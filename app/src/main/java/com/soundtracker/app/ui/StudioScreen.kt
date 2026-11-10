@@ -1,16 +1,26 @@
 package com.soundtracker.app.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animate
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.draggable
+import androidx.compose.foundation.gestures.rememberDraggableState
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
@@ -22,12 +32,15 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -91,8 +104,10 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -102,10 +117,17 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -131,6 +153,8 @@ import com.soundtracker.app.ui.theme.TextSecondary
 import com.soundtracker.app.ui.theme.VioletAccent
 import com.soundtracker.app.ui.theme.WarmUmber
 import com.soundtracker.app.ui.theme.WeChatGreen
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.roundToInt
@@ -181,218 +205,220 @@ fun StudioScreen(
     var showStorageSheet by rememberSaveable { mutableStateOf(false) }
     var showNetEaseSheet by rememberSaveable { mutableStateOf(false) }
 
-    Scaffold(
-        containerColor = StudioBg,
-        snackbarHost = {
-            SnackbarHost(
-                hostState = snackbarHostState,
-                modifier = Modifier.navigationBarsPadding()
-            )
-        },
-        topBar = {
-            StudioTopBar(
-                ephemeralBytes = uiState.storageInfo.totalEphemeralBytes,
-                trackCount = uiState.tracks.size,
-                onStoragePillClick = {
-                    onRefreshStorage()
-                    showStorageSheet = true
-                },
-                onNetEaseClick = {
-                    onScanNetEaseClick()
-                    showNetEaseSheet = true
-                },
-                onImportClick = onPickAudioClick
-            )
-        }
-    ) { innerPadding ->
-        val activeTrack = uiState.selectedTrack
-
-        LazyColumn(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding),
-            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp)
-        ) {
-            if (activeTrack == null) {
-                item {
-                    EmptyStudioHeroCard(
-                        onNetEaseImportClick = {
-                            onScanNetEaseClick()
-                            showNetEaseSheet = true
-                        },
-                        onImportClick = onPickAudioClick
-                    )
-                }
-            } else {
-                // 1. Active Waveform Player + A/B Audition + Delivery Actions
-                item {
-                    ActiveTrackDeckCard(
-                        track = activeTrack,
-                        hasOriginForAb = uiState.originComparisonTrack != null,
-                        isComparingOriginal = uiState.isComparingOriginal,
-                        isPlaying = uiState.isPlaying,
-                        positionMs = uiState.playbackPositionMs,
-                        durationMs = uiState.playbackDurationMs.takeIf { it > 0 }
-                            ?: (activeTrack.metrics.durationSec * 1000f).toLong(),
-                        exportFormat = uiState.exportFormat,
-                        onExportFormatChange = onExportFormatChange,
-                        onTogglePlayPause = onTogglePlayPause,
-                        onSeekFraction = onSeekFraction,
-                        onSkipMs = onSkipMs,
-                        onToggleAbCompare = onToggleAbCompare,
-                        onRenameClick = { renameTargetTrack = activeTrack },
-                        onShareWeChatClick = { onShareWeChat(activeTrack.id) },
-                        onShareMoreClick = { onShareSystemMore(activeTrack.id) },
-                        onSaveAsClick = { saveTargetTrack = activeTrack }
-                    )
-                }
-
-                // 2. Three Studio DSP Modules
-                item {
-                    StudioDspWorkbenchCard(
-                        uiState = uiState,
-                        activeTrack = activeTrack,
-                        onSelectTab = onSelectTab,
-                        onVocalEngineModeChange = onVocalEngineModeChange,
-                        onEnableDeepDenoiseChange = onEnableDeepDenoiseChange,
-                        onKeepVocalChange = onKeepVocalChange,
-                        onRunVocalSeparation = onRunVocalSeparation,
-                        onPitchSemitonesChange = onPitchSemitonesChange,
-                        onPitchCentsChange = onPitchCentsChange,
-                        onTargetBpmChange = onTargetBpmChange,
-                        onAdjustTargetBpmBy = onAdjustTargetBpmBy,
-                        onCalibrateSourceBpm = onCalibrateSourceBpm,
-                        onPreserveTimbreChange = onPreserveTimbreChange,
-                        onRunPitchShift = onRunPitchShift,
-                        onVolumeGainChange = onVolumeGainChange,
-                        onRunVolumeBoost = onRunVolumeBoost
-                    )
-                }
+    Box(modifier = Modifier.fillMaxSize()) {
+        Scaffold(
+            containerColor = StudioBg,
+            snackbarHost = {
+                SnackbarHost(
+                    hostState = snackbarHostState,
+                    modifier = Modifier.navigationBarsPadding()
+                )
+            },
+            topBar = {
+                StudioTopBar(
+                    ephemeralBytes = uiState.storageInfo.totalEphemeralBytes,
+                    trackCount = uiState.tracks.size,
+                    onStoragePillClick = {
+                        onRefreshStorage()
+                        showStorageSheet = true
+                    },
+                    onNetEaseClick = {
+                        onScanNetEaseClick()
+                        showNetEaseSheet = true
+                    },
+                    onImportClick = onPickAudioClick
+                )
             }
+        ) { innerPadding ->
+            val activeTrack = uiState.selectedTrack
 
-            // 3. Persistent Workspace Track Tray
-            if (uiState.tracks.isNotEmpty()) {
-                item {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(top = 4.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column {
-                            Text(
-                                text = "工作台音轨 (${uiState.tracks.size})",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = TextPrimary
-                            )
-                            Text(
-                                text = "点击任意音轨试听或继续处理 · 右上角扫把按钮可随时按需清理空间",
-                                fontSize = 11.sp,
-                                color = TextMuted
-                            )
-                        }
-                        TextButton(onClick = {
-                            onRefreshStorage()
-                            showStorageSheet = true
-                        }) {
-                            Text("资源管理", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = CyanPrimary)
-                        }
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding),
+                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                if (activeTrack == null) {
+                    item {
+                        EmptyStudioHeroCard(
+                            onNetEaseImportClick = {
+                                onScanNetEaseClick()
+                                showNetEaseSheet = true
+                            },
+                            onImportClick = onPickAudioClick
+                        )
+                    }
+                } else {
+                    // 1. Active Waveform Player + A/B Audition + Delivery Actions
+                    item {
+                        ActiveTrackDeckCard(
+                            track = activeTrack,
+                            hasOriginForAb = uiState.originComparisonTrack != null,
+                            isComparingOriginal = uiState.isComparingOriginal,
+                            isPlaying = uiState.isPlaying,
+                            positionMs = uiState.playbackPositionMs,
+                            durationMs = uiState.playbackDurationMs.takeIf { it > 0 }
+                                ?: (activeTrack.metrics.durationSec * 1000f).toLong(),
+                            exportFormat = uiState.exportFormat,
+                            onExportFormatChange = onExportFormatChange,
+                            onTogglePlayPause = onTogglePlayPause,
+                            onSeekFraction = onSeekFraction,
+                            onSkipMs = onSkipMs,
+                            onToggleAbCompare = onToggleAbCompare,
+                            onRenameClick = { renameTargetTrack = activeTrack },
+                            onShareWeChatClick = { onShareWeChat(activeTrack.id) },
+                            onShareMoreClick = { onShareSystemMore(activeTrack.id) },
+                            onSaveAsClick = { saveTargetTrack = activeTrack }
+                        )
+                    }
+
+                    // 2. Three Studio DSP Modules
+                    item {
+                        StudioDspWorkbenchCard(
+                            uiState = uiState,
+                            activeTrack = activeTrack,
+                            onSelectTab = onSelectTab,
+                            onVocalEngineModeChange = onVocalEngineModeChange,
+                            onEnableDeepDenoiseChange = onEnableDeepDenoiseChange,
+                            onKeepVocalChange = onKeepVocalChange,
+                            onRunVocalSeparation = onRunVocalSeparation,
+                            onPitchSemitonesChange = onPitchSemitonesChange,
+                            onPitchCentsChange = onPitchCentsChange,
+                            onTargetBpmChange = onTargetBpmChange,
+                            onAdjustTargetBpmBy = onAdjustTargetBpmBy,
+                            onCalibrateSourceBpm = onCalibrateSourceBpm,
+                            onPreserveTimbreChange = onPreserveTimbreChange,
+                            onRunPitchShift = onRunPitchShift,
+                            onVolumeGainChange = onVolumeGainChange,
+                            onRunVolumeBoost = onRunVolumeBoost
+                        )
                     }
                 }
 
-                items(items = uiState.tracks, key = { it.id }) { item ->
-                    SessionTrackItemCard(
-                        track = item,
-                        isSelected = item.id == activeTrack?.id,
-                        onClick = { onSelectTrack(item.id) },
-                        onRenameClick = { renameTargetTrack = item },
-                        onShareWeChatClick = { onShareWeChat(item.id) },
-                        onSaveAsClick = { saveTargetTrack = item },
-                        onDeleteClick = { onDeleteTrack(item.id) }
-                    )
+                // 3. Persistent Workspace Track Tray
+                if (uiState.tracks.isNotEmpty()) {
+                    item {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 4.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column {
+                                Text(
+                                    text = "工作台音轨 (${uiState.tracks.size})",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    color = TextPrimary
+                                )
+                                Text(
+                                    text = "点击任意音轨试听或继续处理 · 右上角扫把按钮可随时按需清理空间",
+                                    fontSize = 11.sp,
+                                    color = TextMuted
+                                )
+                            }
+                            TextButton(onClick = {
+                                onRefreshStorage()
+                                showStorageSheet = true
+                            }) {
+                                Text("资源管理", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = CyanPrimary)
+                            }
+                        }
+                    }
+
+                    items(items = uiState.tracks, key = { it.id }) { item ->
+                        SessionTrackItemCard(
+                            track = item,
+                            isSelected = item.id == activeTrack?.id,
+                            onClick = { onSelectTrack(item.id) },
+                            onRenameClick = { renameTargetTrack = item },
+                            onShareWeChatClick = { onShareWeChat(item.id) },
+                            onSaveAsClick = { saveTargetTrack = item },
+                            onDeleteClick = { onDeleteTrack(item.id) }
+                        )
+                    }
+                }
+
+                item {
+                    Spacer(modifier = Modifier.height(28.dp))
                 }
             }
-
-            item {
-                Spacer(modifier = Modifier.height(28.dp))
-            }
         }
-    }
 
-    // Rename Dialog
-    renameTargetTrack?.let { target ->
-        RenameTrackDialog(
-            track = target,
-            exportExtension = uiState.exportFormat.extension,
-            onDismiss = { renameTargetTrack = null },
-            onConfirm = { newName ->
-                onRenameTrack(target.id, newName)
-                renameTargetTrack = null
-            }
-        )
-    }
+        // Rename Dialog
+        renameTargetTrack?.let { target ->
+            RenameTrackDialog(
+                track = target,
+                exportExtension = uiState.exportFormat.extension,
+                onDismiss = { renameTargetTrack = null },
+                onConfirm = { newName ->
+                    onRenameTrack(target.id, newName)
+                    renameTargetTrack = null
+                }
+            )
+        }
 
-    // Save As Local Sheet
-    saveTargetTrack?.let { target ->
-        SaveAsBottomSheet(
-            track = target,
-            currentFormat = uiState.exportFormat,
-            onFormatChange = onExportFormatChange,
-            onQuickSaveMusic = {
-                saveTargetTrack = null
-                onQuickSaveMusic(target.id)
-            },
-            onCustomFolderSave = {
-                val id = target.id
-                saveTargetTrack = null
-                onCustomSaveDocument(id)
-            },
-            onDismiss = { saveTargetTrack = null }
-        )
-    }
+        // Save As Local Sheet
+        saveTargetTrack?.let { target ->
+            SaveAsBottomSheet(
+                track = target,
+                currentFormat = uiState.exportFormat,
+                onFormatChange = onExportFormatChange,
+                onQuickSaveMusic = {
+                    saveTargetTrack = null
+                    onQuickSaveMusic(target.id)
+                },
+                onCustomFolderSave = {
+                    val id = target.id
+                    saveTargetTrack = null
+                    onCustomSaveDocument(id)
+                },
+                onDismiss = { saveTargetTrack = null }
+            )
+        }
 
-    // Interactive Storage Resource Manager Sheet
-    if (showStorageSheet) {
-        StorageResourceManagerSheet(
-            storageInfo = uiState.storageInfo,
-            onDeleteSingleItem = onDeleteResourceItem,
-            onDeleteSelectedItems = onDeleteSelectedResources,
-            onClearAll = {
-                onClearWorkspace()
-                showStorageSheet = false
-            },
-            onDismiss = { showStorageSheet = false }
-        )
-    }
+        // Interactive Storage Resource Manager Sheet
+        if (showStorageSheet) {
+            StorageResourceManagerSheet(
+                storageInfo = uiState.storageInfo,
+                onDeleteSingleItem = onDeleteResourceItem,
+                onDeleteSelectedItems = onDeleteSelectedResources,
+                onClearAll = {
+                    onClearWorkspace()
+                    showStorageSheet = false
+                },
+                onDismiss = { showStorageSheet = false }
+            )
+        }
 
-    // NetEase Cloud Music Import Sheet (NCM -> FLAC / MP3)
-    if (showNetEaseSheet) {
-        NetEaseCloudMusicImportSheet(
-            tracks = uiState.netEaseTracks,
-            isScanning = uiState.isScanningNetEase,
-            hasStorageAccess = uiState.hasNetEaseStorageAccess,
-            onRefresh = onScanNetEaseClick,
-            onRequestStorageAccess = onRequestAllFilesAccess,
-            onPickManualNcmFile = {
-                showNetEaseSheet = false
-                onPickAudioClick()
-            },
-            onImportTracks = { selected ->
-                showNetEaseSheet = false
-                onImportNetEaseTracks(selected)
-            },
-            onDismiss = { showNetEaseSheet = false }
-        )
-    }
+        // NetEase Cloud Music Import Sheet (NCM -> FLAC / MP3)
+        if (showNetEaseSheet) {
+            NetEaseCloudMusicImportSheet(
+                tracks = uiState.netEaseTracks,
+                isScanning = uiState.isScanningNetEase,
+                hasStorageAccess = uiState.hasNetEaseStorageAccess,
+                onRefresh = onScanNetEaseClick,
+                onRequestStorageAccess = onRequestAllFilesAccess,
+                onPickManualNcmFile = {
+                    showNetEaseSheet = false
+                    onPickAudioClick()
+                },
+                onImportTracks = { selected ->
+                    showNetEaseSheet = false
+                    onImportNetEaseTracks(selected)
+                },
+                onDismiss = { showNetEaseSheet = false }
+            )
+        }
 
-    // Processing Progress Modal
-    uiState.processingTask?.let { task ->
-        ProcessingProgressDialog(
-            task = task,
-            onCancel = onCancelProcessing
-        )
+        // Processing Progress Modal
+        uiState.processingTask?.let { task ->
+            ProcessingProgressDialog(
+                task = task,
+                onCancel = onCancelProcessing
+            )
+        }
     }
 }
 
@@ -2278,6 +2304,370 @@ private fun SaveAsBottomSheet(
     }
 }
 
+private enum class SheetStage {
+    HIDDEN,
+    HALF, // 五分屏 (56% screen height)
+    FULL  // 九分屏 (90% screen height)
+}
+
+/**
+ * Custom two-stage bottom sheet (五分屏 56% / 九分屏 90% / 收起) with deterministic
+ * LazyColumn scroll arbitration:
+ * - Swiping up or down inside the list ALWAYS scrolls the list while the list can scroll in that direction.
+ * - When scrolling back towards the top of the list (回滑, finger moving top-to-bottom), even if the
+ *   swipe or fling reaches item 0 mid-gesture, the leftover delta/velocity is absorbed at the top of the
+ *   list and NEVER drags the sheet down.
+ * - ONLY when a downward swipe starts while the list is ALREADY at the very top (cannot scroll back
+ *   any further) does dragging down pull the panel down (9 -> 5, or 5 -> 收起).
+ * - Dragging on non-list areas (drag handle, header, search bar, filter chips, bottom bar) always
+ *   drags the panel smoothly between 5 <-> 9 <-> 收起.
+ */
+@Composable
+private fun TwoStageBottomSheet(
+    listState: LazyListState,
+    onDismissRequest: () -> Unit,
+    containerColor: Color = StudioSurface,
+    content: @Composable (
+        currentStage: SheetStage,
+        onToggleStage: () -> Unit,
+        listScrollModifier: Modifier
+    ) -> Unit
+) {
+    val scope = rememberCoroutineScope()
+    val density = LocalDensity.current
+
+    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+        val screenHeightPx = constraints.maxHeight.toFloat().coerceAtLeast(1f)
+        val halfHeightPx = screenHeightPx * 0.58f
+        val fullHeightPx = screenHeightPx * 0.90f
+        val flingVelocityThresholdPx = with(density) { 420.dp.toPx() }
+
+        var currentStage by remember { mutableStateOf(SheetStage.HALF) }
+        var sheetHeightPx by remember { mutableFloatStateOf(0f) }
+        var animJob by remember { mutableStateOf<Job?>(null) }
+
+        fun animateSheetTo(targetStage: SheetStage, initialVelocityY: Float = 0f) {
+            animJob?.cancel()
+            val targetPx = when (targetStage) {
+                SheetStage.HIDDEN -> 0f
+                SheetStage.HALF -> halfHeightPx
+                SheetStage.FULL -> fullHeightPx
+            }
+            if (targetStage != SheetStage.HIDDEN) {
+                currentStage = targetStage
+            }
+            animJob = scope.launch {
+                val startPx = sheetHeightPx
+                if (abs(startPx - targetPx) > 0.5f) {
+                    animate(
+                        initialValue = startPx,
+                        targetValue = targetPx,
+                        initialVelocity = -initialVelocityY,
+                        animationSpec = spring(
+                            dampingRatio = Spring.DampingRatioNoBouncy,
+                            stiffness = Spring.StiffnessMediumLow
+                        )
+                    ) { value, _ ->
+                        sheetHeightPx = value
+                    }
+                } else {
+                    sheetHeightPx = targetPx
+                }
+                sheetHeightPx = targetPx
+                if (targetStage == SheetStage.HIDDEN) {
+                    onDismissRequest()
+                }
+            }
+        }
+
+        LaunchedEffect(screenHeightPx) {
+            if (sheetHeightPx == 0f && currentStage != SheetStage.HIDDEN) {
+                animateSheetTo(SheetStage.HALF)
+            }
+        }
+
+        BackHandler(enabled = true) {
+            animateSheetTo(SheetStage.HIDDEN)
+        }
+
+        fun applySheetDragDelta(deltaY: Float, startStage: SheetStage): Float {
+            if (deltaY == 0f) return 0f
+            animJob?.cancel()
+            // deltaY > 0 means finger moves downward (shrinking sheetHeightPx)
+            // deltaY < 0 means finger moves upward (growing sheetHeightPx)
+            val minAllowed = when {
+                startStage == SheetStage.FULL && deltaY > 0f -> halfHeightPx
+                else -> 0f
+            }
+            val oldHeight = sheetHeightPx
+            val newHeight = (oldHeight - deltaY).coerceIn(minAllowed, fullHeightPx)
+            sheetHeightPx = newHeight
+            return oldHeight - newHeight
+        }
+
+        fun settleSheetAfterDrag(velocityY: Float, startStage: SheetStage) {
+            val h = sheetHeightPx
+            val targetStage = when (startStage) {
+                SheetStage.FULL -> {
+                    // Dragged from 九分屏 (9): downward drag transitions 9 -> 5 (never 9 -> 0 directly)
+                    if (velocityY > flingVelocityThresholdPx) {
+                        SheetStage.HALF
+                    } else if (velocityY < -flingVelocityThresholdPx) {
+                        SheetStage.FULL
+                    } else {
+                        val mid = (halfHeightPx + fullHeightPx) * 0.5f
+                        if (h < mid) SheetStage.HALF else SheetStage.FULL
+                    }
+                }
+                SheetStage.HALF -> {
+                    if (h > halfHeightPx + 1f) {
+                        // Dragged upward between 5 and 9
+                        if (velocityY < -flingVelocityThresholdPx) {
+                            SheetStage.FULL
+                        } else if (velocityY > flingVelocityThresholdPx) {
+                            SheetStage.HALF
+                        } else {
+                            val mid = (halfHeightPx + fullHeightPx) * 0.5f
+                            if (h >= mid) SheetStage.FULL else SheetStage.HALF
+                        }
+                    } else {
+                        // Dragged downward between 5 and 收起
+                        if (velocityY > flingVelocityThresholdPx) {
+                            SheetStage.HIDDEN
+                        } else if (velocityY < -flingVelocityThresholdPx) {
+                            SheetStage.HALF
+                        } else {
+                            if (h < halfHeightPx * 0.72f) SheetStage.HIDDEN else SheetStage.HALF
+                        }
+                    }
+                }
+                SheetStage.HIDDEN -> SheetStage.HIDDEN
+            }
+            animateSheetTo(targetStage, velocityY)
+        }
+
+        // Gesture tracking state for the LazyColumn touch area
+        var gestureStartedAtTop by remember { mutableStateOf(true) }
+        var gestureStartedAtBottom by remember { mutableStateOf(false) }
+        var listScrolledDuringGesture by remember { mutableStateOf(false) }
+        var sheetDraggedByListGesture by remember { mutableStateOf(false) }
+        var listDragStartStage by remember { mutableStateOf(SheetStage.HALF) }
+        var settledByPreFling by remember { mutableStateOf(false) }
+
+        val listNestedScrollConnection = remember(screenHeightPx) {
+            object : NestedScrollConnection {
+                override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                    if (source != NestedScrollSource.UserInput) return Offset.Zero
+                    val dy = available.y
+                    if (dy == 0f) return Offset.Zero
+
+                    // If this touch gesture has ALREADY started dragging the sheet, keep routing
+                    // subsequent vertical movement in the same gesture to the sheet so the list
+                    // doesn't scroll while the sheet is mid-drag.
+                    if (sheetDraggedByListGesture) {
+                        applySheetDragDelta(dy, listDragStartStage)
+                        return Offset(0f, dy)
+                    }
+
+                    // If user swipes up (dy < 0) and the list can scroll forward, mark that the
+                    // list is scrolling in this gesture and let LazyColumn consume it.
+                    if (dy < 0f && listState.canScrollForward) {
+                        listScrolledDuringGesture = true
+                        return Offset.Zero
+                    }
+
+                    // If user swipes down (dy > 0) and the list can scroll backward, mark that the
+                    // list is scrolling in this gesture and let LazyColumn consume it.
+                    if (dy > 0f && listState.canScrollBackward) {
+                        listScrolledDuringGesture = true
+                        return Offset.Zero
+                    }
+
+                    return Offset.Zero
+                }
+
+                override fun onPostScroll(
+                    consumed: Offset,
+                    available: Offset,
+                    source: NestedScrollSource
+                ): Offset {
+                    if (consumed.y != 0f) {
+                        listScrolledDuringGesture = true
+                    }
+                    if (source != NestedScrollSource.UserInput) {
+                        return Offset(0f, available.y)
+                    }
+                    val dy = available.y
+                    if (dy == 0f) return Offset.Zero
+
+                    if (dy > 0f) {
+                        // Finger moving top-to-bottom (回滑):
+                        // ONLY drag the panel down if this touch gesture started when the list was
+                        // ALREADY at the very top and did NOT scroll the list at all during this gesture.
+                        val isAtTopNow = !listState.canScrollBackward &&
+                            listState.firstVisibleItemIndex == 0 &&
+                            listState.firstVisibleItemScrollOffset == 0
+                        if (gestureStartedAtTop && !listScrolledDuringGesture && isAtTopNow) {
+                            sheetDraggedByListGesture = true
+                            applySheetDragDelta(dy, listDragStartStage)
+                        }
+                        // Always consume leftover downward delta so it never leaks.
+                        return Offset(0f, dy)
+                    } else {
+                        // Finger moving bottom-to-top (dy < 0):
+                        // If in 五分屏 and gesture started at the bottom of the list (or list fits on screen),
+                        // pulling up expands 5 -> 9.
+                        if (currentStage == SheetStage.HALF &&
+                            gestureStartedAtBottom &&
+                            !listState.canScrollForward &&
+                            !listScrolledDuringGesture
+                        ) {
+                            sheetDraggedByListGesture = true
+                            applySheetDragDelta(dy, listDragStartStage)
+                        }
+                        return Offset(0f, dy)
+                    }
+                }
+
+                override suspend fun onPreFling(available: Velocity): Velocity {
+                    if (sheetDraggedByListGesture) {
+                        settledByPreFling = true
+                        sheetDraggedByListGesture = false
+                        settleSheetAfterDrag(available.y, listDragStartStage)
+                        return available
+                    }
+                    return Velocity.Zero
+                }
+
+                override suspend fun onPostFling(consumed: Velocity, available: Velocity): Velocity {
+                    if (sheetDraggedByListGesture && !settledByPreFling) {
+                        sheetDraggedByListGesture = false
+                        settleSheetAfterDrag(available.y, listDragStartStage)
+                    }
+                    // Consume any leftover fling velocity from the list so it never moves the sheet.
+                    return available
+                }
+            }
+        }
+
+        val listScrollModifier = Modifier
+            .pointerInput(listState, screenHeightPx) {
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                    val atTopNow = !listState.canScrollBackward &&
+                        listState.firstVisibleItemIndex == 0 &&
+                        listState.firstVisibleItemScrollOffset == 0
+                    val atBottomNow = !listState.canScrollForward
+                    gestureStartedAtTop = atTopNow
+                    gestureStartedAtBottom = atBottomNow
+                    listScrolledDuringGesture = !atTopNow
+                    sheetDraggedByListGesture = false
+                    listDragStartStage = currentStage
+                    settledByPreFling = false
+
+                    do {
+                        val event = awaitPointerEvent(pass = PointerEventPass.Final)
+                    } while (event.changes.any { it.pressed })
+
+                    if (sheetDraggedByListGesture && !settledByPreFling) {
+                        settledByPreFling = true
+                        sheetDraggedByListGesture = false
+                        settleSheetAfterDrag(0f, listDragStartStage)
+                    }
+                }
+            }
+            .nestedScroll(listNestedScrollConnection)
+
+        // Draggable state for non-list areas (Drag Handle, Header, Search Bar, Filter Chips, Bottom Bar)
+        var surfaceDragStartStage by remember { mutableStateOf(SheetStage.HALF) }
+        val surfaceDraggableState = rememberDraggableState { deltaY ->
+            applySheetDragDelta(deltaY, surfaceDragStartStage)
+        }
+
+        val scrimProgress = (sheetHeightPx / halfHeightPx).coerceIn(0f, 1f)
+
+        // Full-screen Backdrop Scrim
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.48f * scrimProgress))
+                .pointerInput(Unit) {
+                    detectTapGestures(onTap = { animateSheetTo(SheetStage.HIDDEN) })
+                }
+        )
+
+        val visibleHeightPx = sheetHeightPx.coerceAtLeast(halfHeightPx)
+        val translationYPx = if (sheetHeightPx < halfHeightPx) {
+            (halfHeightPx - sheetHeightPx).roundToInt()
+        } else {
+            0
+        }
+
+        Surface(
+            shape = RoundedCornerShape(topStart = 26.dp, topEnd = 26.dp),
+            color = containerColor,
+            tonalElevation = 6.dp,
+            shadowElevation = 20.dp,
+            border = BorderStroke(1.dp, StudioBorder),
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth()
+                .height(with(density) { visibleHeightPx.toDp() })
+                .offset { IntOffset(0, translationYPx) }
+                .draggable(
+                    state = surfaceDraggableState,
+                    orientation = Orientation.Vertical,
+                    startDragImmediately = false,
+                    onDragStarted = {
+                        animJob?.cancel()
+                        surfaceDragStartStage = currentStage
+                    },
+                    onDragStopped = { velocity ->
+                        settleSheetAfterDrag(velocity, surfaceDragStartStage)
+                    }
+                )
+        ) {
+            Column(modifier = Modifier.fillMaxSize()) {
+                // Drag Handle Bar (supports both drag and tap to toggle 五分屏/九分屏)
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable {
+                            val nextStage = if (currentStage == SheetStage.HALF) {
+                                SheetStage.FULL
+                            } else {
+                                SheetStage.HALF
+                            }
+                            animateSheetTo(nextStage)
+                        }
+                        .padding(top = 10.dp, bottom = 6.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(width = 38.dp, height = 4.dp)
+                            .clip(RoundedCornerShape(2.dp))
+                            .background(TextMuted.copy(alpha = 0.45f))
+                    )
+                }
+
+                content(
+                    currentStage,
+                    {
+                        val nextStage = if (currentStage == SheetStage.HALF) {
+                            SheetStage.FULL
+                        } else {
+                            SheetStage.HALF
+                        }
+                        animateSheetTo(nextStage)
+                    },
+                    listScrollModifier
+                )
+            }
+        }
+    }
+}
+
 /**
  * Interactive Storage Resource Manager Sheet:
  * - Lists every stored audio/cache resource in the App with its exact size
@@ -2296,26 +2686,28 @@ private fun StorageResourceManagerSheet(
 ) {
     val resources = storageInfo.resources
     var selectedPaths by remember { mutableStateOf(setOf<String>()) }
+    val listState = rememberLazyListState()
 
     // Prune any paths that were already deleted
     LaunchedEffect(resources) {
-        val valid = resources.mapTo( hashSetOf() ) { it.filePath }
+        val valid = resources.mapTo(hashSetOf()) { it.filePath }
         selectedPaths = selectedPaths.intersect(valid)
     }
 
     val allSelected = resources.isNotEmpty() && selectedPaths.size == resources.size
     val selectedBytes = resources.filter { it.filePath in selectedPaths }.sumOf { it.sizeBytes }
 
-    ModalBottomSheet(
+    TwoStageBottomSheet(
+        listState = listState,
         onDismissRequest = onDismiss,
         containerColor = StudioSurface
-    ) {
+    ) { currentStage, onToggleStage, listScrollModifier ->
         Column(
             modifier = Modifier
-                .fillMaxWidth()
+                .fillMaxSize()
                 .navigationBarsPadding()
-                .padding(horizontal = 18.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+                .padding(horizontal = 18.dp, vertical = 6.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             // Sheet Header
             Row(
@@ -2334,6 +2726,14 @@ private fun StorageResourceManagerSheet(
                     Text(
                         text = "共 ${resources.size} 个音频资源 · 总计占用 ${formatBytesShort(storageInfo.totalEphemeralBytes)}",
                         fontSize = 12.sp,
+                        color = TextSecondary
+                    )
+                }
+
+                TextButton(onClick = onToggleStage) {
+                    Text(
+                        text = if (currentStage == SheetStage.HALF) "展开九分屏" else "收为五分屏",
+                        fontSize = 11.sp,
                         color = TextSecondary
                     )
                 }
@@ -2361,62 +2761,75 @@ private fun StorageResourceManagerSheet(
             HorizontalDivider(color = StudioBorder)
 
             if (resources.isEmpty()) {
-                Surface(
-                    shape = RoundedCornerShape(14.dp),
-                    color = StudioSurfaceElevated.copy(alpha = 0.6f),
-                    border = BorderStroke(1.dp, StudioBorder),
-                    modifier = Modifier.fillMaxWidth()
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f),
+                    contentAlignment = Alignment.Center
                 ) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 28.dp, horizontal = 16.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
+                    Surface(
+                        shape = RoundedCornerShape(14.dp),
+                        color = StudioSurfaceElevated.copy(alpha = 0.6f),
+                        border = BorderStroke(1.dp, StudioBorder),
+                        modifier = Modifier.fillMaxWidth()
                     ) {
-                        Icon(
-                            imageVector = Icons.Rounded.CleaningServices,
-                            contentDescription = null,
-                            tint = EmeraldLossless,
-                            modifier = Modifier.size(28.dp)
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text(
-                            text = "当前应用内暂无任何存储资源 (0 KB)",
-                            fontSize = 14.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = TextPrimary
-                        )
-                        Text(
-                            text = "导入或处理后的音轨及分享缓存会在此处列出，方便随时按需清理",
-                            fontSize = 11.sp,
-                            color = TextMuted
-                        )
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 28.dp, horizontal = 16.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.CleaningServices,
+                                contentDescription = null,
+                                tint = EmeraldLossless,
+                                modifier = Modifier.size(28.dp)
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = "当前应用内暂无任何存储资源 (0 KB)",
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = TextPrimary
+                            )
+                            Text(
+                                text = "导入或处理后的音轨及分享缓存会在此处列出，方便随时按需清理",
+                                fontSize = 11.sp,
+                                color = TextMuted
+                            )
+                        }
                     }
                 }
             } else {
-                LazyColumn(
+                Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .heightIn(max = 360.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                        .weight(1f)
+                        .then(listScrollModifier)
                 ) {
-                    items(items = resources, key = { it.id }) { item ->
-                        val isChecked = item.filePath in selectedPaths
-                        StoredResourceRowCell(
-                            item = item,
-                            checked = isChecked,
-                            onCheckedChange = { checked ->
-                                selectedPaths = if (checked) {
-                                    selectedPaths + item.filePath
-                                } else {
-                                    selectedPaths - item.filePath
+                    LazyColumn(
+                        state = listState,
+                        modifier = Modifier.fillMaxSize(),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        items(items = resources, key = { it.id }) { item ->
+                            val isChecked = item.filePath in selectedPaths
+                            StoredResourceRowCell(
+                                item = item,
+                                checked = isChecked,
+                                onCheckedChange = { checked ->
+                                    selectedPaths = if (checked) {
+                                        selectedPaths + item.filePath
+                                    } else {
+                                        selectedPaths - item.filePath
+                                    }
+                                },
+                                onDeleteClick = {
+                                    selectedPaths = selectedPaths - item.filePath
+                                    onDeleteSingleItem(item.filePath)
                                 }
-                            },
-                            onDeleteClick = {
-                                selectedPaths = selectedPaths - item.filePath
-                                onDeleteSingleItem(item.filePath)
-                            }
-                        )
+                            )
+                        }
                     }
                 }
             }
@@ -2492,7 +2905,7 @@ private fun StorageResourceManagerSheet(
                 }
             }
 
-            Spacer(modifier = Modifier.height(6.dp))
+            Spacer(modifier = Modifier.height(4.dp))
         }
     }
 }
@@ -2625,6 +3038,7 @@ private fun NetEaseCloudMusicImportSheet(
     // Filter: 0 = All, 1 = NCM, 2 = FLAC, 3 = MP3
     var filterTab by rememberSaveable { mutableStateOf(0) }
     var selectedIds by remember { mutableStateOf(setOf<String>()) }
+    val listState = rememberLazyListState()
 
     val filteredTracks = remember(tracks, searchQuery, filterTab) {
         val q = searchQuery.trim().lowercase()
@@ -2646,15 +3060,16 @@ private fun NetEaseCloudMusicImportSheet(
 
     val allFilteredSelected = filteredTracks.isNotEmpty() && filteredTracks.all { it.id in selectedIds }
 
-    ModalBottomSheet(
+    TwoStageBottomSheet(
+        listState = listState,
         onDismissRequest = onDismiss,
         containerColor = StudioSurface
-    ) {
+    ) { currentStage, onToggleStage, listScrollModifier ->
         Column(
             modifier = Modifier
-                .fillMaxWidth()
+                .fillMaxSize()
                 .navigationBarsPadding()
-                .padding(horizontal = 18.dp, vertical = 8.dp),
+                .padding(horizontal = 18.dp, vertical = 6.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             // Sheet Header
@@ -2682,6 +3097,14 @@ private fun NetEaseCloudMusicImportSheet(
                     }
                     Text(
                         text = "NCM 自动无损解密为 FLAC 或 MP3（同名多版本自动优选最高音质）",
+                        fontSize = 11.sp,
+                        color = TextSecondary
+                    )
+                }
+
+                TextButton(onClick = onToggleStage) {
+                    Text(
+                        text = if (currentStage == SheetStage.HALF) "九分屏" else "五分屏",
                         fontSize = 11.sp,
                         color = TextSecondary
                     )
@@ -2814,7 +3237,7 @@ private fun NetEaseCloudMusicImportSheet(
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(vertical = 36.dp),
+                        .weight(1f),
                     contentAlignment = Alignment.Center
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -2828,60 +3251,73 @@ private fun NetEaseCloudMusicImportSheet(
                     }
                 }
             } else if (filteredTracks.isEmpty()) {
-                Surface(
-                    shape = RoundedCornerShape(14.dp),
-                    color = StudioSurfaceElevated.copy(alpha = 0.6f),
-                    border = BorderStroke(1.dp, StudioBorder),
-                    modifier = Modifier.fillMaxWidth()
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f),
+                    contentAlignment = Alignment.Center
                 ) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 24.dp, horizontal = 16.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    Surface(
+                        shape = RoundedCornerShape(14.dp),
+                        color = StudioSurfaceElevated.copy(alpha = 0.6f),
+                        border = BorderStroke(1.dp, StudioBorder),
+                        modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text(
-                            text = if (tracks.isEmpty()) "未扫描到网易云音乐已下载歌曲" else "没有匹配的搜索结果",
-                            fontSize = 14.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = TextPrimary
-                        )
-                        Text(
-                            text = "默认扫描路径：Download/netease/cloudmusic/Music 及 netease/cloudmusic/Music",
-                            fontSize = 11.sp,
-                            color = TextMuted
-                        )
-                        OutlinedButton(
-                            onClick = onPickManualNcmFile,
-                            shape = RoundedCornerShape(10.dp),
-                            border = BorderStroke(1.dp, StudioBorder)
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 24.dp, horizontal = 16.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            Icon(Icons.Rounded.FolderOpen, contentDescription = null, tint = TextPrimary, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("手动从文件夹选择 .ncm / .flac / .mp3", fontSize = 12.sp, color = TextPrimary)
+                            Text(
+                                text = if (tracks.isEmpty()) "未扫描到网易云音乐已下载歌曲" else "没有匹配的搜索结果",
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = TextPrimary
+                            )
+                            Text(
+                                text = "默认扫描路径：Download/netease/cloudmusic/Music 及 netease/cloudmusic/Music",
+                                fontSize = 11.sp,
+                                color = TextMuted
+                            )
+                            OutlinedButton(
+                                onClick = onPickManualNcmFile,
+                                shape = RoundedCornerShape(10.dp),
+                                border = BorderStroke(1.dp, StudioBorder)
+                            ) {
+                                Icon(Icons.Rounded.FolderOpen, contentDescription = null, tint = TextPrimary, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("手动从文件夹选择 .ncm / .flac / .mp3", fontSize = 12.sp, color = TextPrimary)
+                            }
                         }
                     }
                 }
             } else {
-                LazyColumn(
+                Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .heightIn(max = 360.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                        .weight(1f)
+                        .then(listScrollModifier)
                 ) {
-                    items(items = filteredTracks, key = { it.id }) { item ->
-                        val isChecked = item.id in selectedIds
-                        NetEaseTrackRowCell(
-                            item = item,
-                            checked = isChecked,
-                            onCheckedChange = { checked ->
-                                selectedIds = if (checked) selectedIds + item.id else selectedIds - item.id
-                            },
-                            onSingleImportClick = {
-                                onImportTracks(listOf(item))
-                            }
-                        )
+                    LazyColumn(
+                        state = listState,
+                        modifier = Modifier.fillMaxSize(),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        items(items = filteredTracks, key = { it.id }) { item ->
+                            val isChecked = item.id in selectedIds
+                            NetEaseTrackRowCell(
+                                item = item,
+                                checked = isChecked,
+                                onCheckedChange = { checked ->
+                                    selectedIds = if (checked) selectedIds + item.id else selectedIds - item.id
+                                },
+                                onSingleImportClick = {
+                                    onImportTracks(listOf(item))
+                                }
+                            )
+                        }
                     }
                 }
             }
@@ -2934,7 +3370,7 @@ private fun NetEaseCloudMusicImportSheet(
                 }
             }
 
-            Spacer(modifier = Modifier.height(6.dp))
+            Spacer(modifier = Modifier.height(4.dp))
         }
     }
 }
