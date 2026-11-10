@@ -36,9 +36,9 @@ import kotlin.math.abs
 import kotlin.math.roundToInt
 
 enum class StudioToolTab(val title: String, val subtitle: String) {
-    VOCAL_REMOVE("去人声提伴奏", "Inst-HQ5 全频直出 + Meta HTDemucs-FT 双核"),
-    PITCH_SHIFT("移调与变速", "Rubber Band R3 · 1 BPM 精度变速 + 无电音移调"),
-    VOLUME_BOOST("无损音量放大", "真峰值余量直通 + 5ms母带限幅")
+    VOCAL_REMOVE("去人声提伴奏", "提取伴奏或人声"),
+    PITCH_SHIFT("移调与变速", "升降调 · 1 BPM 变速"),
+    VOLUME_BOOST("音量放大", "无损放大与防破音")
 }
 
 data class SessionTrack(
@@ -683,9 +683,9 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         val deepDenoise = state.enableDeepDenoise
         val keepVocals = state.keepVocalStemToo
         val engineShortLabel = when (mode) {
-            VocalEngineMode.INST_HQ5_DIRECT -> if (deepDenoise) "Inst-HQ5 深度消噪" else "Inst-HQ5 全频直出"
-            VocalEngineMode.HTDEMUCS_FT -> "Meta HTDemucs-FT v4"
-            VocalEngineMode.HYBRID_ENSEMBLE -> "Min-Spec 双擎融合"
+            VocalEngineMode.INST_HQ5_DIRECT -> if (deepDenoise) "人声去除优先(二次降噪)" else "人声去除优先"
+            VocalEngineMode.HTDEMUCS_FT -> "乐器音质优先"
+            VocalEngineMode.HYBRID_ENSEMBLE -> "双模型均衡模式"
         }
 
         activeProcessingJob = viewModelScope.launch {
@@ -702,8 +702,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 _uiState.update {
                     it.copy(
                         processingTask = ProcessingTaskState(
-                            title = "正在提取母带级纯伴奏",
-                            subtitle = "正在初始化 $engineShortLabel 神经网络引擎...",
+                            title = "正在提取伴奏",
+                            subtitle = "正在加载分离模型（$engineShortLabel）...",
                             progress = 0.02f,
                             cancellable = true
                         )
@@ -721,7 +721,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 ) { p ->
                     val pct = (p * 100).roundToInt()
                     val phaseHint = if (mode == VocalEngineMode.HYBRID_ENSEMBLE) {
-                        if (p < 0.5f) "第 1/2 阶 Inst-HQ5 直出伴奏" else "第 2/2 阶 Meta HTDemucs-FT 混合时频"
+                        if (p < 0.5f) "第 1/2 步：人声去除模型" else "第 2/2 步：乐器保真模型"
                     } else {
                         engineShortLabel
                     }
@@ -729,7 +729,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                         st.copy(
                             processingTask = st.processingTask?.copy(
                                 progress = p,
-                                subtitle = "$phaseHint · 进度 $pct% (零电音高保真重建)"
+                                subtitle = "$phaseHint · 已处理 $pct%"
                             )
                         )
                     }
@@ -847,16 +847,16 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 val bpmTag = if (hasBpmChange) "${dstBpm}BPM" else ""
                 val combinedTag = listOf(pitchTag, bpmTag).filter { it.isNotEmpty() }.joinToString("_")
                 val modeActionTitle = when {
-                    hasPitchChange && hasBpmChange -> "移调 + 变速一次合成 ($pitchTag · ${srcBpm}→${dstBpm} BPM)"
-                    hasPitchChange -> "母带级无电音移调 ($pitchTag · 保持 ${srcBpm} BPM)"
-                    else -> "母带级变速不变调 (${srcBpm} → ${dstBpm} BPM)"
+                    hasPitchChange && hasBpmChange -> "移调 + 变速 ($pitchTag · ${srcBpm}→${dstBpm} BPM)"
+                    hasPitchChange -> "移调 ($pitchTag · 保持 ${srcBpm} BPM)"
+                    else -> "变速不变调 (${srcBpm} → ${dstBpm} BPM)"
                 }
 
                 _uiState.update {
                     it.copy(
                         processingTask = ProcessingTaskState(
                             title = "正在执行 $modeActionTitle",
-                            subtitle = "Rubber Band R3 多分辨率双遍离线引擎处理中...",
+                            subtitle = "正在准备音频数据...",
                             progress = 0.04f,
                             cancellable = true
                         )
@@ -872,9 +872,9 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     preserveTimbre = preserveTimbre
                 ) { p ->
                     val phaseText = if (p < 0.25f) {
-                        "第 1/2 步：全局瞬态与节拍泛音结构预分析..."
+                        "第 1/2 步：分析音频节拍与音高..."
                     } else {
-                        "第 2/2 步：Rubber Band R3 多分辨率母带合成..."
+                        "第 2/2 步：正在生成移调/变速后的音频..."
                     }
                     _uiState.update { st ->
                         st.copy(
@@ -903,7 +903,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 val shiftedTrack = SessionTrack(
                     displayName = newName,
                     badge = badgeText,
-                    detailNote = "${if (preserveTimbre) "R3 人声共振峰保护" else "R3 纯伴奏零电音"} · ${formatMetricsSummary(finalMetrics)}",
+                    detailNote = "${if (preserveTimbre) "保持人声音色" else "伴奏模式"} · ${formatMetricsSummary(finalMetrics)}",
                     audioFile = outWav,
                     originTrackId = sourceTrack.originTrackId ?: sourceTrack.id,
                     metrics = finalMetrics

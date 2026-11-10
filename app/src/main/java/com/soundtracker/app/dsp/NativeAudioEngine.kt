@@ -14,21 +14,21 @@ enum class VocalEngineMode(
 ) {
     INST_HQ5_DIRECT(
         nativeOrdinal = 0,
-        title = "全频直出超净引擎 · Inst-HQ5",
-        badge = "默认推荐 · 极净去人声",
-        subtitle = "22.05kHz 全奈奎斯特频段直接合成纯伴奏（非相位相减），连气声、齿音与混响尾音深度剥离，告别过电声"
+        title = "人声去除优先",
+        badge = "默认推荐",
+        subtitle = "适合大多数流行歌曲。主唱、和声与呼吸声去除最彻底，处理速度较快。"
     ),
     HTDEMUCS_FT(
         nativeOrdinal = 1,
-        title = "Meta 混合时频母带 · HTDemucs-FT v4",
-        badge = "原声瞬态 · 零频谱断层",
-        subtitle = "Meta AI 时域波形 + 复数频谱双分支混合 Transformer 专精模型，鼓点、贝斯与原声乐器相位 100% 饱满自然"
+        title = "乐器音质优先",
+        badge = "适合鼓点/乐队伴奏",
+        subtitle = "适合摇滚、乐队或鼓点贝斯较重的歌曲。鼓点和低音乐器更饱满，但可能保留少量和声。"
     ),
     HYBRID_ENSEMBLE(
         nativeOrdinal = 2,
-        title = "双擎交叉融合 · Min-Spec 终极母带",
-        badge = "录音棚双模融合",
-        subtitle = "低频同相保留 HTDemucs-FT 饱满鼓贝斯瞬态，中高频执行 UVR Min-Spec 最小频谱交叉抑制，双重清除残余和声"
+        title = "双模型均衡模式",
+        badge = "耗时约 2 倍",
+        subtitle = "同时运行以上两种模型并结合结果：低音保留鼓点饱满度，中高音加强人声去除，耗时更长。"
     )
 }
 
@@ -39,20 +39,20 @@ enum class ExportFormat(
     val mimeType: String
 ) {
     MP3_320(
-        label = "MP3 320kbps 极高音质",
-        badge = "推荐微信分享 · 通用性强",
+        label = "MP3 (320kbps)",
+        badge = "推荐分享微信 · 兼容性最好",
         extension = "mp3",
         mimeType = "audio/mpeg"
     ),
     M4A_256(
-        label = "M4A 256kbps 超清AAC",
-        badge = "体积更小 · 听感通透",
+        label = "M4A (256kbps AAC)",
+        badge = "文件体积更小",
         extension = "m4a",
         mimeType = "audio/mp4"
     ),
     WAV_16(
-        label = "WAV 无损母带 (16-bit)",
-        badge = "零压缩无损 · 体积较大",
+        label = "WAV 无损格式 (16-bit)",
+        badge = "无损不压缩 · 文件较大",
         extension = "wav",
         mimeType = "audio/x-wav"
     )

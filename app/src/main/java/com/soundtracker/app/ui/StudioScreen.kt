@@ -434,12 +434,16 @@ private fun StudioTopBar(
         color = StudioBg,
         modifier = Modifier.fillMaxWidth()
     ) {
-        Column {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .statusBarsPadding()
+        ) {
+            // Row 1: App Title (full width, never squeezed) + Storage Resource Pill on right
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .statusBarsPadding()
-                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
@@ -462,113 +466,121 @@ private fun StudioTopBar(
                             modifier = Modifier.size(20.dp)
                         )
                     }
-                    Spacer(modifier = Modifier.width(8.dp))
+                    Spacer(modifier = Modifier.width(10.dp))
                     Column {
                         Text(
                             text = "SoundTracker",
                             style = MaterialTheme.typography.headlineSmall,
                             color = TextPrimary,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
+                            maxLines = 1
                         )
                         Text(
-                            text = "本地母带伴奏 · 移调变速工坊",
-                            fontSize = 10.sp,
+                            text = "伴奏提取 · 移调变速 · 音量放大",
+                            fontSize = 11.sp,
                             color = TextSecondary,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
+                            maxLines = 1
                         )
                     }
                 }
 
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                // Broom + Storage Size Button -> Opens Resource Manager List
+                Surface(
+                    onClick = onStoragePillClick,
+                    shape = RoundedCornerShape(20.dp),
+                    color = StudioSurface,
+                    border = BorderStroke(1.dp, StudioBorder)
                 ) {
-                    // Broom + Storage Size Button -> Opens Resource Manager List
-                    Surface(
-                        onClick = onStoragePillClick,
-                        shape = RoundedCornerShape(20.dp),
-                        color = StudioSurface,
-                        border = BorderStroke(1.dp, StudioBorder)
+                    Row(
+                        modifier = Modifier.padding(horizontal = 11.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(
-                                imageVector = Icons.Rounded.CleaningServices,
-                                contentDescription = "存储资源管理",
-                                tint = CyanPrimary,
-                                modifier = Modifier.size(14.dp)
-                            )
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text(
-                                text = formatBytesShort(ephemeralBytes),
-                                fontSize = 11.sp,
-                                fontFamily = FontFamily.Monospace,
-                                fontWeight = FontWeight.SemiBold,
-                                color = TextPrimary
-                            )
-                        }
+                        Icon(
+                            imageVector = Icons.Rounded.CleaningServices,
+                            contentDescription = "存储资源管理",
+                            tint = CyanPrimary,
+                            modifier = Modifier.size(15.dp)
+                        )
+                        Spacer(modifier = Modifier.width(5.dp))
+                        Text(
+                            text = formatBytesShort(ephemeralBytes),
+                            fontSize = 12.sp,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.SemiBold,
+                            color = TextPrimary
+                        )
                     }
+                }
+            }
 
-                    // NetEase Cloud Music Import Button
+            // Row 2: Quick Import Action Bar when tracks are loaded
+            if (trackCount > 0) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = 16.dp, end = 16.dp, bottom = 10.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
                     Surface(
                         onClick = onNetEaseClick,
-                        shape = RoundedCornerShape(20.dp),
+                        shape = RoundedCornerShape(10.dp),
                         color = CyanPrimary.copy(alpha = 0.12f),
-                        border = BorderStroke(1.dp, CyanPrimary.copy(alpha = 0.45f))
+                        border = BorderStroke(1.dp, CyanPrimary.copy(alpha = 0.40f)),
+                        modifier = Modifier.weight(1f)
                     ) {
                         Row(
-                            modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center
                         ) {
                             Icon(
                                 imageVector = Icons.Rounded.CloudDownload,
                                 contentDescription = "从网易云音乐导入",
                                 tint = CyanPrimary,
-                                modifier = Modifier.size(14.dp)
+                                modifier = Modifier.size(16.dp)
                             )
-                            Spacer(modifier = Modifier.width(4.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
                             Text(
-                                text = "网易云",
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = CyanPrimary
+                                text = "从网易云导入",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = CyanPrimary,
+                                maxLines = 1
                             )
                         }
                     }
 
-                    if (trackCount > 0) {
-                        Surface(
-                            onClick = onImportClick,
-                            shape = RoundedCornerShape(20.dp),
-                            color = VioletAccent,
-                            border = BorderStroke(1.dp, VioletAccent)
+                    Surface(
+                        onClick = onImportClick,
+                        shape = RoundedCornerShape(10.dp),
+                        color = VioletAccent,
+                        border = BorderStroke(1.dp, VioletAccent),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center
                         ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Rounded.Add,
-                                    contentDescription = null,
-                                    tint = OnAccentLight,
-                                    modifier = Modifier.size(14.dp)
-                                )
-                                Spacer(modifier = Modifier.width(2.dp))
-                                Text(
-                                    text = "导入",
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = OnAccentLight
-                                )
-                            }
+                            Icon(
+                                imageVector = Icons.Rounded.Add,
+                                contentDescription = null,
+                                tint = OnAccentLight,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(5.dp))
+                            Text(
+                                text = "导入本地音频",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = OnAccentLight,
+                                maxLines = 1
+                            )
                         }
                     }
                 }
             }
+
             HorizontalDivider(color = StudioBorder.copy(alpha = 0.7f), thickness = 0.75.dp)
         }
     }
@@ -609,7 +621,7 @@ private fun EmptyStudioHeroCard(
 
             Spacer(modifier = Modifier.height(14.dp))
             Text(
-                text = "导入音频，开启纯本地母带处理",
+                text = "导入音乐开始处理",
                 fontFamily = FontFamily.Serif,
                 fontSize = 19.sp,
                 fontWeight = FontWeight.Bold,
@@ -617,7 +629,7 @@ private fun EmptyStudioHeroCard(
             )
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = "支持一键从网易云音乐已下载曲目导入（NCM 自动无损转 FLAC/MP3）\n也支持本地 MP3 · FLAC · M4A · WAV · 视频提取音频",
+                text = "支持从网易云音乐导入已下载歌曲（NCM 自动转换为 FLAC 或 MP3）\n也支持直接选择手机中的 MP3、FLAC、M4A、WAV 或视频文件",
                 fontSize = 12.sp,
                 color = TextSecondary,
                 lineHeight = 19.sp,
@@ -638,7 +650,7 @@ private fun EmptyStudioHeroCard(
             ) {
                 Icon(Icons.Rounded.CloudDownload, contentDescription = null, modifier = Modifier.size(19.dp))
                 Spacer(modifier = Modifier.width(8.dp))
-                Text("从网易云音乐已下载导入 (NCM → FLAC/MP3)", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                Text("从网易云音乐导入 (NCM → FLAC/MP3)", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
             }
 
             Spacer(modifier = Modifier.height(10.dp))
@@ -663,9 +675,9 @@ private fun EmptyStudioHeroCard(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceEvenly
             ) {
-                FeaturePillBadge("双核母带去人声", CyanPrimary)
-                FeaturePillBadge("1 BPM 移调变速", WarmUmber)
-                FeaturePillBadge("无损防破音放大", EmeraldLossless)
+                FeaturePillBadge("提取伴奏", CyanPrimary)
+                FeaturePillBadge("升降调与变速", WarmUmber)
+                FeaturePillBadge("音量放大", EmeraldLossless)
             }
         }
     }
@@ -1211,20 +1223,20 @@ private fun VocalRemovalPanel(
             Spacer(modifier = Modifier.width(8.dp))
             Column {
                 Text(
-                    "双核 AI 母带级去人声提取伴奏",
+                    "提取伴奏（去除人声）",
                     fontFamily = FontFamily.Serif,
                     fontWeight = FontWeight.Bold,
                     color = TextPrimary
                 )
                 Text(
-                    "彻底告别老一代模型人声残影与过电声 · 22.05kHz 全频段高保真重建",
+                    "根据歌曲类型选择分离模式，将主唱和人声从音乐中去除",
                     fontSize = 12.sp,
                     color = TextSecondary
                 )
             }
         }
 
-        // 3 Studio Separation Architecture Cards
+        // 3 Separation Mode Cards
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             VocalEngineMode.entries.forEach { mode ->
                 val isSelected = mode == selectedMode
@@ -1266,11 +1278,9 @@ private fun VocalRemovalPanel(
                                 }
                                 Text(
                                     text = mode.title,
-                                    fontSize = 13.sp,
-                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
-                                    color = TextPrimary,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
+                                    fontSize = 14.sp,
+                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.SemiBold,
+                                    color = TextPrimary
                                 )
                             }
                             Surface(
@@ -1279,17 +1289,17 @@ private fun VocalRemovalPanel(
                             ) {
                                 Text(
                                     text = mode.badge,
-                                    fontSize = 10.sp,
+                                    fontSize = 11.sp,
                                     fontWeight = FontWeight.SemiBold,
                                     color = if (isSelected) CyanPrimary else TextMuted,
-                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
                                 )
                             }
                         }
                         Text(
                             text = mode.subtitle,
-                            fontSize = 11.sp,
-                            lineHeight = 16.sp,
+                            fontSize = 12.sp,
+                            lineHeight = 17.sp,
                             color = TextSecondary
                         )
                     }
@@ -1310,12 +1320,17 @@ private fun VocalRemovalPanel(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text("双向对称消噪增强", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = TextPrimary)
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(end = 10.dp)
+                    ) {
+                        Text("二次降噪处理", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = TextPrimary)
                         Text(
-                            if (enableDeepDenoise) "已开启正反双遍推理抵消偏置噪声，静音前奏更纯净（耗时约翻倍）"
-                            else "默认单遍极速推理已具备超净抑人声表现，遇到强底噪曲目可开启",
+                            if (enableDeepDenoise) "已开启：将对音频处理两遍以减少伴奏底噪（耗时约增加一倍）"
+                            else "如果分离后前奏或安静段落有沙沙底噪可开启，耗时约增加一倍",
                             fontSize = 11.sp,
+                            lineHeight = 16.sp,
                             color = TextMuted
                         )
                     }
@@ -1343,12 +1358,17 @@ private fun VocalRemovalPanel(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text("同时输出纯净清唱人声轨", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = TextPrimary)
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(end = 10.dp)
+                ) {
+                    Text("同时保存清唱人声", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = TextPrimary)
                     Text(
-                        if (keepVocalStem) "将同时生成「伴奏」与「纯人声」两条音轨"
-                        else "仅生成高质量纯伴奏，保持工作台精简清爽",
+                        if (keepVocalStem) "已开启：将同时生成「伴奏」和「纯人声」两条音轨"
+                        else "默认关闭：只生成伴奏音轨",
                         fontSize = 11.sp,
+                        lineHeight = 16.sp,
                         color = TextMuted
                     )
                 }
@@ -1376,11 +1396,10 @@ private fun VocalRemovalPanel(
             Icon(Icons.Rounded.AutoFixHigh, contentDescription = null, modifier = Modifier.size(19.dp))
             Spacer(modifier = Modifier.width(8.dp))
             Text(
-                text = "对「$trackName」提取高质量伴奏",
+                text = if (keepVocalStem) "开始提取伴奏与人声" else "开始提取伴奏",
                 fontWeight = FontWeight.SemiBold,
                 fontSize = 14.sp,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
+                maxLines = 1
             )
         }
     }
@@ -1417,19 +1436,15 @@ private fun PitchShiftAndTempoPanel(
                 Spacer(modifier = Modifier.width(8.dp))
                 Column {
                     Text(
-                        "母带级移调与 1 BPM 变速",
+                        "升降调与变速",
                         fontFamily = FontFamily.Serif,
                         fontWeight = FontWeight.Bold,
-                        color = TextPrimary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+                        color = TextPrimary
                     )
                     Text(
-                        text = "拖动滑杆快速定位，点击左右 - / + 按 1 BPM 或 1 半音精调",
-                        fontSize = 11.sp,
-                        color = TextSecondary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+                        text = "拖动滑杆快速调整，点击左右 - / + 按 1 BPM 或 1 个半音微调",
+                        fontSize = 12.sp,
+                        color = TextSecondary
                     )
                 }
             }
@@ -1477,9 +1492,9 @@ private fun PitchShiftAndTempoPanel(
                         Text(
                             text = if (hasBpmChange) {
                                 val sign = if (deltaBpm > 0) "+$deltaBpm" else "$deltaBpm"
-                                String.format(Locale.US, "原速 %d BPM · 变速 %s BPM (%.2fx)", sourceBpm, sign, speedRatio)
+                                String.format(Locale.US, "原速 %d BPM · 调整 %s BPM (%.2fx)", sourceBpm, sign, speedRatio)
                             } else {
-                                "识别原速: $sourceBpm BPM (1.00x · 不变速)"
+                                "原曲速度：$sourceBpm BPM（未变速）"
                             },
                             fontSize = 11.sp,
                             color = if (hasBpmChange) CyanPrimary else TextMuted,
@@ -1581,7 +1596,7 @@ private fun PitchShiftAndTempoPanel(
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = "半音升降调 (Key)",
+                            text = "升降调 (半音)",
                             fontSize = 13.sp,
                             fontWeight = FontWeight.SemiBold,
                             color = TextPrimary
@@ -1696,12 +1711,17 @@ private fun PitchShiftAndTempoPanel(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text("人声共振峰保护（纯伴奏请保持关闭）", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = TextPrimary)
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(end = 10.dp)
+                ) {
+                    Text("保持人声音色（含人声歌曲适用）", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = TextPrimary)
                     Text(
-                        if (preserveTimbre) "已开启 R3 多频段共振峰锁定：适合含主唱原曲防变声；对纯伴奏建议关闭"
-                        else "默认关闭（推荐纯伴奏）：严格锁定全频段整数倍泛音比例，彻底告别电音染色",
+                        if (preserveTimbre) "已开启：对含人声的原曲升降调时，避免人声变尖或变粗"
+                        else "默认关闭（适合纯伴奏）：对伴奏升降调时保持关闭，乐器音质更自然",
                         fontSize = 11.sp,
+                        lineHeight = 16.sp,
                         color = TextMuted
                     )
                 }
@@ -1719,16 +1739,16 @@ private fun PitchShiftAndTempoPanel(
         val actionButtonText = when {
             hasPitchChange && hasBpmChange -> {
                 val pStr = if (semitones > 0) "+$semitones 半音" else "$semitones 半音"
-                "移调 + 变速一次完成 ($pStr · ${sourceBpm}→${targetBpm} BPM)"
+                "开始移调与变速 ($pStr · ${sourceBpm}→${targetBpm} BPM)"
             }
             hasPitchChange -> {
                 val pStr = if (semitones > 0) "+$semitones 半音" else "$semitones 半音"
-                "执行母带移调 ($pStr · 保持 $sourceBpm BPM)"
+                "开始移调 ($pStr · 保持 $sourceBpm BPM)"
             }
             hasBpmChange -> {
-                "执行变速不变调 ($sourceBpm → $targetBpm BPM · 原调)"
+                "开始变速 ($sourceBpm → $targetBpm BPM · 原调)"
             }
-            else -> "执行移调 / 变速（请先调整上方速度或升降调）"
+            else -> "请先调整上方速度或升降调"
         }
 
         Button(
@@ -1797,13 +1817,13 @@ private fun VolumeBoostPanel(
             Spacer(modifier = Modifier.width(8.dp))
             Column {
                 Text(
-                    "尽量无损的母带级音量放大",
+                    "音量放大",
                     fontFamily = FontFamily.Serif,
                     fontWeight = FontWeight.Bold,
                     color = TextPrimary
                 )
                 Text(
-                    "余量内 100% 纯线性零失真放大 · 超余量启动 5ms 前瞻真峰值防破音保护",
+                    "在无损空间内等比例放大；继续放大时自动限制峰值，防止爆音破音",
                     fontSize = 12.sp,
                     color = TextSecondary
                 )
@@ -1823,13 +1843,13 @@ private fun VolumeBoostPanel(
                 modifier = Modifier.weight(1f)
             )
             MetricMiniCard(
-                label = "4x真峰值",
+                label = "最高峰值",
                 value = String.format(Locale.US, "%.1f dBTP", metrics.truePeakDbtp),
                 accent = CyanPrimary,
                 modifier = Modifier.weight(1f)
             )
             MetricMiniCard(
-                label = "纯无损余量",
+                label = "无损可放大",
                 value = String.format(Locale.US, "+%.1f dB", headroom),
                 accent = EmeraldLossless,
                 modifier = Modifier.weight(1f)
@@ -1850,7 +1870,7 @@ private fun VolumeBoostPanel(
                 border = BorderStroke(1.dp, EmeraldLossless.copy(alpha = 0.55f)),
                 contentPadding = PaddingValues(vertical = 8.dp, horizontal = 4.dp)
             ) {
-                Text("纯无损满幅", fontSize = 11.sp, color = EmeraldLossless, fontWeight = FontWeight.SemiBold)
+                Text("无损最大", fontSize = 11.sp, color = EmeraldLossless, fontWeight = FontWeight.SemiBold)
             }
 
             OutlinedButton(
@@ -1865,7 +1885,7 @@ private fun VolumeBoostPanel(
                 border = BorderStroke(1.dp, CyanPrimary.copy(alpha = 0.55f)),
                 contentPadding = PaddingValues(vertical = 8.dp, horizontal = 4.dp)
             ) {
-                Text("标准伴奏响度", fontSize = 11.sp, color = CyanPrimary, fontWeight = FontWeight.SemiBold)
+                Text("适中音量", fontSize = 11.sp, color = CyanPrimary, fontWeight = FontWeight.SemiBold)
             }
 
             OutlinedButton(
@@ -1880,7 +1900,7 @@ private fun VolumeBoostPanel(
                 border = BorderStroke(1.dp, AmberMastering.copy(alpha = 0.55f)),
                 contentPadding = PaddingValues(vertical = 8.dp, horizontal = 4.dp)
             ) {
-                Text("舞台强劲响度", fontSize = 11.sp, color = AmberMastering, fontWeight = FontWeight.SemiBold)
+                Text("较大音量", fontSize = 11.sp, color = AmberMastering, fontWeight = FontWeight.SemiBold)
             }
         }
 
@@ -1924,7 +1944,7 @@ private fun VolumeBoostPanel(
             )
         }
 
-        // Dynamic Lossless vs True-Peak Limiter Status Banner
+        // Dynamic Lossless vs Limiter Status Banner
         val modeColor = if (isPureLosslessZone) EmeraldLossless else AmberMastering
         Surface(
             shape = RoundedCornerShape(12.dp),
@@ -1933,9 +1953,9 @@ private fun VolumeBoostPanel(
         ) {
             Text(
                 text = if (isPureLosslessZone) {
-                    "当前处于【100% 纯线性无损区】：峰值未触及上限，仅执行高精度浮点比例放大，动态范围与波形比例零改变。"
+                    "当前放大倍数在无损空间内：仅等比例调大整体音量，不会产生任何失真或破音。"
                 } else {
-                    "当前处于【母带前瞻防破音保护区】：安静段落纯线性放大，仅对超出 -0.2 dBTP 的鼓点瞬态执行 5ms 前瞻平滑限幅，音量响亮且绝不爆音。"
+                    "当前放大倍数超出原始峰值空间：已自动启用防破音保护，在提高整体音量的同时压制过高峰值，避免爆音。"
                 },
                 fontSize = 11.sp,
                 lineHeight = 17.sp,
@@ -1957,7 +1977,7 @@ private fun VolumeBoostPanel(
             Icon(Icons.AutoMirrored.Rounded.VolumeUp, contentDescription = null, modifier = Modifier.size(19.dp))
             Spacer(modifier = Modifier.width(8.dp))
             Text(
-                text = String.format(Locale.US, "执行音量放大 (+%.1f dB · 零破音)", gainDb),
+                text = String.format(Locale.US, "开始放大音量 (+%.1f dB)", gainDb),
                 fontWeight = FontWeight.SemiBold,
                 fontSize = 14.sp
             )
