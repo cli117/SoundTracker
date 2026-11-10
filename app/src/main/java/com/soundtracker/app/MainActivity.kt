@@ -134,6 +134,7 @@ class MainActivity : ComponentActivity() {
                     onAdjustTargetBpmBy = viewModel::adjustTargetBpmBy,
                     onCalibrateSourceBpm = viewModel::calibrateSourceBpm,
                     onPreserveTimbreChange = viewModel::setPreserveTimbre,
+                    onLivePitchPreviewChange = viewModel::setLivePitchTempoPreview,
                     onRunPitchShift = viewModel::runPitchShift,
                     onVolumeGainChange = viewModel::setVolumeGainDb,
                     onRunVolumeBoost = viewModel::runVolumeBoost,

@@ -14,8 +14,8 @@ android {
         applicationId = "com.soundtracker.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 5
-        versionName = "2.3.0"
+        versionCode = 6
+        versionName = "2.4.0"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a")

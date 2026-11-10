@@ -11,6 +11,8 @@ import androidx.media3.exoplayer.ExoPlayer
 import com.soundtracker.app.audio.AudioCodecHelper
 import com.soundtracker.app.audio.NetEaseCloudMusicManager
 import com.soundtracker.app.audio.NetEaseLocalTrack
+import com.soundtracker.app.audio.RealtimePitchAudioProcessor
+import com.soundtracker.app.audio.buildRealtimePreviewExoPlayer
 import com.soundtracker.app.dsp.AudioMetrics
 import com.soundtracker.app.dsp.ExportFormat
 import com.soundtracker.app.dsp.NativeAudioEngine
@@ -73,12 +75,13 @@ data class StudioUiState(
     val vocalEngineMode: VocalEngineMode = VocalEngineMode.INST_HQ5_DIRECT,
     val enableDeepDenoise: Boolean = false,
     val keepVocalStemToo: Boolean = false,
-    // Tool 2 options (Pitch + 1-BPM Tempo)
+    // Tool 2 options (Pitch + 1-BPM Tempo + Real-time "边听边调" preview)
     val pitchSemitones: Int = 0,
     val pitchCents: Int = 0,
     val sourceBpm: Int = 120,
     val targetBpm: Int = 120,
     val preserveTimbre: Boolean = false,
+    val livePitchTempoPreview: Boolean = true,
     // Tool 3 options
     val volumeGainDb: Float = 4.0f,
     // Export format
@@ -101,6 +104,27 @@ data class StudioUiState(
             if (rootId == cur.id) return null
             return tracks.firstOrNull { it.id == rootId && it.audioFile.exists() }
         }
+
+    val isLivePitchTempoPreviewActive: Boolean
+        get() = activeTab == StudioToolTab.PITCH_SHIFT &&
+            livePitchTempoPreview &&
+            !isComparingOriginal &&
+            (pitchSemitones != 0 || pitchCents != 0 || targetBpm != sourceBpm)
+
+    val livePreviewSummaryLabel: String?
+        get() {
+            if (!isLivePitchTempoPreviewActive) return null
+            val parts = buildList {
+                if (pitchSemitones != 0 || pitchCents != 0) {
+                    val semiStr = if (pitchSemitones > 0) "+$pitchSemitones" else "$pitchSemitones"
+                    add("${semiStr}半音")
+                }
+                if (targetBpm != sourceBpm) {
+                    add("${targetBpm}BPM")
+                }
+            }
+            return if (parts.isEmpty()) null else "实时预览 · ${parts.joinToString(" · ")}"
+        }
 }
 
 sealed interface StudioUiEvent {
@@ -118,11 +142,18 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     private val _events = Channel<StudioUiEvent>(Channel.BUFFERED)
     val events = _events.receiveAsFlow()
 
-    private val exoPlayer: ExoPlayer = ExoPlayer.Builder(appContext).build()
+    private val realtimePitchProcessor = RealtimePitchAudioProcessor()
+    private val exoPlayer: ExoPlayer = buildRealtimePreviewExoPlayer(appContext, realtimePitchProcessor)
     private var loadedPlayerFilePath: String? = null
     private var activeProcessingJob: Job? = null
 
     init {
+        viewModelScope.launch {
+            _uiState.collect { state ->
+                syncRealtimePreviewProcessor(state)
+            }
+        }
+
         exoPlayer.addListener(object : Player.Listener {
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 _uiState.update { it.copy(isPlaying = isPlaying) }
@@ -199,11 +230,14 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 isComparingOriginal = false,
                 playbackPositionMs = 0L,
                 playbackDurationMs = (track.metrics.durationSec * 1000f).toLong(),
+                pitchSemitones = 0,
+                pitchCents = 0,
                 sourceBpm = detectedBpm,
                 targetBpm = detectedBpm,
                 volumeGainDb = smartDefaultGain
             )
         }
+        syncRealtimePreviewProcessor()
         preparePlayerForTrack(track, seekMs = 0L, playImmediately = false)
     }
 
@@ -275,6 +309,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         val nextTrack = if (nextCompare) origTrack else curTrack
 
         _uiState.update { it.copy(isComparingOriginal = nextCompare, playbackPositionMs = currentPos) }
+        syncRealtimePreviewProcessor()
         preparePlayerForTrack(nextTrack, seekMs = currentPos, playImmediately = wasPlaying)
     }
 
@@ -295,6 +330,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     fun selectTab(tab: StudioToolTab) {
         _uiState.update { it.copy(activeTab = tab) }
+        syncRealtimePreviewProcessor()
     }
 
     fun setVocalEngineMode(mode: VocalEngineMode) {
@@ -311,27 +347,54 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     fun setPitchSemitones(semitones: Int) {
         _uiState.update { it.copy(pitchSemitones = semitones.coerceIn(-12, 12)) }
+        syncRealtimePreviewProcessor()
     }
 
     fun setPitchCents(cents: Int) {
         _uiState.update { it.copy(pitchCents = cents.coerceIn(-50, 50)) }
+        syncRealtimePreviewProcessor()
     }
 
     fun setTargetBpm(bpm: Int) {
         _uiState.update { it.copy(targetBpm = bpm.coerceIn(40, 240)) }
+        syncRealtimePreviewProcessor()
     }
 
     fun adjustTargetBpmBy(delta: Int) {
         _uiState.update { it.copy(targetBpm = (it.targetBpm + delta).coerceIn(40, 240)) }
+        syncRealtimePreviewProcessor()
     }
 
     fun calibrateSourceBpm(newSourceBpm: Int) {
         val clamped = newSourceBpm.coerceIn(40, 240)
         _uiState.update { it.copy(sourceBpm = clamped, targetBpm = clamped) }
+        syncRealtimePreviewProcessor()
     }
 
     fun setPreserveTimbre(preserve: Boolean) {
         _uiState.update { it.copy(preserveTimbre = preserve) }
+        syncRealtimePreviewProcessor()
+    }
+
+    fun setLivePitchTempoPreview(enabled: Boolean) {
+        _uiState.update { it.copy(livePitchTempoPreview = enabled) }
+        syncRealtimePreviewProcessor()
+    }
+
+    private fun syncRealtimePreviewProcessor(state: StudioUiState = _uiState.value) {
+        val enabled = state.activeTab == StudioToolTab.PITCH_SHIFT &&
+            state.livePitchTempoPreview &&
+            !state.isComparingOriginal
+        val semitones = state.pitchSemitones + (state.pitchCents / 100f)
+        val srcBpm = state.sourceBpm.coerceIn(40, 240).toDouble()
+        val dstBpm = state.targetBpm.coerceIn(40, 240).toDouble()
+        val timeRatio = srcBpm / dstBpm
+        realtimePitchProcessor.updatePreviewConfig(
+            enabled = enabled,
+            semitones = semitones,
+            timeRatio = timeRatio,
+            preserveTimbre = state.preserveTimbre
+        )
     }
 
     fun setVolumeGainDb(gainDb: Float) {
@@ -1246,18 +1309,22 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         val nextSelectedTrack = remaining.firstOrNull { it.id == state.selectedTrackId } ?: remaining.firstOrNull()
         val nextBpm = nextSelectedTrack?.metrics?.detectedBpm?.roundToInt()?.coerceIn(45, 220) ?: 120
 
+        val switchedTrack = nextSelectedTrack?.id != state.selectedTrackId
         _uiState.update {
             it.copy(
                 tracks = remaining,
                 selectedTrackId = nextSelectedTrack?.id,
                 isPlaying = if (loadedPlayerFilePath == null) false else it.isPlaying,
                 isComparingOriginal = false,
-                playbackPositionMs = if (nextSelectedTrack?.id != state.selectedTrackId) 0L else it.playbackPositionMs,
+                playbackPositionMs = if (switchedTrack) 0L else it.playbackPositionMs,
                 playbackDurationMs = ((nextSelectedTrack?.metrics?.durationSec ?: 0f) * 1000f).toLong(),
-                sourceBpm = if (nextSelectedTrack?.id != state.selectedTrackId) nextBpm else it.sourceBpm,
-                targetBpm = if (nextSelectedTrack?.id != state.selectedTrackId) nextBpm else it.targetBpm
+                pitchSemitones = if (switchedTrack) 0 else it.pitchSemitones,
+                pitchCents = if (switchedTrack) 0 else it.pitchCents,
+                sourceBpm = if (switchedTrack) nextBpm else it.sourceBpm,
+                targetBpm = if (switchedTrack) nextBpm else it.targetBpm
             )
         }
+        syncRealtimePreviewProcessor()
         refreshStorageInfo()
         val freedMb = String.format(Locale.US, "%.1f MB", freedBytes / (1024.0 * 1024.0))
         sendMessage("已删除 ${filePaths.size} 项资源，释放 $freedMb")
@@ -1277,9 +1344,12 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 isPlaying = false,
                 isComparingOriginal = false,
                 playbackPositionMs = 0L,
-                playbackDurationMs = 0L
+                playbackDurationMs = 0L,
+                pitchSemitones = 0,
+                pitchCents = 0
             )
         }
+        syncRealtimePreviewProcessor()
         refreshStorageInfo()
         sendMessage("已一键清空全部应用内音频资源")
     }
@@ -1317,11 +1387,14 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 isComparingOriginal = false,
                 playbackPositionMs = 0L,
                 playbackDurationMs = (newTrack.metrics.durationSec * 1000f).toLong(),
+                pitchSemitones = 0,
+                pitchCents = 0,
                 sourceBpm = detectedBpm,
                 targetBpm = detectedBpm,
                 volumeGainDb = smartGain
             )
         }
+        syncRealtimePreviewProcessor()
         preparePlayerForTrack(newTrack, seekMs = 0L, playImmediately = false)
     }
 

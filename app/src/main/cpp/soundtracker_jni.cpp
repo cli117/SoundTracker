@@ -326,4 +326,172 @@ Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeConvertToStandardWav(
     return soundtracker::writeWavFile(outPath, buf, false, &err) ? JNI_TRUE : JNI_FALSE;
 }
 
+// ============================================================================
+// Real-Time Streaming Pitch & Tempo Preview ("边听边调") JNI Bridge
+// ============================================================================
+
+JNIEXPORT jlong JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeCreateRealtimeShifter(
+    JNIEnv*,
+    jobject,
+    jint sampleRate,
+    jint channels
+) {
+    auto* shifter = new soundtracker::RealtimePitchShifter(
+        static_cast<int>(sampleRate),
+        static_cast<int>(channels)
+    );
+    return reinterpret_cast<jlong>(shifter);
+}
+
+JNIEXPORT void JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeDestroyRealtimeShifter(
+    JNIEnv*,
+    jobject,
+    jlong handle
+) {
+    if (handle == 0) return;
+    auto* shifter = reinterpret_cast<soundtracker::RealtimePitchShifter*>(handle);
+    delete shifter;
+}
+
+JNIEXPORT void JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeResetRealtimeShifter(
+    JNIEnv*,
+    jobject,
+    jlong handle
+) {
+    if (handle == 0) return;
+    auto* shifter = reinterpret_cast<soundtracker::RealtimePitchShifter*>(handle);
+    shifter->reset();
+}
+
+JNIEXPORT void JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeSetRealtimeShifterParams(
+    JNIEnv*,
+    jobject,
+    jlong handle,
+    jfloat semitones,
+    jdouble timeRatio,
+    jboolean preserveTimbre
+) {
+    if (handle == 0) return;
+    auto* shifter = reinterpret_cast<soundtracker::RealtimePitchShifter*>(handle);
+    shifter->setParameters(
+        static_cast<float>(semitones),
+        static_cast<double>(timeRatio),
+        preserveTimbre == JNI_TRUE
+    );
+}
+
+JNIEXPORT jint JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeProcessRealtimeShifter(
+    JNIEnv* env,
+    jobject,
+    jlong handle,
+    jshortArray jInPcm,
+    jint inFrames,
+    jshortArray jOutPcm,
+    jint maxOutFrames
+) {
+    if (handle == 0 || !jOutPcm || maxOutFrames <= 0) return 0;
+    auto* shifter = reinterpret_cast<soundtracker::RealtimePitchShifter*>(handle);
+    const int ch = shifter->channels();
+
+    static thread_local std::vector<int16_t> tlInBuf;
+    static thread_local std::vector<int16_t> tlOutBuf;
+
+    const int safeInFrames = (jInPcm && inFrames > 0) ? static_cast<int>(inFrames) : 0;
+    const size_t inSamples = static_cast<size_t>(safeInFrames) * static_cast<size_t>(ch);
+    if (inSamples > 0) {
+        if (tlInBuf.size() < inSamples) {
+            tlInBuf.resize(inSamples);
+        }
+        env->GetShortArrayRegion(jInPcm, 0, static_cast<jsize>(inSamples), tlInBuf.data());
+    }
+
+    const size_t maxOutSamples = static_cast<size_t>(maxOutFrames) * static_cast<size_t>(ch);
+    if (tlOutBuf.size() < maxOutSamples) {
+        tlOutBuf.resize(maxOutSamples);
+    }
+
+    const int outFrames = shifter->processInterleavedInt16(
+        inSamples > 0 ? tlInBuf.data() : nullptr,
+        safeInFrames,
+        tlOutBuf.data(),
+        static_cast<int>(maxOutFrames)
+    );
+    if (outFrames > 0) {
+        const jsize outSamples = static_cast<jsize>(outFrames * ch);
+        env->SetShortArrayRegion(jOutPcm, 0, outSamples, tlOutBuf.data());
+    }
+    return static_cast<jint>(outFrames);
+}
+
+JNIEXPORT jint JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeDrainRealtimeShifter(
+    JNIEnv* env,
+    jobject,
+    jlong handle,
+    jshortArray jOutPcm,
+    jint maxOutFrames
+) {
+    if (handle == 0 || !jOutPcm || maxOutFrames <= 0) return 0;
+    auto* shifter = reinterpret_cast<soundtracker::RealtimePitchShifter*>(handle);
+    const int ch = shifter->channels();
+
+    static thread_local std::vector<int16_t> tlOutBuf;
+    const size_t maxOutSamples = static_cast<size_t>(maxOutFrames) * static_cast<size_t>(ch);
+    if (tlOutBuf.size() < maxOutSamples) {
+        tlOutBuf.resize(maxOutSamples);
+    }
+
+    const int outFrames = shifter->drainPendingInt16(
+        tlOutBuf.data(),
+        static_cast<int>(maxOutFrames)
+    );
+    if (outFrames > 0) {
+        env->SetShortArrayRegion(
+            jOutPcm,
+            0,
+            static_cast<jsize>(outFrames * ch),
+            tlOutBuf.data()
+        );
+    }
+    return static_cast<jint>(outFrames);
+}
+
+JNIEXPORT jint JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeFinishRealtimeShifter(
+    JNIEnv* env,
+    jobject,
+    jlong handle,
+    jshortArray jOutPcm,
+    jint maxOutFrames
+) {
+    if (handle == 0 || !jOutPcm || maxOutFrames <= 0) return 0;
+    auto* shifter = reinterpret_cast<soundtracker::RealtimePitchShifter*>(handle);
+    const int ch = shifter->channels();
+
+    static thread_local std::vector<int16_t> tlOutBuf;
+    const size_t maxOutSamples = static_cast<size_t>(maxOutFrames) * static_cast<size_t>(ch);
+    if (tlOutBuf.size() < maxOutSamples) {
+        tlOutBuf.resize(maxOutSamples);
+    }
+
+    const int outFrames = shifter->finishInterleavedInt16(
+        tlOutBuf.data(),
+        static_cast<int>(maxOutFrames)
+    );
+    if (outFrames > 0) {
+        env->SetShortArrayRegion(
+            jOutPcm,
+            0,
+            static_cast<jsize>(outFrames * ch),
+            tlOutBuf.data()
+        );
+    }
+    return static_cast<jint>(outFrames);
+}
+
 } // extern "C"

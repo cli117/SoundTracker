@@ -37,6 +37,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
@@ -64,6 +65,7 @@ import androidx.compose.material.icons.rounded.LibraryMusic
 import androidx.compose.material.icons.rounded.MusicNote
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.RadioButtonUnchecked
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Replay5
 import androidx.compose.material.icons.rounded.SaveAlt
@@ -125,6 +127,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.Velocity
@@ -184,6 +187,7 @@ fun StudioScreen(
     onAdjustTargetBpmBy: (Int) -> Unit,
     onCalibrateSourceBpm: (Int) -> Unit,
     onPreserveTimbreChange: (Boolean) -> Unit,
+    onLivePitchPreviewChange: (Boolean) -> Unit,
     onRunPitchShift: () -> Unit,
     onVolumeGainChange: (Float) -> Unit,
     onRunVolumeBoost: () -> Unit,
@@ -256,6 +260,7 @@ fun StudioScreen(
                             track = activeTrack,
                             hasOriginForAb = uiState.originComparisonTrack != null,
                             isComparingOriginal = uiState.isComparingOriginal,
+                            livePreviewBadgeText = uiState.livePreviewSummaryLabel,
                             isPlaying = uiState.isPlaying,
                             positionMs = uiState.playbackPositionMs,
                             durationMs = uiState.playbackDurationMs.takeIf { it > 0 }
@@ -279,6 +284,7 @@ fun StudioScreen(
                             uiState = uiState,
                             activeTrack = activeTrack,
                             onSelectTab = onSelectTab,
+                            onTogglePlayPause = onTogglePlayPause,
                             onVocalEngineModeChange = onVocalEngineModeChange,
                             onEnableDeepDenoiseChange = onEnableDeepDenoiseChange,
                             onKeepVocalChange = onKeepVocalChange,
@@ -289,6 +295,7 @@ fun StudioScreen(
                             onAdjustTargetBpmBy = onAdjustTargetBpmBy,
                             onCalibrateSourceBpm = onCalibrateSourceBpm,
                             onPreserveTimbreChange = onPreserveTimbreChange,
+                            onLivePitchPreviewChange = onLivePitchPreviewChange,
                             onRunPitchShift = onRunPitchShift,
                             onVolumeGainChange = onVolumeGainChange,
                             onRunVolumeBoost = onRunVolumeBoost
@@ -706,6 +713,7 @@ private fun ActiveTrackDeckCard(
     track: SessionTrack,
     hasOriginForAb: Boolean,
     isComparingOriginal: Boolean,
+    livePreviewBadgeText: String?,
     isPlaying: Boolean,
     positionMs: Long,
     durationMs: Long,
@@ -725,7 +733,7 @@ private fun ActiveTrackDeckCard(
         colors = CardDefaults.cardColors(containerColor = StudioSurface),
         border = BorderStroke(
             width = 1.dp,
-            color = if (isComparingOriginal) CyanPrimary else StudioBorder
+            color = if (isComparingOriginal || livePreviewBadgeText != null) CyanPrimary else StudioBorder
         ),
         modifier = Modifier.fillMaxWidth()
     ) {
@@ -736,10 +744,14 @@ private fun ActiveTrackDeckCard(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Column(modifier = Modifier.weight(1f)) {
+                Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
                     Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(22.dp)
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
                         Surface(
                             shape = RoundedCornerShape(6.dp),
@@ -750,6 +762,7 @@ private fun ActiveTrackDeckCard(
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.SemiBold,
                                 color = if (isComparingOriginal) WarmUmber else CyanPrimary,
+                                maxLines = 1,
                                 modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
                             )
                         }
@@ -764,8 +777,25 @@ private fun ActiveTrackDeckCard(
                                 fontFamily = FontFamily.Monospace,
                                 fontWeight = FontWeight.SemiBold,
                                 color = TextSecondary,
+                                maxLines = 1,
                                 modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                             )
+                        }
+
+                        if (livePreviewBadgeText != null) {
+                            Surface(
+                                shape = RoundedCornerShape(6.dp),
+                                color = CyanPrimary
+                            ) {
+                                Text(
+                                    text = livePreviewBadgeText,
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = OnAccentLight,
+                                    maxLines = 1,
+                                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
+                                )
+                            }
                         }
 
                         if (track.savedLocalPath != null) {
@@ -778,6 +808,7 @@ private fun ActiveTrackDeckCard(
                                     fontSize = 10.sp,
                                     fontWeight = FontWeight.Medium,
                                     color = EmeraldLossless,
+                                    maxLines = 1,
                                     modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                                 )
                             }
@@ -1100,6 +1131,7 @@ private fun StudioDspWorkbenchCard(
     uiState: StudioUiState,
     activeTrack: SessionTrack,
     onSelectTab: (StudioToolTab) -> Unit,
+    onTogglePlayPause: () -> Unit,
     onVocalEngineModeChange: (VocalEngineMode) -> Unit,
     onEnableDeepDenoiseChange: (Boolean) -> Unit,
     onKeepVocalChange: (Boolean) -> Unit,
@@ -1110,6 +1142,7 @@ private fun StudioDspWorkbenchCard(
     onAdjustTargetBpmBy: (Int) -> Unit,
     onCalibrateSourceBpm: (Int) -> Unit,
     onPreserveTimbreChange: (Boolean) -> Unit,
+    onLivePitchPreviewChange: (Boolean) -> Unit,
     onRunPitchShift: () -> Unit,
     onVolumeGainChange: (Float) -> Unit,
     onRunVolumeBoost: () -> Unit
@@ -1178,11 +1211,16 @@ private fun StudioDspWorkbenchCard(
 
                 StudioToolTab.PITCH_SHIFT -> {
                     PitchShiftAndTempoPanel(
+                        isPlaying = uiState.isPlaying,
+                        isComparingOriginal = uiState.isComparingOriginal,
+                        livePreviewEnabled = uiState.livePitchTempoPreview,
                         semitones = uiState.pitchSemitones,
                         cents = uiState.pitchCents,
                         sourceBpm = uiState.sourceBpm,
                         targetBpm = uiState.targetBpm,
                         preserveTimbre = uiState.preserveTimbre,
+                        onTogglePlayPause = onTogglePlayPause,
+                        onLivePreviewChange = onLivePitchPreviewChange,
                         onSemitonesChange = onPitchSemitonesChange,
                         onCentsChange = onPitchCentsChange,
                         onTargetBpmChange = onTargetBpmChange,
@@ -1268,19 +1306,19 @@ private fun VocalRemovalPanel(
                                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                                 modifier = Modifier.weight(1f)
                             ) {
-                                if (isSelected) {
-                                    Icon(
-                                        imageVector = Icons.Rounded.CheckCircle,
-                                        contentDescription = null,
-                                        tint = CyanPrimary,
-                                        modifier = Modifier.size(16.dp)
-                                    )
-                                }
+                                Icon(
+                                    imageVector = if (isSelected) Icons.Rounded.CheckCircle else Icons.Rounded.RadioButtonUnchecked,
+                                    contentDescription = null,
+                                    tint = if (isSelected) CyanPrimary else TextMuted.copy(alpha = 0.55f),
+                                    modifier = Modifier.size(16.dp)
+                                )
                                 Text(
                                     text = mode.title,
                                     fontSize = 14.sp,
                                     fontWeight = if (isSelected) FontWeight.Bold else FontWeight.SemiBold,
-                                    color = TextPrimary
+                                    color = TextPrimary,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
                                 )
                             }
                             Surface(
@@ -1307,42 +1345,54 @@ private fun VocalRemovalPanel(
             }
         }
 
-        AnimatedVisibility(visible = selectedMode != VocalEngineMode.HTDEMUCS_FT) {
-            Surface(
-                shape = RoundedCornerShape(12.dp),
-                color = StudioSurfaceElevated.copy(alpha = 0.65f),
-                border = BorderStroke(1.dp, StudioBorder)
+        val denoiseSupported = selectedMode != VocalEngineMode.HTDEMUCS_FT
+        Surface(
+            shape = RoundedCornerShape(12.dp),
+            color = StudioSurfaceElevated.copy(alpha = if (denoiseSupported) 0.65f else 0.38f),
+            border = BorderStroke(1.dp, StudioBorder)
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 9.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Row(
+                Column(
                     modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 14.dp, vertical = 9.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
+                        .weight(1f)
+                        .padding(end = 10.dp)
                 ) {
-                    Column(
-                        modifier = Modifier
-                            .weight(1f)
-                            .padding(end = 10.dp)
-                    ) {
-                        Text("二次降噪处理", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = TextPrimary)
-                        Text(
-                            if (enableDeepDenoise) "已开启：将对音频处理两遍以减少伴奏底噪（耗时约增加一倍）"
-                            else "如果分离后前奏或安静段落有沙沙底噪可开启，耗时约增加一倍",
-                            fontSize = 11.sp,
-                            lineHeight = 16.sp,
-                            color = TextMuted
-                        )
-                    }
-                    Switch(
-                        checked = enableDeepDenoise,
-                        onCheckedChange = onEnableDeepDenoiseChange,
-                        colors = SwitchDefaults.colors(
-                            checkedThumbColor = OnAccentLight,
-                            checkedTrackColor = CyanPrimary
-                        )
+                    Text(
+                        text = "二次降噪处理",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = if (denoiseSupported) TextPrimary else TextMuted,
+                        maxLines = 1
+                    )
+                    Text(
+                        text = when {
+                            !denoiseSupported -> "「乐器音质优先」模式无需二次降噪，切换其他模式时可开启"
+                            enableDeepDenoise -> "已开启：将对音频处理两遍以减少伴奏底噪（耗时约增加一倍）"
+                            else -> "若分离后安静段落有沙沙底噪可开启，处理耗时约增加一倍"
+                        },
+                        fontSize = 11.sp,
+                        lineHeight = 16.sp,
+                        color = TextMuted,
+                        minLines = 2,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
+                Switch(
+                    checked = denoiseSupported && enableDeepDenoise,
+                    onCheckedChange = onEnableDeepDenoiseChange,
+                    enabled = denoiseSupported,
+                    colors = SwitchDefaults.colors(
+                        checkedThumbColor = OnAccentLight,
+                        checkedTrackColor = CyanPrimary
+                    )
+                )
             }
         }
 
@@ -1363,13 +1413,22 @@ private fun VocalRemovalPanel(
                         .weight(1f)
                         .padding(end = 10.dp)
                 ) {
-                    Text("同时保存清唱人声", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = TextPrimary)
                     Text(
-                        if (keepVocalStem) "已开启：将同时生成「伴奏」和「纯人声」两条音轨"
+                        text = "同时保存清唱人声",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = TextPrimary,
+                        maxLines = 1
+                    )
+                    Text(
+                        text = if (keepVocalStem) "已开启：同时生成伴奏和纯人声两条音轨"
                         else "默认关闭：只生成伴奏音轨",
                         fontSize = 11.sp,
                         lineHeight = 16.sp,
-                        color = TextMuted
+                        color = TextMuted,
+                        minLines = 1,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
                 Switch(
@@ -1407,11 +1466,16 @@ private fun VocalRemovalPanel(
 
 @Composable
 private fun PitchShiftAndTempoPanel(
+    isPlaying: Boolean,
+    isComparingOriginal: Boolean,
+    livePreviewEnabled: Boolean,
     semitones: Int,
     cents: Int,
     sourceBpm: Int,
     targetBpm: Int,
     preserveTimbre: Boolean,
+    onTogglePlayPause: () -> Unit,
+    onLivePreviewChange: (Boolean) -> Unit,
     onSemitonesChange: (Int) -> Unit,
     onCentsChange: (Int) -> Unit,
     onTargetBpmChange: (Int) -> Unit,
@@ -1424,47 +1488,206 @@ private fun PitchShiftAndTempoPanel(
     val hasBpmChange = targetBpm != sourceBpm
     val speedRatio = if (sourceBpm > 0) targetBpm.toFloat() / sourceBpm.toFloat() else 1.0f
     val deltaBpm = targetBpm - sourceBpm
+    val isLiveAuditioningModified = livePreviewEnabled && !isComparingOriginal && (hasPitchChange || hasBpmChange)
+
+    val hasAnyChange = hasPitchChange || hasBpmChange
 
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(42.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(end = 8.dp)
+            ) {
                 Icon(Icons.Rounded.Tune, contentDescription = null, tint = CyanPrimary)
                 Spacer(modifier = Modifier.width(8.dp))
                 Column {
                     Text(
-                        "升降调与变速",
+                        text = "升降调与变速",
                         fontFamily = FontFamily.Serif,
                         fontWeight = FontWeight.Bold,
-                        color = TextPrimary
+                        color = TextPrimary,
+                        maxLines = 1
                     )
                     Text(
-                        text = "拖动滑杆快速调整，点击左右 - / + 按 1 BPM 或 1 个半音微调",
+                        text = "可边播边调试听，调好后生成新音轨",
                         fontSize = 12.sp,
-                        color = TextSecondary
+                        color = TextSecondary,
+                        minLines = 1,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
             }
 
-            if (hasPitchChange || hasBpmChange) {
-                TextButton(
-                    onClick = {
+            val resetShape = RoundedCornerShape(8.dp)
+            Surface(
+                shape = resetShape,
+                color = if (hasAnyChange) CyanPrimary.copy(alpha = 0.12f) else StudioSurfaceElevated.copy(alpha = 0.5f),
+                border = BorderStroke(
+                    1.dp,
+                    if (hasAnyChange) CyanPrimary.copy(alpha = 0.45f) else StudioBorder.copy(alpha = 0.6f)
+                ),
+                modifier = Modifier
+                    .clip(resetShape)
+                    .clickable(enabled = hasAnyChange) {
                         onSemitonesChange(0)
                         onCentsChange(0)
                         onTargetBpmChange(sourceBpm)
-                    },
-                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                    }
+            ) {
+                Text(
+                    text = "全部复位",
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = if (hasAnyChange) CyanPrimary else TextMuted.copy(alpha = 0.45f),
+                    maxLines = 1,
+                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp)
+                )
+            }
+        }
+
+        // ====================================================================
+        // Real-Time Audition ("边听边调") Control Bar — Locked Constant Height
+        // ====================================================================
+        Surface(
+            shape = RoundedCornerShape(14.dp),
+            color = if (isLiveAuditioningModified) CyanPrimary.copy(alpha = 0.08f) else StudioSurfaceElevated.copy(alpha = 0.65f),
+            border = BorderStroke(
+                width = 1.dp,
+                color = if (isLiveAuditioningModified) CyanPrimary.copy(alpha = 0.55f) else StudioBorder
+            )
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Text("全部复位", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = CyanPrimary)
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(end = 10.dp),
+                        verticalArrangement = Arrangement.spacedBy(2.dp)
+                    ) {
+                        Text(
+                            text = "边听边调实时预览",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = TextPrimary,
+                            minLines = 1,
+                            maxLines = 1
+                        )
+                        Text(
+                            text = if (livePreviewEnabled) {
+                                "播放时拖动滑杆或点 − / + 可直接听到变调和变速效果；确定后点最下方按钮生成音轨"
+                            } else {
+                                "实时预览已关闭，播放时试听未处理的原音轨；调整参数后点最下方按钮生成音轨"
+                            },
+                            fontSize = 11.sp,
+                            lineHeight = 16.sp,
+                            color = TextMuted,
+                            minLines = 2,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+
+                    Switch(
+                        checked = livePreviewEnabled,
+                        onCheckedChange = onLivePreviewChange,
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = OnAccentLight,
+                            checkedTrackColor = CyanPrimary
+                        )
+                    )
+                }
+
+                HorizontalDivider(color = StudioBorder.copy(alpha = 0.7f))
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(32.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    val playBtnShape = RoundedCornerShape(9.dp)
+                    Surface(
+                        shape = playBtnShape,
+                        color = if (isPlaying) CyanPrimary else StudioSurface,
+                        border = BorderStroke(1.dp, if (isPlaying) CyanPrimary else StudioBorder),
+                        modifier = Modifier
+                            .height(32.dp)
+                            .clip(playBtnShape)
+                            .clickable(onClick = onTogglePlayPause)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.padding(horizontal = 11.dp, vertical = 6.dp)
+                        ) {
+                            Icon(
+                                imageVector = if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
+                                contentDescription = null,
+                                tint = if (isPlaying) OnAccentLight else CyanPrimary,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = if (isPlaying) "暂停试听" else "播放试听",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = if (isPlaying) OnAccentLight else TextPrimary,
+                                maxLines = 1
+                            )
+                        }
+                    }
+
+                    val liveStatusText = when {
+                        !livePreviewEnabled -> "已关闭：播放原音轨"
+                        isComparingOriginal -> "当前正在对比原曲"
+                        hasPitchChange || hasBpmChange -> {
+                            val parts = buildList {
+                                if (hasPitchChange) {
+                                    add(if (semitones > 0) "+$semitones 半音" else "$semitones 半音")
+                                }
+                                if (hasBpmChange) {
+                                    add("$targetBpm BPM")
+                                }
+                            }.joinToString(" · ")
+                            if (isPlaying) "生效中：$parts" else "当前设定：$parts"
+                        }
+                        isPlaying -> "正在原调原速播放"
+                        else -> "点左侧播放即可边听边调"
+                    }
+
+                    Text(
+                        text = liveStatusText,
+                        fontSize = 11.sp,
+                        fontWeight = if (isLiveAuditioningModified) FontWeight.SemiBold else FontWeight.Normal,
+                        color = if (isLiveAuditioningModified) CyanPrimary else TextSecondary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(start = 10.dp)
+                    )
                 }
             }
         }
 
         // ====================================================================
-        // PART 1: Tempo (BPM) — [ - ]  ━━━━━━●━━━━━━  [ + ]
+        // PART 1: Tempo (BPM) — [ - ]  ━━━━━━●━━━━━━  [ + ] (Constant Height)
         // ====================================================================
         Surface(
             shape = RoundedCornerShape(14.dp),
@@ -1478,26 +1701,34 @@ private fun PitchShiftAndTempoPanel(
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(38.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Column(modifier = Modifier.weight(1f)) {
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(end = 8.dp)
+                    ) {
                         Text(
                             text = "速度调节 (BPM)",
                             fontSize = 13.sp,
                             fontWeight = FontWeight.SemiBold,
-                            color = TextPrimary
+                            color = TextPrimary,
+                            maxLines = 1
                         )
                         Text(
                             text = if (hasBpmChange) {
                                 val sign = if (deltaBpm > 0) "+$deltaBpm" else "$deltaBpm"
-                                String.format(Locale.US, "原速 %d BPM · 调整 %s BPM (%.2fx)", sourceBpm, sign, speedRatio)
+                                String.format(Locale.US, "原速 %d · %s BPM (%.2fx)", sourceBpm, sign, speedRatio)
                             } else {
-                                "原曲速度：$sourceBpm BPM（未变速）"
+                                "原速 $sourceBpm BPM · 未变速"
                             },
                             fontSize = 11.sp,
                             color = if (hasBpmChange) CyanPrimary else TextMuted,
+                            minLines = 1,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
@@ -1507,26 +1738,32 @@ private fun PitchShiftAndTempoPanel(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        if (hasBpmChange) {
-                            Surface(
-                                onClick = { onTargetBpmChange(sourceBpm) },
-                                shape = RoundedCornerShape(7.dp),
-                                color = StudioSurface,
-                                border = BorderStroke(1.dp, StudioBorder)
-                            ) {
-                                Text(
-                                    text = "原速",
-                                    fontSize = 11.sp,
-                                    color = TextSecondary,
-                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                                )
-                            }
+                        val resetBpmShape = RoundedCornerShape(7.dp)
+                        Surface(
+                            shape = resetBpmShape,
+                            color = StudioSurface,
+                            border = BorderStroke(
+                                1.dp,
+                                if (hasBpmChange) StudioBorder else StudioBorder.copy(alpha = 0.45f)
+                            ),
+                            modifier = Modifier
+                                .clip(resetBpmShape)
+                                .clickable(enabled = hasBpmChange) { onTargetBpmChange(sourceBpm) }
+                        ) {
+                            Text(
+                                text = "原速",
+                                fontSize = 11.sp,
+                                color = if (hasBpmChange) TextSecondary else TextMuted.copy(alpha = 0.45f),
+                                maxLines = 1,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                            )
                         }
 
                         Surface(
                             shape = RoundedCornerShape(8.dp),
                             color = if (hasBpmChange) CyanPrimary else StudioSurface,
-                            border = BorderStroke(1.dp, if (hasBpmChange) CyanPrimary else StudioBorder)
+                            border = BorderStroke(1.dp, if (hasBpmChange) CyanPrimary else StudioBorder),
+                            modifier = Modifier.widthIn(min = 78.dp)
                         ) {
                             Text(
                                 text = "$targetBpm BPM",
@@ -1534,7 +1771,9 @@ private fun PitchShiftAndTempoPanel(
                                 fontFamily = FontFamily.Monospace,
                                 fontWeight = FontWeight.Bold,
                                 color = if (hasBpmChange) OnAccentLight else TextPrimary,
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                                textAlign = TextAlign.Center,
+                                maxLines = 1,
+                                modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp)
                             )
                         }
                     }
@@ -1576,7 +1815,7 @@ private fun PitchShiftAndTempoPanel(
         }
 
         // ====================================================================
-        // PART 2: Pitch (Semitone Key) — [ - ]  ━━━━━━●━━━━━━  [ + ]
+        // PART 2: Pitch (Semitone Key) — [ - ]  ━━━━━━●━━━━━━  [ + ] (Constant Height)
         // ====================================================================
         Surface(
             shape = RoundedCornerShape(14.dp),
@@ -1590,21 +1829,29 @@ private fun PitchShiftAndTempoPanel(
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(38.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Column(modifier = Modifier.weight(1f)) {
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(end = 8.dp)
+                    ) {
                         Text(
                             text = "升降调 (半音)",
                             fontSize = 13.sp,
                             fontWeight = FontWeight.SemiBold,
-                            color = TextPrimary
+                            color = TextPrimary,
+                            maxLines = 1
                         )
                         Text(
                             text = describePitchShift(semitones, 0),
                             fontSize = 11.sp,
                             color = if (hasPitchChange) CyanPrimary else TextMuted,
+                            minLines = 1,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
@@ -1614,29 +1861,35 @@ private fun PitchShiftAndTempoPanel(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        if (hasPitchChange) {
-                            Surface(
-                                onClick = {
+                        val resetKeyShape = RoundedCornerShape(7.dp)
+                        Surface(
+                            shape = resetKeyShape,
+                            color = StudioSurface,
+                            border = BorderStroke(
+                                1.dp,
+                                if (hasPitchChange) StudioBorder else StudioBorder.copy(alpha = 0.45f)
+                            ),
+                            modifier = Modifier
+                                .clip(resetKeyShape)
+                                .clickable(enabled = hasPitchChange) {
                                     onSemitonesChange(0)
                                     onCentsChange(0)
-                                },
-                                shape = RoundedCornerShape(7.dp),
-                                color = StudioSurface,
-                                border = BorderStroke(1.dp, StudioBorder)
-                            ) {
-                                Text(
-                                    text = "原调",
-                                    fontSize = 11.sp,
-                                    color = TextSecondary,
-                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                                )
-                            }
+                                }
+                        ) {
+                            Text(
+                                text = "原调",
+                                fontSize = 11.sp,
+                                color = if (hasPitchChange) TextSecondary else TextMuted.copy(alpha = 0.45f),
+                                maxLines = 1,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                            )
                         }
 
                         Surface(
                             shape = RoundedCornerShape(8.dp),
                             color = if (hasPitchChange) CyanPrimary else StudioSurface,
-                            border = BorderStroke(1.dp, if (hasPitchChange) CyanPrimary else StudioBorder)
+                            border = BorderStroke(1.dp, if (hasPitchChange) CyanPrimary else StudioBorder),
+                            modifier = Modifier.widthIn(min = 72.dp)
                         ) {
                             val semitoneLabel = when {
                                 semitones > 0 -> "+$semitones 半音"
@@ -1649,7 +1902,9 @@ private fun PitchShiftAndTempoPanel(
                                 fontFamily = FontFamily.Monospace,
                                 fontWeight = FontWeight.Bold,
                                 color = if (hasPitchChange) OnAccentLight else TextPrimary,
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                                textAlign = TextAlign.Center,
+                                maxLines = 1,
+                                modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp)
                             )
                         }
                     }
@@ -1698,7 +1953,7 @@ private fun PitchShiftAndTempoPanel(
             }
         }
 
-        // Formant Preservation Switch
+        // Formant Preservation Switch (Constant 2-line subtitle height)
         Surface(
             shape = RoundedCornerShape(12.dp),
             color = StudioSurfaceElevated.copy(alpha = 0.65f),
@@ -1716,13 +1971,22 @@ private fun PitchShiftAndTempoPanel(
                         .weight(1f)
                         .padding(end = 10.dp)
                 ) {
-                    Text("保持人声音色（含人声歌曲适用）", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = TextPrimary)
                     Text(
-                        if (preserveTimbre) "已开启：对含人声的原曲升降调时，避免人声变尖或变粗"
+                        text = "保持人声音色（含人声歌曲适用）",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = TextPrimary,
+                        maxLines = 1
+                    )
+                    Text(
+                        text = if (preserveTimbre) "已开启：对含人声的原曲升降调时，避免人声变尖或变粗"
                         else "默认关闭（适合纯伴奏）：对伴奏升降调时保持关闭，乐器音质更自然",
                         fontSize = 11.sp,
                         lineHeight = 16.sp,
-                        color = TextMuted
+                        color = TextMuted,
+                        minLines = 2,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
                 Switch(
@@ -1739,14 +2003,14 @@ private fun PitchShiftAndTempoPanel(
         val actionButtonText = when {
             hasPitchChange && hasBpmChange -> {
                 val pStr = if (semitones > 0) "+$semitones 半音" else "$semitones 半音"
-                "开始移调与变速 ($pStr · ${sourceBpm}→${targetBpm} BPM)"
+                "生成新音轨 ($pStr · ${sourceBpm}→${targetBpm} BPM)"
             }
             hasPitchChange -> {
                 val pStr = if (semitones > 0) "+$semitones 半音" else "$semitones 半音"
-                "开始移调 ($pStr · 保持 $sourceBpm BPM)"
+                "生成移调音轨 ($pStr · 保持 $sourceBpm BPM)"
             }
             hasBpmChange -> {
-                "开始变速 ($sourceBpm → $targetBpm BPM · 原调)"
+                "生成变速音轨 ($sourceBpm → $targetBpm BPM)"
             }
             else -> "请先调整上方速度或升降调"
         }
@@ -1944,22 +2208,26 @@ private fun VolumeBoostPanel(
             )
         }
 
-        // Dynamic Lossless vs Limiter Status Banner
+        // Dynamic Lossless vs Limiter Status Banner (Constant 2-line height)
         val modeColor = if (isPureLosslessZone) EmeraldLossless else AmberMastering
         Surface(
             shape = RoundedCornerShape(12.dp),
             color = modeColor.copy(alpha = 0.10f),
-            border = BorderStroke(1.dp, modeColor.copy(alpha = 0.35f))
+            border = BorderStroke(1.dp, modeColor.copy(alpha = 0.35f)),
+            modifier = Modifier.fillMaxWidth()
         ) {
             Text(
                 text = if (isPureLosslessZone) {
-                    "当前放大倍数在无损空间内：仅等比例调大整体音量，不会产生任何失真或破音。"
+                    "当前处于无损放大区间：仅等比例调大整体音量，不会产生任何失真或破音。"
                 } else {
-                    "当前放大倍数超出原始峰值空间：已自动启用防破音保护，在提高整体音量的同时压制过高峰值，避免爆音。"
+                    "已超出原始无损空间：自动启用防破音保护，提高音量的同时压制峰值避免爆音。"
                 },
                 fontSize = 11.sp,
                 lineHeight = 17.sp,
                 color = modeColor,
+                minLines = 2,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.padding(11.dp)
             )
         }
@@ -2741,12 +3009,16 @@ private fun StorageResourceManagerSheet(
                         fontFamily = FontFamily.Serif,
                         fontSize = 18.sp,
                         fontWeight = FontWeight.Bold,
-                        color = TextPrimary
+                        color = TextPrimary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                     Text(
-                        text = "共 ${resources.size} 个音频资源 · 总计占用 ${formatBytesShort(storageInfo.totalEphemeralBytes)}",
+                        text = "共 ${resources.size} 个音频资源 · 占用 ${formatBytesShort(storageInfo.totalEphemeralBytes)}",
                         fontSize = 12.sp,
-                        color = TextSecondary
+                        color = TextSecondary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
 
@@ -3234,20 +3506,27 @@ private fun NetEaseCloudMusicImportSheet(
                 }
 
                 if (filteredTracks.isNotEmpty()) {
-                    TextButton(
-                        onClick = {
-                            selectedIds = if (allFilteredSelected) {
-                                selectedIds - filteredTracks.map { it.id }.toSet()
-                            } else {
-                                selectedIds + filteredTracks.map { it.id }.toSet()
+                    val selectAllShape = RoundedCornerShape(8.dp)
+                    Surface(
+                        shape = selectAllShape,
+                        color = CyanPrimary.copy(alpha = 0.10f),
+                        modifier = Modifier
+                            .clip(selectAllShape)
+                            .clickable {
+                                selectedIds = if (allFilteredSelected) {
+                                    selectedIds - filteredTracks.map { it.id }.toSet()
+                                } else {
+                                    selectedIds + filteredTracks.map { it.id }.toSet()
+                                }
                             }
-                        }
                     ) {
                         Text(
                             text = if (allFilteredSelected) "取消全选" else "全选当前",
                             fontSize = 11.sp,
                             fontWeight = FontWeight.SemiBold,
-                            color = CyanPrimary
+                            color = CyanPrimary,
+                            maxLines = 1,
+                            modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp)
                         )
                     }
                 }
@@ -3575,14 +3854,14 @@ private fun ProcessingProgressDialog(
 
 private fun describePitchShift(semitones: Int, cents: Int): String {
     if (semitones == 0 && cents == 0) {
-        return "当前保持原调 (0 半音)"
+        return "原曲音调 · 未升降调"
     }
     val main = when {
-        semitones > 0 -> "升高 $semitones 个半音 (${if (semitones == 2) "升1全音" else "+$semitones key"})"
-        semitones < 0 -> "降低 ${abs(semitones)} 个半音 (${if (semitones == -2) "降1全音 · 轻松唱高音" else "$semitones key"})"
+        semitones > 0 -> "已升高 $semitones 个半音${if (semitones == 2) " (升1全音)" else ""}"
+        semitones < 0 -> "已降低 ${abs(semitones)} 个半音${if (semitones == -2) " (降1全音)" else ""}"
         else -> "半音不变"
     }
-    return if (cents == 0) main else "$main · 微调 ${if (cents > 0) "+$cents" else "$cents"} 音分"
+    return if (cents == 0) main else "$main · ${if (cents > 0) "+$cents" else "$cents"}音分"
 }
 
 private fun formatDurationMs(ms: Long): String {

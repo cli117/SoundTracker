@@ -170,4 +170,264 @@ bool pitchShiftPolyphonic(
     return true;
 }
 
+namespace {
+
+constexpr size_t kRealtimeMaxBlockFrames = 1024;
+constexpr int kRealtimeSubBlockFrames = 512;
+
+inline int16_t floatToSoftLimitedInt16(float x) {
+    if (!std::isfinite(x)) return 0;
+    const float ax = std::abs(x);
+    if (ax > 0.95f) {
+        const float excess = (ax - 0.95f) * 20.0f;
+        const float soft = 0.95f + 0.05f * std::tanh(excess);
+        x = std::copysign(soft, x);
+    }
+    const int32_t s = static_cast<int32_t>(std::lrintf(x * 32767.0f));
+    return static_cast<int16_t>(std::clamp(s, -32768, 32767));
+}
+
+} // namespace
+
+RealtimePitchShifter::RealtimePitchShifter(int sampleRate, int channels)
+    : sampleRate_(std::clamp(sampleRate, 8000, 192000)),
+      channels_(std::clamp(channels, 1, 2)) {
+    using RB = RubberBand::RubberBandStretcher;
+    RB::Options options = RB::OptionProcessRealTime
+                        | RB::OptionEngineFiner
+                        | RB::OptionWindowShort
+                        | RB::OptionPitchHighConsistency
+                        | RB::OptionThreadingNever
+                        | RB::OptionFormantShifted;
+
+    if (channels_ == 2) {
+        options |= RB::OptionChannelsTogether;
+    } else {
+        options |= RB::OptionChannelsApart;
+    }
+
+    stretcher_ = std::make_unique<RB>(
+        static_cast<size_t>(sampleRate_),
+        static_cast<size_t>(channels_),
+        options,
+        1.0,
+        1.0
+    );
+    stretcher_->setMaxProcessSize(kRealtimeMaxBlockFrames);
+
+    inPlanar_.assign(static_cast<size_t>(channels_), std::vector<float>(kRealtimeMaxBlockFrames, 0.0f));
+    outPlanar_.assign(static_cast<size_t>(channels_), std::vector<float>(kRealtimeMaxBlockFrames * 4, 0.0f));
+    zeroPlanar_.assign(static_cast<size_t>(channels_), std::vector<float>(kRealtimeMaxBlockFrames, 0.0f));
+    pendingOutInterleaved_.reserve(16384 * static_cast<size_t>(channels_));
+}
+
+RealtimePitchShifter::~RealtimePitchShifter() = default;
+
+void RealtimePitchShifter::setParameters(float semitones, double timeRatio, bool preserveTimbre) {
+    const float clampedSemi = std::clamp(semitones, -24.0f, 24.0f);
+    const double clampedRatio = std::clamp(timeRatio, 0.25, 4.0);
+    targetSemitones_.store(clampedSemi, std::memory_order_relaxed);
+    targetTimeRatio_.store(clampedRatio, std::memory_order_relaxed);
+    targetPreserveTimbre_.store(preserveTimbre, std::memory_order_relaxed);
+}
+
+void RealtimePitchShifter::applyPendingParamsOnAudioThread() {
+    using RB = RubberBand::RubberBandStretcher;
+    const float semi = targetSemitones_.load(std::memory_order_relaxed);
+    const double ratio = targetTimeRatio_.load(std::memory_order_relaxed);
+    const bool preserve = targetPreserveTimbre_.load(std::memory_order_relaxed);
+
+    if (std::abs(semi - appliedSemitones_) > 1e-4f) {
+        appliedSemitones_ = semi;
+        const double pitchScale = std::pow(2.0, static_cast<double>(semi) / 12.0);
+        stretcher_->setPitchScale(pitchScale);
+    }
+    if (std::abs(ratio - appliedTimeRatio_) > 1e-5) {
+        appliedTimeRatio_ = ratio;
+        stretcher_->setTimeRatio(ratio);
+    }
+    if (preserve != appliedPreserveTimbre_) {
+        appliedPreserveTimbre_ = preserve;
+        stretcher_->setFormantOption(
+            preserve ? RB::OptionFormantPreserved : RB::OptionFormantShifted
+        );
+    }
+}
+
+void RealtimePitchShifter::reset() {
+    stretcher_->reset();
+    primed_ = false;
+    remainingStartDelayFrames_ = 0;
+    pendingOutInterleaved_.clear();
+    pendingReadFrameOffset_ = 0;
+    // Force re-application of current target params on next prime/process
+    appliedSemitones_ = -999.0f;
+    appliedTimeRatio_ = -1.0;
+    appliedPreserveTimbre_ = !targetPreserveTimbre_.load(std::memory_order_relaxed);
+    applyPendingParamsOnAudioThread();
+}
+
+void RealtimePitchShifter::primeStartPadIfNeeded() {
+    if (primed_) return;
+    applyPendingParamsOnAudioThread();
+
+    size_t padRemaining = stretcher_->getPreferredStartPad();
+    remainingStartDelayFrames_ = stretcher_->getStartDelay();
+
+    const float* zeroPtrs[2] = {
+        zeroPlanar_[0].data(),
+        channels_ > 1 ? zeroPlanar_[1].data() : nullptr
+    };
+
+    while (padRemaining > 0) {
+        const size_t chunk = std::min(padRemaining, kRealtimeMaxBlockFrames);
+        stretcher_->process(zeroPtrs, chunk, false);
+        padRemaining -= chunk;
+        drainStretcherToPending();
+    }
+    primed_ = true;
+}
+
+void RealtimePitchShifter::drainStretcherToPending() {
+    const size_t outChunkCapacity = outPlanar_[0].size();
+    float* outPtrs[2] = {
+        outPlanar_[0].data(),
+        channels_ > 1 ? outPlanar_[1].data() : nullptr
+    };
+
+    int avail = 0;
+    while ((avail = stretcher_->available()) > 0) {
+        const size_t toRead = std::min(static_cast<size_t>(avail), outChunkCapacity);
+        const size_t got = stretcher_->retrieve(outPtrs, toRead);
+        if (got == 0) break;
+
+        size_t startIdx = 0;
+        if (remainingStartDelayFrames_ > 0) {
+            const size_t skip = std::min(got, remainingStartDelayFrames_);
+            remainingStartDelayFrames_ -= skip;
+            startIdx = skip;
+        }
+
+        if (startIdx < got) {
+            const size_t keepFrames = got - startIdx;
+            const size_t oldSize = pendingOutInterleaved_.size();
+            pendingOutInterleaved_.resize(oldSize + keepFrames * static_cast<size_t>(channels_));
+            int16_t* dst = pendingOutInterleaved_.data() + oldSize;
+            if (channels_ == 2) {
+                const float* ch0 = outPlanar_[0].data() + startIdx;
+                const float* ch1 = outPlanar_[1].data() + startIdx;
+                for (size_t i = 0; i < keepFrames; ++i) {
+                    dst[i * 2] = floatToSoftLimitedInt16(ch0[i]);
+                    dst[i * 2 + 1] = floatToSoftLimitedInt16(ch1[i]);
+                }
+            } else {
+                const float* ch0 = outPlanar_[0].data() + startIdx;
+                for (size_t i = 0; i < keepFrames; ++i) {
+                    dst[i] = floatToSoftLimitedInt16(ch0[i]);
+                }
+            }
+        }
+    }
+}
+
+int RealtimePitchShifter::copyPendingToOut(int16_t* outPcm16, int maxOutFrames) {
+    if (!outPcm16 || maxOutFrames <= 0) return 0;
+    const size_t totalPendingFrames = pendingOutInterleaved_.size() / static_cast<size_t>(channels_);
+    if (pendingReadFrameOffset_ >= totalPendingFrames) {
+        pendingOutInterleaved_.clear();
+        pendingReadFrameOffset_ = 0;
+        return 0;
+    }
+
+    const size_t availFrames = totalPendingFrames - pendingReadFrameOffset_;
+    const size_t framesToCopy = std::min(availFrames, static_cast<size_t>(maxOutFrames));
+    const size_t samplesToCopy = framesToCopy * static_cast<size_t>(channels_);
+    const int16_t* src = pendingOutInterleaved_.data() + pendingReadFrameOffset_ * static_cast<size_t>(channels_);
+    std::copy(src, src + samplesToCopy, outPcm16);
+
+    pendingReadFrameOffset_ += framesToCopy;
+    if (pendingReadFrameOffset_ >= totalPendingFrames) {
+        pendingOutInterleaved_.clear();
+        pendingReadFrameOffset_ = 0;
+    } else if (pendingReadFrameOffset_ > 8192) {
+        const size_t remainSamples = (totalPendingFrames - pendingReadFrameOffset_) * static_cast<size_t>(channels_);
+        std::move(src + samplesToCopy, src + samplesToCopy + remainSamples, pendingOutInterleaved_.begin());
+        pendingOutInterleaved_.resize(remainSamples);
+        pendingReadFrameOffset_ = 0;
+    }
+
+    return static_cast<int>(framesToCopy);
+}
+
+int RealtimePitchShifter::processInterleavedInt16(
+    const int16_t* inPcm16,
+    int inFrames,
+    int16_t* outPcm16,
+    int maxOutFrames
+) {
+    if (!inPcm16 || inFrames <= 0) {
+        return copyPendingToOut(outPcm16, maxOutFrames);
+    }
+
+    primeStartPadIfNeeded();
+
+    const float* inPtrs[2] = {
+        inPlanar_[0].data(),
+        channels_ > 1 ? inPlanar_[1].data() : nullptr
+    };
+
+    int frameOffset = 0;
+    while (frameOffset < inFrames) {
+        applyPendingParamsOnAudioThread();
+        const int chunk = std::min(kRealtimeSubBlockFrames, inFrames - frameOffset);
+
+        if (channels_ == 2) {
+            float* dst0 = inPlanar_[0].data();
+            float* dst1 = inPlanar_[1].data();
+            const int16_t* src = inPcm16 + frameOffset * 2;
+            for (int i = 0; i < chunk; ++i) {
+                dst0[i] = static_cast<float>(src[i * 2]) * (1.0f / 32768.0f);
+                dst1[i] = static_cast<float>(src[i * 2 + 1]) * (1.0f / 32768.0f);
+            }
+        } else {
+            float* dst0 = inPlanar_[0].data();
+            const int16_t* src = inPcm16 + frameOffset;
+            for (int i = 0; i < chunk; ++i) {
+                dst0[i] = static_cast<float>(src[i]) * (1.0f / 32768.0f);
+            }
+        }
+
+        stretcher_->process(inPtrs, static_cast<size_t>(chunk), false);
+        frameOffset += chunk;
+        drainStretcherToPending();
+    }
+
+    return copyPendingToOut(outPcm16, maxOutFrames);
+}
+
+int RealtimePitchShifter::finishInterleavedInt16(
+    int16_t* outPcm16,
+    int maxOutFrames
+) {
+    if (primed_) {
+        applyPendingParamsOnAudioThread();
+        const float* zeroPtrs[2] = {
+            zeroPlanar_[0].data(),
+            channels_ > 1 ? zeroPlanar_[1].data() : nullptr
+        };
+        stretcher_->process(zeroPtrs, 0, true);
+        drainStretcherToPending();
+        primed_ = false;
+    }
+    return copyPendingToOut(outPcm16, maxOutFrames);
+}
+
+int RealtimePitchShifter::drainPendingInt16(
+    int16_t* outPcm16,
+    int maxOutFrames
+) {
+    drainStretcherToPending();
+    return copyPendingToOut(outPcm16, maxOutFrames);
+}
+
 } // namespace soundtracker

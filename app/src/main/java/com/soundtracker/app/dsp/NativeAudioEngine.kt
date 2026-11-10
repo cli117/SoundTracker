@@ -143,6 +143,33 @@ object NativeAudioEngine {
 
     external fun nativeConvertToStandardWav(inWavPath: String, outWavPath: String): Boolean
 
+    external fun nativeCreateRealtimeShifter(sampleRate: Int, channels: Int): Long
+    external fun nativeDestroyRealtimeShifter(handle: Long)
+    external fun nativeResetRealtimeShifter(handle: Long)
+    external fun nativeSetRealtimeShifterParams(
+        handle: Long,
+        semitones: Float,
+        timeRatio: Double,
+        preserveTimbre: Boolean
+    )
+    external fun nativeProcessRealtimeShifter(
+        handle: Long,
+        inPcm: ShortArray?,
+        inFrames: Int,
+        outPcm: ShortArray,
+        maxOutFrames: Int
+    ): Int
+    external fun nativeDrainRealtimeShifter(
+        handle: Long,
+        outPcm: ShortArray,
+        maxOutFrames: Int
+    ): Int
+    external fun nativeFinishRealtimeShifter(
+        handle: Long,
+        outPcm: ShortArray,
+        maxOutFrames: Int
+    ): Int
+
     /**
      * Reclaims any legacy extracted `.onnx` files from `noBackupFilesDir/engine_models/`.
      * Models are now zero-copy mmap'd directly from APK `assets/models/` via `AAssetManager`,
