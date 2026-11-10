@@ -1,0 +1,38 @@
+# Gradle & Kotlin
+.gradle/
+.kotlin/
+**/build/
+build/
+
+# Android Studio / IntelliJ / CMake Native Build
+.idea/
+*.iml
+.cxx/
+**/.cxx/
+local.properties
+captures/
+.externalNativeBuild/
+.navigation/
+
+# Local Toolchains & SDK/NDK
+.tools/
+
+# Prebuilt Large Model Weights & Native Runtime Binaries (>100MB)
+app/src/main/assets/models/
+app/src/main/jniLibs/
+models/
+
+# Build Outputs & Keystores
+*.apk
+*.aab
+*.ap_
+*.dex
+*.keystore
+*.jks
+
+# OS & Temp Files
+.DS_Store
+**/.DS_Store
+Thumbs.db
+artifacts/
+*.log

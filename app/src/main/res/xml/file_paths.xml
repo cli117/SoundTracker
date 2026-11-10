@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <cache-path
+        name="wechat_share_staging"
+        path="wechat_share_staging/" />
+    <files-path
+        name="workspace_tracks"
+        path="workspace_tracks/" />
+</paths>
