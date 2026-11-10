@@ -21,7 +21,7 @@ import java.nio.ByteOrder
 
 object AudioCodecHelper {
 
-    fun resolveDisplayName(context: Context, uri: Uri): String {
+    fun resolveDisplayNameWithExt(context: Context, uri: Uri): String {
         runCatching {
             context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
                 ?.use { cursor ->
@@ -30,14 +30,18 @@ object AudioCodecHelper {
                         if (idx >= 0) {
                             val raw = cursor.getString(idx)
                             if (!raw.isNullOrBlank()) {
-                                return stripExtension(raw)
+                                return raw.trim()
                             }
                         }
                     }
                 }
         }
-        val fallback = uri.lastPathSegment?.substringAfterLast('/') ?: "未命名音轨"
-        return stripExtension(fallback).ifBlank { "未命名音轨" }
+        return (uri.lastPathSegment?.substringAfterLast('/') ?: "未命名音轨").trim()
+    }
+
+    fun resolveDisplayName(context: Context, uri: Uri): String {
+        val raw = resolveDisplayNameWithExt(context, uri)
+        return stripExtension(raw).ifBlank { "未命名音轨" }
     }
 
     fun stripExtension(fileName: String): String {

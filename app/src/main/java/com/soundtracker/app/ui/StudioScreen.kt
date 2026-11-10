@@ -39,6 +39,8 @@ import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.AutoFixHigh
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.CleaningServices
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.CloudDownload
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.DeleteSweep
 import androidx.compose.material.icons.rounded.DriveFileRenameOutline
@@ -49,8 +51,10 @@ import androidx.compose.material.icons.rounded.LibraryMusic
 import androidx.compose.material.icons.rounded.MusicNote
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Replay5
 import androidx.compose.material.icons.rounded.SaveAlt
+import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material.icons.rounded.Speed
 import androidx.compose.material.icons.rounded.Tune
@@ -61,6 +65,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CheckboxDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
@@ -105,6 +110,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import com.soundtracker.app.audio.NetEaseLocalTrack
 import com.soundtracker.app.dsp.ExportFormat
 import com.soundtracker.app.dsp.VocalEngineMode
 import com.soundtracker.app.storage.EphemeralStorageInfo
@@ -135,6 +141,9 @@ fun StudioScreen(
     uiState: StudioUiState,
     snackbarHostState: SnackbarHostState,
     onPickAudioClick: () -> Unit,
+    onScanNetEaseClick: () -> Unit,
+    onImportNetEaseTracks: (List<NetEaseLocalTrack>) -> Unit,
+    onRequestAllFilesAccess: () -> Unit,
     onSelectTrack: (String) -> Unit,
     onTogglePlayPause: () -> Unit,
     onSeekFraction: (Float) -> Unit,
@@ -170,6 +179,7 @@ fun StudioScreen(
     var renameTargetTrack by remember { mutableStateOf<SessionTrack?>(null) }
     var saveTargetTrack by remember { mutableStateOf<SessionTrack?>(null) }
     var showStorageSheet by rememberSaveable { mutableStateOf(false) }
+    var showNetEaseSheet by rememberSaveable { mutableStateOf(false) }
 
     Scaffold(
         containerColor = StudioBg,
@@ -187,6 +197,10 @@ fun StudioScreen(
                     onRefreshStorage()
                     showStorageSheet = true
                 },
+                onNetEaseClick = {
+                    onScanNetEaseClick()
+                    showNetEaseSheet = true
+                },
                 onImportClick = onPickAudioClick
             )
         }
@@ -202,7 +216,13 @@ fun StudioScreen(
         ) {
             if (activeTrack == null) {
                 item {
-                    EmptyStudioHeroCard(onImportClick = onPickAudioClick)
+                    EmptyStudioHeroCard(
+                        onNetEaseImportClick = {
+                            onScanNetEaseClick()
+                            showNetEaseSheet = true
+                        },
+                        onImportClick = onPickAudioClick
+                    )
                 }
             } else {
                 // 1. Active Waveform Player + A/B Audition + Delivery Actions
@@ -347,6 +367,26 @@ fun StudioScreen(
         )
     }
 
+    // NetEase Cloud Music Import Sheet (NCM -> FLAC / MP3)
+    if (showNetEaseSheet) {
+        NetEaseCloudMusicImportSheet(
+            tracks = uiState.netEaseTracks,
+            isScanning = uiState.isScanningNetEase,
+            hasStorageAccess = uiState.hasNetEaseStorageAccess,
+            onRefresh = onScanNetEaseClick,
+            onRequestStorageAccess = onRequestAllFilesAccess,
+            onPickManualNcmFile = {
+                showNetEaseSheet = false
+                onPickAudioClick()
+            },
+            onImportTracks = { selected ->
+                showNetEaseSheet = false
+                onImportNetEaseTracks(selected)
+            },
+            onDismiss = { showNetEaseSheet = false }
+        )
+    }
+
     // Processing Progress Modal
     uiState.processingTask?.let { task ->
         ProcessingProgressDialog(
@@ -361,6 +401,7 @@ private fun StudioTopBar(
     ephemeralBytes: Long,
     trackCount: Int,
     onStoragePillClick: () -> Unit,
+    onNetEaseClick: () -> Unit,
     onImportClick: () -> Unit
 ) {
     Surface(
@@ -372,7 +413,7 @@ private fun StudioTopBar(
                 modifier = Modifier
                     .fillMaxWidth()
                     .statusBarsPadding()
-                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
@@ -382,7 +423,7 @@ private fun StudioTopBar(
                 ) {
                     Box(
                         modifier = Modifier
-                            .size(38.dp)
+                            .size(36.dp)
                             .clip(RoundedCornerShape(10.dp))
                             .background(CyanPrimary.copy(alpha = 0.14f))
                             .border(1.dp, CyanPrimary.copy(alpha = 0.35f), RoundedCornerShape(10.dp)),
@@ -392,10 +433,10 @@ private fun StudioTopBar(
                             imageVector = Icons.Rounded.GraphicEq,
                             contentDescription = null,
                             tint = CyanPrimary,
-                            modifier = Modifier.size(21.dp)
+                            modifier = Modifier.size(20.dp)
                         )
                     }
-                    Spacer(modifier = Modifier.width(10.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
                     Column {
                         Text(
                             text = "SoundTracker",
@@ -406,7 +447,7 @@ private fun StudioTopBar(
                         )
                         Text(
                             text = "本地母带伴奏 · 移调变速工坊",
-                            fontSize = 11.sp,
+                            fontSize = 10.sp,
                             color = TextSecondary,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
@@ -416,7 +457,7 @@ private fun StudioTopBar(
 
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     // Broom + Storage Size Button -> Opens Resource Manager List
                     Surface(
@@ -426,7 +467,7 @@ private fun StudioTopBar(
                         border = BorderStroke(1.dp, StudioBorder)
                     ) {
                         Row(
-                            modifier = Modifier.padding(horizontal = 11.dp, vertical = 6.dp),
+                            modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Icon(
@@ -435,13 +476,40 @@ private fun StudioTopBar(
                                 tint = CyanPrimary,
                                 modifier = Modifier.size(14.dp)
                             )
-                            Spacer(modifier = Modifier.width(5.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
                             Text(
                                 text = formatBytesShort(ephemeralBytes),
                                 fontSize = 11.sp,
                                 fontFamily = FontFamily.Monospace,
                                 fontWeight = FontWeight.SemiBold,
                                 color = TextPrimary
+                            )
+                        }
+                    }
+
+                    // NetEase Cloud Music Import Button
+                    Surface(
+                        onClick = onNetEaseClick,
+                        shape = RoundedCornerShape(20.dp),
+                        color = CyanPrimary.copy(alpha = 0.12f),
+                        border = BorderStroke(1.dp, CyanPrimary.copy(alpha = 0.45f))
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.CloudDownload,
+                                contentDescription = "从网易云音乐导入",
+                                tint = CyanPrimary,
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = "网易云",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = CyanPrimary
                             )
                         }
                     }
@@ -454,19 +522,19 @@ private fun StudioTopBar(
                             border = BorderStroke(1.dp, VioletAccent)
                         ) {
                             Row(
-                                modifier = Modifier.padding(horizontal = 11.dp, vertical = 6.dp),
+                                modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Icon(
                                     imageVector = Icons.Rounded.Add,
                                     contentDescription = null,
                                     tint = OnAccentLight,
-                                    modifier = Modifier.size(15.dp)
+                                    modifier = Modifier.size(14.dp)
                                 )
-                                Spacer(modifier = Modifier.width(3.dp))
+                                Spacer(modifier = Modifier.width(2.dp))
                                 Text(
                                     text = "导入",
-                                    fontSize = 12.sp,
+                                    fontSize = 11.sp,
                                     fontWeight = FontWeight.SemiBold,
                                     color = OnAccentLight
                                 )
@@ -481,7 +549,10 @@ private fun StudioTopBar(
 }
 
 @Composable
-private fun EmptyStudioHeroCard(onImportClick: () -> Unit) {
+private fun EmptyStudioHeroCard(
+    onNetEaseImportClick: () -> Unit,
+    onImportClick: () -> Unit
+) {
     Card(
         shape = RoundedCornerShape(20.dp),
         colors = CardDefaults.cardColors(containerColor = StudioSurface),
@@ -491,12 +562,12 @@ private fun EmptyStudioHeroCard(onImportClick: () -> Unit) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(26.dp),
+                .padding(24.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Box(
                 modifier = Modifier
-                    .size(68.dp)
+                    .size(64.dp)
                     .clip(CircleShape)
                     .background(CyanPrimary.copy(alpha = 0.12f))
                     .border(1.dp, CyanPrimary.copy(alpha = 0.32f), CircleShape),
@@ -506,11 +577,11 @@ private fun EmptyStudioHeroCard(onImportClick: () -> Unit) {
                     imageVector = Icons.Rounded.LibraryMusic,
                     contentDescription = null,
                     tint = CyanPrimary,
-                    modifier = Modifier.size(32.dp)
+                    modifier = Modifier.size(30.dp)
                 )
             }
 
-            Spacer(modifier = Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(14.dp))
             Text(
                 text = "导入音频，开启纯本地母带处理",
                 fontFamily = FontFamily.Serif,
@@ -520,30 +591,45 @@ private fun EmptyStudioHeroCard(onImportClick: () -> Unit) {
             )
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = "支持 MP3 · M4A · FLAC · WAV · OGG 及视频提取音频\n自动识别原曲 BPM，支持去人声伴奏、1 BPM 精度变速与无电音移调",
-                fontSize = 13.sp,
+                text = "支持一键从网易云音乐已下载曲目导入（NCM 自动无损转 FLAC/MP3）\n也支持本地 MP3 · FLAC · M4A · WAV · 视频提取音频",
+                fontSize = 12.sp,
                 color = TextSecondary,
-                lineHeight = 20.sp,
-                modifier = Modifier.padding(horizontal = 6.dp)
+                lineHeight = 19.sp,
+                modifier = Modifier.padding(horizontal = 4.dp)
             )
 
-            Spacer(modifier = Modifier.height(20.dp))
+            Spacer(modifier = Modifier.height(18.dp))
 
             Button(
-                onClick = onImportClick,
+                onClick = onNetEaseImportClick,
+                modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(12.dp),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = CyanPrimary,
                     contentColor = OnAccentLight
                 ),
-                contentPadding = PaddingValues(horizontal = 24.dp, vertical = 13.dp)
+                contentPadding = PaddingValues(horizontal = 20.dp, vertical = 13.dp)
             ) {
-                Icon(Icons.Rounded.FolderOpen, contentDescription = null, modifier = Modifier.size(19.dp))
+                Icon(Icons.Rounded.CloudDownload, contentDescription = null, modifier = Modifier.size(19.dp))
                 Spacer(modifier = Modifier.width(8.dp))
-                Text("选择手机音频 / 视频文件", fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+                Text("从网易云音乐已下载导入 (NCM → FLAC/MP3)", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
             }
 
-            Spacer(modifier = Modifier.height(22.dp))
+            Spacer(modifier = Modifier.height(10.dp))
+
+            OutlinedButton(
+                onClick = onImportClick,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                border = BorderStroke(1.dp, StudioBorder),
+                contentPadding = PaddingValues(horizontal = 20.dp, vertical = 12.dp)
+            ) {
+                Icon(Icons.Rounded.FolderOpen, contentDescription = null, tint = TextPrimary, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("选择手机本地音频 / 视频文件", fontWeight = FontWeight.SemiBold, fontSize = 14.sp, color = TextPrimary)
+            }
+
+            Spacer(modifier = Modifier.height(20.dp))
             HorizontalDivider(color = StudioBorder)
             Spacer(modifier = Modifier.height(14.dp))
 
@@ -661,12 +747,13 @@ private fun ActiveTrackDeckCard(
                     }
 
                     Spacer(modifier = Modifier.height(6.dp))
+                    val trackFileExt = track.audioFile.extension.lowercase().ifBlank { exportFormat.extension }
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         modifier = Modifier.clickable(onClick = onRenameClick)
                     ) {
                         Text(
-                            text = "${track.displayName}.${exportFormat.extension}",
+                            text = "${track.displayName}.$trackFileExt",
                             style = MaterialTheme.typography.titleMedium,
                             color = TextPrimary,
                             maxLines = 1,
@@ -1920,9 +2007,10 @@ private fun SessionTrackItemCard(
                         modifier = Modifier.size(20.dp)
                     )
                     Spacer(modifier = Modifier.width(8.dp))
+                    val itemExt = track.audioFile.extension.lowercase().ifBlank { "wav" }
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = track.displayName,
+                            text = "${track.displayName}.$itemExt",
                             fontSize = 14.sp,
                             fontWeight = FontWeight.SemiBold,
                             color = TextPrimary,
@@ -2515,6 +2603,442 @@ private fun StoredResourceRowCell(
                     fontSize = 11.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = DangerRed
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun NetEaseCloudMusicImportSheet(
+    tracks: List<NetEaseLocalTrack>,
+    isScanning: Boolean,
+    hasStorageAccess: Boolean,
+    onRefresh: () -> Unit,
+    onRequestStorageAccess: () -> Unit,
+    onPickManualNcmFile: () -> Unit,
+    onImportTracks: (List<NetEaseLocalTrack>) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var searchQuery by rememberSaveable { mutableStateOf("") }
+    // Filter: 0 = All, 1 = NCM, 2 = FLAC, 3 = MP3
+    var filterTab by rememberSaveable { mutableStateOf(0) }
+    var selectedIds by remember { mutableStateOf(setOf<String>()) }
+
+    val filteredTracks = remember(tracks, searchQuery, filterTab) {
+        val q = searchQuery.trim().lowercase()
+        tracks.filter { item ->
+            val matchesQuery = q.isEmpty() ||
+                item.displayTitle.lowercase().contains(q) ||
+                item.songName.lowercase().contains(q) ||
+                item.artist.lowercase().contains(q) ||
+                item.album.lowercase().contains(q)
+            val matchesFilter = when (filterTab) {
+                1 -> item.isNcm
+                2 -> item.isLosslessFlac
+                3 -> !item.isLosslessFlac
+                else -> true
+            }
+            matchesQuery && matchesFilter
+        }
+    }
+
+    val allFilteredSelected = filteredTracks.isNotEmpty() && filteredTracks.all { it.id in selectedIds }
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        containerColor = StudioSurface
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .padding(horizontal = 18.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            // Sheet Header
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Rounded.CloudDownload,
+                            contentDescription = null,
+                            tint = CyanPrimary,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "从网易云音乐导入",
+                            fontFamily = FontFamily.Serif,
+                            fontSize = 18.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = TextPrimary
+                        )
+                    }
+                    Text(
+                        text = "NCM 自动无损解密为 FLAC 或 MP3（同名多版本自动优选最高音质）",
+                        fontSize = 11.sp,
+                        color = TextSecondary
+                    )
+                }
+
+                IconButton(onClick = onRefresh) {
+                    Icon(
+                        imageVector = Icons.Rounded.Refresh,
+                        contentDescription = "重新扫描",
+                        tint = CyanPrimary
+                    )
+                }
+            }
+
+            // Permission Banner if Android 11+ MANAGE_EXTERNAL_STORAGE is not granted
+            if (!hasStorageAccess) {
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = AmberMastering.copy(alpha = 0.12f),
+                    border = BorderStroke(1.dp, AmberMastering.copy(alpha = 0.45f)),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "开启文件访问权限以扫描 .ncm 加密音乐",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = TextPrimary
+                            )
+                            Text(
+                                text = "安卓系统默认隐藏第三方应用的 .ncm 文件，授权后即可一键列出全部网易云下载歌曲",
+                                fontSize = 11.sp,
+                                color = TextSecondary
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Button(
+                            onClick = onRequestStorageAccess,
+                            shape = RoundedCornerShape(8.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = CyanPrimary,
+                                contentColor = OnAccentLight
+                            ),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                        ) {
+                            Text("去授权", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                }
+            }
+
+            // Search Box
+            OutlinedTextField(
+                value = searchQuery,
+                onValueChange = { searchQuery = it },
+                placeholder = { Text("搜索歌名、歌手或专辑...", fontSize = 13.sp, color = TextMuted) },
+                leadingIcon = {
+                    Icon(Icons.Rounded.Search, contentDescription = null, tint = TextSecondary, modifier = Modifier.size(18.dp))
+                },
+                trailingIcon = {
+                    if (searchQuery.isNotEmpty()) {
+                        IconButton(onClick = { searchQuery = "" }) {
+                            Icon(Icons.Rounded.Close, contentDescription = "清除", tint = TextMuted, modifier = Modifier.size(16.dp))
+                        }
+                    }
+                },
+                singleLine = true,
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            // Filter Chips + Select All
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                val ncmCount = tracks.count { it.isNcm }
+                val flacCount = tracks.count { it.isLosslessFlac }
+                val mp3Count = tracks.size - flacCount
+                val tabs = listOf(
+                    0 to "全部 (${tracks.size})",
+                    1 to "NCM 加密 ($ncmCount)",
+                    2 to "FLAC 无损 ($flacCount)",
+                    3 to "MP3 ($mp3Count)"
+                )
+                tabs.forEach { (idx, title) ->
+                    val selected = filterTab == idx
+                    FilterChip(
+                        selected = selected,
+                        onClick = { filterTab = idx },
+                        label = { Text(title, fontSize = 11.sp) },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = CyanPrimary.copy(alpha = 0.16f),
+                            selectedLabelColor = CyanPrimary
+                        )
+                    )
+                }
+
+                if (filteredTracks.isNotEmpty()) {
+                    TextButton(
+                        onClick = {
+                            selectedIds = if (allFilteredSelected) {
+                                selectedIds - filteredTracks.map { it.id }.toSet()
+                            } else {
+                                selectedIds + filteredTracks.map { it.id }.toSet()
+                            }
+                        }
+                    ) {
+                        Text(
+                            text = if (allFilteredSelected) "取消全选" else "全选当前",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = CyanPrimary
+                        )
+                    }
+                }
+            }
+
+            if (isScanning) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 36.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        CircularProgressIndicator(
+                            color = CyanPrimary,
+                            strokeWidth = 2.5.dp,
+                            modifier = Modifier.size(22.dp)
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text("正在扫描网易云音乐下载目录并解析 NCM 音质...", fontSize = 13.sp, color = TextSecondary)
+                    }
+                }
+            } else if (filteredTracks.isEmpty()) {
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    color = StudioSurfaceElevated.copy(alpha = 0.6f),
+                    border = BorderStroke(1.dp, StudioBorder),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 24.dp, horizontal = 16.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            text = if (tracks.isEmpty()) "未扫描到网易云音乐已下载歌曲" else "没有匹配的搜索结果",
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = TextPrimary
+                        )
+                        Text(
+                            text = "默认扫描路径：Download/netease/cloudmusic/Music 及 netease/cloudmusic/Music",
+                            fontSize = 11.sp,
+                            color = TextMuted
+                        )
+                        OutlinedButton(
+                            onClick = onPickManualNcmFile,
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, StudioBorder)
+                        ) {
+                            Icon(Icons.Rounded.FolderOpen, contentDescription = null, tint = TextPrimary, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("手动从文件夹选择 .ncm / .flac / .mp3", fontSize = 12.sp, color = TextPrimary)
+                        }
+                    }
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 360.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(items = filteredTracks, key = { it.id }) { item ->
+                        val isChecked = item.id in selectedIds
+                        NetEaseTrackRowCell(
+                            item = item,
+                            checked = isChecked,
+                            onCheckedChange = { checked ->
+                                selectedIds = if (checked) selectedIds + item.id else selectedIds - item.id
+                            },
+                            onSingleImportClick = {
+                                onImportTracks(listOf(item))
+                            }
+                        )
+                    }
+                }
+            }
+
+            // Bottom Batch Import Bar
+            if (tracks.isNotEmpty()) {
+                HorizontalDivider(color = StudioBorder)
+                val selectedList = tracks.filter { it.id in selectedIds }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedButton(
+                        onClick = onPickManualNcmFile,
+                        shape = RoundedCornerShape(11.dp),
+                        border = BorderStroke(1.dp, StudioBorder),
+                        contentPadding = PaddingValues(vertical = 12.dp, horizontal = 12.dp)
+                    ) {
+                        Icon(Icons.Rounded.FolderOpen, contentDescription = null, tint = TextPrimary, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(5.dp))
+                        Text("自选文件", fontSize = 12.sp, color = TextPrimary)
+                    }
+
+                    Button(
+                        onClick = { onImportTracks(selectedList) },
+                        enabled = selectedList.isNotEmpty(),
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(11.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = CyanPrimary,
+                            contentColor = OnAccentLight
+                        ),
+                        contentPadding = PaddingValues(vertical = 12.dp, horizontal = 12.dp)
+                    ) {
+                        Icon(Icons.Rounded.CloudDownload, contentDescription = null, modifier = Modifier.size(17.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = if (selectedList.isEmpty()) {
+                                "勾选曲目可批量导入（或直接点右侧「导入」）"
+                            } else {
+                                "批量导入已选 (${selectedList.size} 首 → 自动转 FLAC/MP3)"
+                            },
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(6.dp))
+        }
+    }
+}
+
+@Composable
+private fun NetEaseTrackRowCell(
+    item: NetEaseLocalTrack,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    onSingleImportClick: () -> Unit
+) {
+    val badgeAccent = if (item.isLosslessFlac) EmeraldLossless else CyanPrimary
+
+    Surface(
+        onClick = { onCheckedChange(!checked) },
+        shape = RoundedCornerShape(12.dp),
+        color = if (checked) CyanPrimary.copy(alpha = 0.08f) else StudioSurfaceElevated.copy(alpha = 0.65f),
+        border = BorderStroke(1.dp, if (checked) CyanPrimary else StudioBorder),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 6.dp, end = 10.dp, top = 8.dp, bottom = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Checkbox(
+                checked = checked,
+                onCheckedChange = onCheckedChange,
+                colors = CheckboxDefaults.colors(
+                    checkedColor = CyanPrimary,
+                    checkmarkColor = OnAccentLight,
+                    uncheckedColor = TextMuted
+                )
+            )
+
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(horizontal = 4.dp),
+                verticalArrangement = Arrangement.spacedBy(3.dp)
+            ) {
+                Text(
+                    text = item.displayTitle,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = TextPrimary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Surface(
+                        shape = RoundedCornerShape(4.dp),
+                        color = badgeAccent.copy(alpha = 0.14f)
+                    ) {
+                        Text(
+                            text = item.badgeText,
+                            fontSize = 9.sp,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.Bold,
+                            color = badgeAccent,
+                            modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                        )
+                    }
+
+                    Text(
+                        text = formatBytesShort(item.sizeBytes),
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = TextSecondary
+                    )
+
+                    if (item.album.isNotBlank()) {
+                        Text(
+                            text = "· ${item.album}",
+                            fontSize = 10.sp,
+                            color = TextMuted,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+
+            Button(
+                onClick = onSingleImportClick,
+                shape = RoundedCornerShape(8.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = CyanPrimary,
+                    contentColor = OnAccentLight
+                ),
+                contentPadding = PaddingValues(horizontal = 11.dp, vertical = 4.dp),
+                modifier = Modifier.height(31.dp)
+            ) {
+                Text(
+                    text = "导入 .${item.targetFormat}",
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold
                 )
             }
         }

@@ -1,14 +1,25 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Read NetEase Cloud Music downloaded tracks (.ncm / .flac / .mp3) -->
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+    <uses-permission
+        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
 
     <!-- Only needed for legacy Android 8/9 public Music folder fallback; Android 10+ uses Scoped MediaStore -->
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
 
-    <!-- Android 11+ package visibility for direct WeChat (微信) detection & audio file sharing -->
+    <!-- Android 11+ package visibility for direct WeChat (微信) & NetEase Cloud Music (网易云音乐) detection -->
     <queries>
         <package android:name="com.tencent.mm" />
+        <package android:name="com.netease.cloudmusic" />
         <intent>
             <action android:name="android.intent.action.SEND" />
             <data android:mimeType="audio/*" />

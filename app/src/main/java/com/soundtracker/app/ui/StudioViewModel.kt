@@ -9,6 +9,8 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import com.soundtracker.app.audio.AudioCodecHelper
+import com.soundtracker.app.audio.NetEaseCloudMusicManager
+import com.soundtracker.app.audio.NetEaseLocalTrack
 import com.soundtracker.app.dsp.AudioMetrics
 import com.soundtracker.app.dsp.ExportFormat
 import com.soundtracker.app.dsp.NativeAudioEngine
@@ -83,7 +85,11 @@ data class StudioUiState(
     val exportFormat: ExportFormat = ExportFormat.MP3_320,
     // Processing overlay & storage stats
     val processingTask: ProcessingTaskState? = null,
-    val storageInfo: EphemeralStorageInfo = EphemeralStorageInfo(0L, 0L, 0)
+    val storageInfo: EphemeralStorageInfo = EphemeralStorageInfo(0L, 0L, 0),
+    // NetEase Cloud Music local scanner state
+    val netEaseTracks: List<NetEaseLocalTrack> = emptyList(),
+    val isScanningNetEase: Boolean = false,
+    val hasNetEaseStorageAccess: Boolean = true
 ) {
     val selectedTrack: SessionTrack?
         get() = tracks.firstOrNull { it.id == selectedTrackId } ?: tracks.firstOrNull()
@@ -344,70 +350,317 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     // ========================================================================
-    // Import & 3 Studio Processing Engines
+    // Import (Local & NetEase Cloud Music NCM/FLAC/MP3) & 3 Studio Engines
     // ========================================================================
+
+    fun scanNetEaseCloudMusic() {
+        viewModelScope.launch {
+            val hasAccess = NetEaseCloudMusicManager.hasAllFilesAccess()
+            _uiState.update {
+                it.copy(
+                    isScanningNetEase = true,
+                    hasNetEaseStorageAccess = hasAccess
+                )
+            }
+            val found = NetEaseCloudMusicManager.scanNetEaseLocalTracks(appContext)
+            _uiState.update {
+                it.copy(
+                    netEaseTracks = found,
+                    isScanningNetEase = false,
+                    hasNetEaseStorageAccess = NetEaseCloudMusicManager.hasAllFilesAccess()
+                )
+            }
+        }
+    }
+
+    /**
+     * Imports one or more tracks selected from the NetEase Cloud Music download list.
+     * - `.ncm` files are decrypted directly into `.flac` or `.mp3` inside the App workspace (zero transcoding loss).
+     * - `.flac` / `.mp3` files are copied directly in their original format (FLAC > MP3).
+     */
+    fun importNetEaseTracks(selectedTracks: List<NetEaseLocalTrack>) {
+        if (selectedTracks.isEmpty() || _uiState.value.processingTask != null) return
+        pausePlayback()
+
+        activeProcessingJob = viewModelScope.launch {
+            var importedCount = 0
+            var lastImportedName = ""
+            var lastFormat = ""
+            var lastBpm = 120
+            try {
+                NativeAudioEngine.nativeResetCancel()
+                val total = selectedTracks.size
+                for ((index, item) in selectedTracks.withIndex()) {
+                    var workspaceAudioFile: File? = null
+                    val tempAnalysisWav = File(
+                        SessionWorkspaceManager.tempDir(appContext),
+                        "netease_analyze_${System.nanoTime()}.wav"
+                    )
+                    try {
+                        val stepPrefix = if (total > 1) "(${index + 1}/$total) " else ""
+                        _uiState.update {
+                            it.copy(
+                                processingTask = ProcessingTaskState(
+                                    title = "${stepPrefix}正在从网易云导入「${item.displayTitle}」",
+                                    subtitle = if (item.isNcm) {
+                                        "正在无损解密 NCM → ${item.targetFormat.uppercase()}..."
+                                    } else {
+                                        "正在导入 ${item.targetFormat.uppercase()} 音轨..."
+                                    },
+                                    progress = 0.08f,
+                                    cancellable = true
+                                )
+                            )
+                        }
+
+                        val importRes = NetEaseCloudMusicManager.importNetEaseTrackToWorkspace(
+                            context = appContext,
+                            track = item
+                        ) { p ->
+                            _uiState.update { st ->
+                                st.copy(
+                                    processingTask = st.processingTask?.copy(
+                                        progress = (p * 0.45f).coerceIn(0.05f, 0.45f)
+                                    )
+                                )
+                            }
+                        }.getOrThrow()
+
+                        workspaceAudioFile = importRes.outputFile
+                        val fmtUpper = importRes.format.uppercase()
+
+                        _uiState.update { st ->
+                            st.copy(
+                                processingTask = st.processingTask?.copy(
+                                    subtitle = "已生成 $fmtUpper · 正在分析响度与自动识别 BPM...",
+                                    progress = 0.50f
+                                )
+                            )
+                        }
+
+                        val decodedOk = AudioCodecHelper.decodeUriToWav(
+                            context = appContext,
+                            uri = Uri.fromFile(workspaceAudioFile),
+                            tempDir = SessionWorkspaceManager.tempDir(appContext),
+                            targetWav = tempAnalysisWav
+                        ) { p ->
+                            _uiState.update { st ->
+                                st.copy(
+                                    processingTask = st.processingTask?.copy(
+                                        progress = (0.50f + p * 0.42f).coerceIn(0.50f, 0.92f)
+                                    )
+                                )
+                            }
+                        }
+
+                        if (!decodedOk || !tempAnalysisWav.exists()) {
+                            workspaceAudioFile.delete()
+                            continue
+                        }
+
+                        val metrics = NativeAudioEngine.analyzeWav(tempAnalysisWav)
+                        if (metrics == null) {
+                            workspaceAudioFile.delete()
+                            continue
+                        }
+
+                        val detectedBpm = metrics.detectedBpm.roundToInt()
+                        val sourceNote = if (importRes.wasEncryptedNcm) {
+                            "网易云 NCM→$fmtUpper"
+                        } else {
+                            "网易云 $fmtUpper"
+                        }
+                        val newTrack = SessionTrack(
+                            displayName = AudioCodecHelper.sanitizeFileName(importRes.displayTitle),
+                            badge = "$fmtUpper · ${detectedBpm}BPM",
+                            detailNote = "$sourceNote · ${formatMetricsSummary(metrics)}",
+                            audioFile = workspaceAudioFile,
+                            originTrackId = null,
+                            metrics = metrics
+                        ).let { it.copy(originTrackId = it.id) }
+
+                        appendTrackToWorkspace(newTrack)
+                        importedCount++
+                        lastImportedName = newTrack.displayName
+                        lastFormat = fmtUpper
+                        lastBpm = detectedBpm
+                    } catch (ce: CancellationException) {
+                        workspaceAudioFile?.delete()
+                        throw ce
+                    } catch (e: Exception) {
+                        workspaceAudioFile?.delete()
+                        if (total == 1) {
+                            sendMessage("网易云音乐导入失败：${e.message ?: "格式异常"}")
+                            return@launch
+                        }
+                    } finally {
+                        if (tempAnalysisWav.exists()) tempAnalysisWav.delete()
+                    }
+                }
+
+                if (importedCount == 1) {
+                    sendMessage("已从网易云导入「$lastImportedName.$lastFormat」· 速度 $lastBpm BPM")
+                } else if (importedCount > 1) {
+                    sendMessage("已从网易云成功导入 $importedCount 首音乐（自动转换为最佳 FLAC/MP3 格式）")
+                }
+            } catch (_: CancellationException) {
+                sendMessage("已取消网易云导入")
+            } finally {
+                _uiState.update { it.copy(processingTask = null) }
+                refreshStorageInfo()
+            }
+        }
+    }
 
     fun importAudioUri(uri: Uri) {
         if (_uiState.value.processingTask != null) return
         pausePlayback()
 
         activeProcessingJob = viewModelScope.launch {
-            val rawName = AudioCodecHelper.resolveDisplayName(appContext, uri)
-            val targetWav = SessionWorkspaceManager.createSessionTrackFile(appContext, "src", "wav")
+            val rawNameWithExt = AudioCodecHelper.resolveDisplayNameWithExt(appContext, uri)
+            val rawName = AudioCodecHelper.stripExtension(rawNameWithExt).ifBlank { "未命名音轨" }
+            val lowerExt = rawNameWithExt.substringAfterLast('.', "").lowercase()
+            val isNcm = NetEaseCloudMusicManager.isNcmUri(appContext, uri, rawNameWithExt)
+
+            var workspaceFile: File? = null
+            val tempAnalysisWav = File(
+                SessionWorkspaceManager.tempDir(appContext),
+                "analyze_${System.nanoTime()}.wav"
+            )
             try {
                 NativeAudioEngine.nativeResetCancel()
                 _uiState.update {
                     it.copy(
                         processingTask = ProcessingTaskState(
-                            title = "正在解码并分析「$rawName」",
-                            subtitle = "转换为 44.1kHz 双声道母带流并自动识别 BPM...",
+                            title = if (isNcm) "正在解密网易云 NCM「$rawName」" else "正在导入并分析「$rawName」",
+                            subtitle = if (isNcm) "正在无损提取 NCM 内置 FLAC / MP3 音频流..." else "正在分析音频流并自动识别 BPM...",
                             progress = 0.05f,
                             cancellable = true
                         )
                     )
                 }
 
-                val ok = AudioCodecHelper.decodeUriToWav(
-                    context = appContext,
-                    uri = uri,
-                    tempDir = SessionWorkspaceManager.tempDir(appContext),
-                    targetWav = targetWav
-                ) { p ->
-                    _uiState.update { state ->
-                        state.copy(
-                            processingTask = state.processingTask?.copy(progress = (p * 0.85f).coerceIn(0.05f, 0.85f))
-                        )
+                var finalTitle = rawName
+                var badgePrefix = "原曲"
+                var notePrefix = ""
+
+                if (isNcm) {
+                    val ncmRes = NetEaseCloudMusicManager.decryptNcmUriToWorkspace(
+                        context = appContext,
+                        uri = uri,
+                        fallbackTitle = rawName
+                    ) { p ->
+                        _uiState.update { st ->
+                            st.copy(
+                                processingTask = st.processingTask?.copy(
+                                    progress = (p * 0.45f).coerceIn(0.05f, 0.45f)
+                                )
+                            )
+                        }
+                    }.getOrThrow()
+
+                    workspaceFile = ncmRes.outputFile
+                    finalTitle = ncmRes.displayTitle
+                    val fmtUpper = ncmRes.format.uppercase()
+                    badgePrefix = fmtUpper
+                    notePrefix = "网易云 NCM→$fmtUpper · "
+
+                    val ok = AudioCodecHelper.decodeUriToWav(
+                        context = appContext,
+                        uri = Uri.fromFile(workspaceFile),
+                        tempDir = SessionWorkspaceManager.tempDir(appContext),
+                        targetWav = tempAnalysisWav
+                    ) { p ->
+                        _uiState.update { st ->
+                            st.copy(
+                                processingTask = st.processingTask?.copy(
+                                    progress = (0.45f + p * 0.45f).coerceIn(0.45f, 0.90f)
+                                )
+                            )
+                        }
+                    }
+                    if (!ok || !tempAnalysisWav.exists()) {
+                        workspaceFile.delete()
+                        sendMessage("NCM 解密后解码失败")
+                        return@launch
+                    }
+                } else if (lowerExt == "flac" || lowerExt == "mp3") {
+                    // Store directly as .flac or .mp3 in workspace
+                    val directFile = SessionWorkspaceManager.createSessionTrackFile(appContext, "src", lowerExt)
+                    workspaceFile = directFile
+                    appContext.contentResolver.openInputStream(uri)?.use { ins ->
+                        directFile.outputStream().buffered(256 * 1024).use { outs ->
+                            ins.copyTo(outs, 256 * 1024)
+                        }
+                    }
+                    badgePrefix = lowerExt.uppercase()
+
+                    val ok = AudioCodecHelper.decodeUriToWav(
+                        context = appContext,
+                        uri = Uri.fromFile(directFile),
+                        tempDir = SessionWorkspaceManager.tempDir(appContext),
+                        targetWav = tempAnalysisWav
+                    ) { p ->
+                        _uiState.update { state ->
+                            state.copy(
+                                processingTask = state.processingTask?.copy(progress = (p * 0.85f).coerceIn(0.05f, 0.85f))
+                            )
+                        }
+                    }
+                    if (!ok || !tempAnalysisWav.exists()) {
+                        directFile.delete()
+                        sendMessage("无法解码该音频文件")
+                        return@launch
+                    }
+                } else {
+                    val targetWav = SessionWorkspaceManager.createSessionTrackFile(appContext, "src", "wav")
+                    workspaceFile = targetWav
+                    val ok = AudioCodecHelper.decodeUriToWav(
+                        context = appContext,
+                        uri = uri,
+                        tempDir = SessionWorkspaceManager.tempDir(appContext),
+                        targetWav = targetWav
+                    ) { p ->
+                        _uiState.update { state ->
+                            state.copy(
+                                processingTask = state.processingTask?.copy(progress = (p * 0.85f).coerceIn(0.05f, 0.85f))
+                            )
+                        }
+                    }
+                    if (!ok || !targetWav.exists()) {
+                        targetWav.delete()
+                        sendMessage("无法解码该音频文件，请选择 NCM / MP3 / FLAC / M4A / WAV / MP4 格式")
+                        return@launch
                     }
                 }
 
-                if (!ok || !targetWav.exists()) {
-                    targetWav.delete()
-                    sendMessage("无法解码该音频文件，请选择 MP3 / M4A / FLAC / WAV / OGG / MP4 格式")
-                    return@launch
-                }
-
-                val metrics = NativeAudioEngine.analyzeWav(targetWav) ?: run {
-                    targetWav.delete()
+                val wavToAnalyze = if (tempAnalysisWav.exists()) tempAnalysisWav else workspaceFile!!
+                val metrics = NativeAudioEngine.analyzeWav(wavToAnalyze) ?: run {
+                    workspaceFile?.delete()
                     sendMessage("音频响度与 BPM 分析失败")
                     return@launch
                 }
 
                 val detectedBpm = metrics.detectedBpm.roundToInt()
                 val newTrack = SessionTrack(
-                    displayName = AudioCodecHelper.sanitizeFileName(rawName),
-                    badge = "原曲 · ${detectedBpm}BPM",
-                    detailNote = formatMetricsSummary(metrics),
-                    audioFile = targetWav,
+                    displayName = AudioCodecHelper.sanitizeFileName(finalTitle),
+                    badge = "$badgePrefix · ${detectedBpm}BPM",
+                    detailNote = "$notePrefix${formatMetricsSummary(metrics)}",
+                    audioFile = workspaceFile!!,
                     originTrackId = null,
                     metrics = metrics
                 ).let { it.copy(originTrackId = it.id) }
 
                 appendTrackToWorkspace(newTrack)
-                sendMessage("已导入「${newTrack.displayName}」· 自动识别速度 ${detectedBpm} BPM")
+                sendMessage("已导入「${newTrack.displayName}.${workspaceFile.extension.lowercase()}」· 自动识别速度 ${detectedBpm} BPM")
             } catch (_: CancellationException) {
-                targetWav.delete()
+                workspaceFile?.delete()
                 sendMessage("已取消导入")
+            } catch (e: Exception) {
+                workspaceFile?.delete()
+                sendMessage("导入失败：${e.message ?: "格式不支持"}")
             } finally {
+                if (tempAnalysisWav.exists()) tempAnalysisWav.delete()
                 _uiState.update { it.copy(processingTask = null) }
                 refreshStorageInfo()
             }

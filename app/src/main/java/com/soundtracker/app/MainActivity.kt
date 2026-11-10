@@ -4,6 +4,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -51,13 +52,20 @@ class MainActivity : ComponentActivity() {
                 val snackbarHostState = remember { SnackbarHostState() }
                 var pendingCustomSaveTrackId by remember { mutableStateOf<String?>(null) }
 
-                // Picker for importing audio (or video to extract audio)
+                // Picker for importing audio, video, or .ncm files
                 val openAudioLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.OpenDocument()
                 ) { uri: Uri? ->
                     if (uri != null) {
                         viewModel.importAudioUri(uri)
                     }
+                }
+
+                // Launcher for Android 11+ All Files Access (needed to scan NetEase .ncm files)
+                val manageAllFilesLauncher = rememberLauncherForActivityResult(
+                    contract = ActivityResultContracts.StartActivityForResult()
+                ) {
+                    viewModel.scanNetEaseCloudMusic()
                 }
 
                 // SAF "Save As" custom folder/file picker
@@ -92,7 +100,23 @@ class MainActivity : ComponentActivity() {
                     uiState = uiState,
                     snackbarHostState = snackbarHostState,
                     onPickAudioClick = {
-                        openAudioLauncher.launch(arrayOf("audio/*", "video/*"))
+                        openAudioLauncher.launch(arrayOf("*/*"))
+                    },
+                    onScanNetEaseClick = viewModel::scanNetEaseCloudMusic,
+                    onImportNetEaseTracks = viewModel::importNetEaseTracks,
+                    onRequestAllFilesAccess = {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                            runCatching {
+                                val intent = Intent(
+                                    Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                                    Uri.parse("package:$packageName")
+                                )
+                                manageAllFilesLauncher.launch(intent)
+                            }.onFailure {
+                                val fallback = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                                manageAllFilesLauncher.launch(fallback)
+                            }
+                        }
                     },
                     onSelectTrack = viewModel::selectTrack,
                     onTogglePlayPause = viewModel::togglePlayPause,
