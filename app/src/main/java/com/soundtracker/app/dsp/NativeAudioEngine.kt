@@ -170,6 +170,12 @@ object NativeAudioEngine {
         maxOutFrames: Int
     ): Int
 
+    external fun nativeCreateRealtimeMaximizer(sampleRate: Int, channels: Int): Long
+    external fun nativeDestroyRealtimeMaximizer(handle: Long)
+    external fun nativeResetRealtimeMaximizer(handle: Long)
+    external fun nativeSetRealtimeMaximizerGain(handle: Long, gainDb: Float)
+    external fun nativeProcessRealtimeMaximizer(handle: Long, pcm: ShortArray, frames: Int)
+
     /**
      * Reclaims any legacy extracted `.onnx` files from `noBackupFilesDir/engine_models/`.
      * Models are now zero-copy mmap'd directly from APK `assets/models/` via `AAssetManager`,

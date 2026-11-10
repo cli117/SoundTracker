@@ -570,4 +570,213 @@ float applyTruePeakSafetyLimiter(PlanarAudioBuffer& buf, float ceilingDbtp) {
     return r.maxGainReductionDb;
 }
 
+namespace {
+
+inline float estimateHistoryTruePeak4x(const float h[4]) {
+    const float s0 = h[0], s1 = h[1], s2 = h[2], s3 = h[3];
+    float maxAbs = std::abs(s1);
+    if (maxAbs < 0.15f && std::abs(s2) < 0.15f) {
+        return std::max(maxAbs, std::abs(s2));
+    }
+    const float a = -0.5f * s0 + 1.5f * s1 - 1.5f * s2 + 0.5f * s3;
+    const float b = s0 - 2.5f * s1 + 2.0f * s2 - 0.5f * s3;
+    const float c = -0.5f * s0 + 0.5f * s2;
+    const float d = s1;
+
+    const float p25 = ((a * 0.25f + b) * 0.25f + c) * 0.25f + d;
+    const float p50 = ((a * 0.50f + b) * 0.50f + c) * 0.50f + d;
+    const float p75 = ((a * 0.75f + b) * 0.75f + c) * 0.75f + d;
+
+    maxAbs = std::max(maxAbs, std::abs(p25));
+    maxAbs = std::max(maxAbs, std::abs(p50));
+    maxAbs = std::max(maxAbs, std::abs(p75));
+    return maxAbs;
+}
+
+inline int16_t floatToPcm16ExactScale(float x) {
+    const int32_t v = static_cast<int32_t>(std::lrintf(x * 32768.0f));
+    return static_cast<int16_t>(std::clamp(v, -32768, 32767));
+}
+
+size_t nextPowerOfTwo(size_t n) {
+    size_t p = 1;
+    while (p < n) p <<= 1;
+    return p;
+}
+
+} // namespace
+
+RealtimeVolumeMaximizer::RealtimeVolumeMaximizer(int sampleRate, int channels, float ceilingDbtp)
+    : sampleRate_(std::clamp(sampleRate, 8000, 192000)),
+      channels_(std::clamp(channels, 1, 2)),
+      ceilingLin_(std::pow(10.0f, ceilingDbtp / 20.0f)),
+      hardGuard_(std::min(0.996f, ceilingLin_ * 1.008f)),
+      fastRelCoeff_(std::exp(-1.0f / (0.040f * static_cast<float>(sampleRate_)))),
+      slowRelCoeff_(std::exp(-1.0f / (0.240f * static_cast<float>(sampleRate_)))),
+      paramSmoothAlpha_(1.0f - std::exp(-1.0f / (0.008f * static_cast<float>(sampleRate_)))),
+      lookahead_(std::max<size_t>(16, static_cast<size_t>(sampleRate_ * 0.005))),
+      halfWin_(std::max<size_t>(4, lookahead_ / 2)),
+      invHalfWin_(1.0 / static_cast<double>(halfWin_)),
+      ringCap_(nextPowerOfTwo(lookahead_ + 16)),
+      ringMask_(ringCap_ - 1) {
+    audioRing0_.assign(ringCap_, 0.0f);
+    audioRing1_.assign(ringCap_, 0.0f);
+    targetGainRing_.assign(ringCap_, 1.0f);
+    dequeIdx_.assign(ringCap_, 0);
+    dequeVal_.assign(ringCap_, 1.0f);
+    boxcar1Ring_.assign(halfWin_, 1.0f);
+    boxcar2Ring_.assign(halfWin_, 1.0f);
+    reset();
+}
+
+void RealtimeVolumeMaximizer::setGainDb(float gainDb) {
+    const float clamped = std::clamp(gainDb, -12.0f, 24.0f);
+    targetGainDb_.store(clamped, std::memory_order_relaxed);
+}
+
+void RealtimeVolumeMaximizer::reset() {
+    const float gainDb = targetGainDb_.load(std::memory_order_relaxed);
+    appliedGainLin_ = std::pow(10.0f, gainDb / 20.0f);
+
+    for (int c = 0; c < 2; ++c) {
+        for (int k = 0; k < 4; ++k) {
+            tpHist_[c][k] = 0.0f;
+        }
+    }
+    std::fill(audioRing0_.begin(), audioRing0_.end(), 0.0f);
+    std::fill(audioRing1_.begin(), audioRing1_.end(), 0.0f);
+    std::fill(targetGainRing_.begin(), targetGainRing_.end(), 1.0f);
+
+    frameCount_ = lookahead_;
+    dequeHead_ = 0;
+    dequeSize_ = 1;
+    dequeIdx_[0] = lookahead_ - 1;
+    dequeVal_[0] = 1.0f;
+
+    fastEnv_ = 1.0f;
+    slowEnv_ = 1.0f;
+    std::fill(boxcar1Ring_.begin(), boxcar1Ring_.end(), 1.0f);
+    std::fill(boxcar2Ring_.begin(), boxcar2Ring_.end(), 1.0f);
+    boxcarPos_ = 0;
+    winSum1_ = static_cast<double>(halfWin_);
+    winSum2_ = static_cast<double>(halfWin_);
+}
+
+void RealtimeVolumeMaximizer::processInterleavedInt16(
+    const int16_t* inPcm16,
+    int16_t* outPcm16,
+    int frames
+) {
+    if (!inPcm16 || !outPcm16 || frames <= 0) return;
+
+    const float targetGainDb = targetGainDb_.load(std::memory_order_relaxed);
+    const float targetLin = std::pow(10.0f, targetGainDb / 20.0f);
+    constexpr float kInv32768 = 1.0f / 32768.0f;
+
+    for (int i = 0; i < frames; ++i) {
+        // 1. Zipper-free 8ms exponential fader smoothing
+        appliedGainLin_ += paramSmoothAlpha_ * (targetLin - appliedGainLin_);
+
+        float in0 = 0.0f;
+        float in1 = 0.0f;
+        if (channels_ == 2) {
+            in0 = static_cast<float>(inPcm16[i * 2]) * kInv32768 * appliedGainLin_;
+            in1 = static_cast<float>(inPcm16[i * 2 + 1]) * kInv32768 * appliedGainLin_;
+        } else {
+            in0 = static_cast<float>(inPcm16[i]) * kInv32768 * appliedGainLin_;
+            in1 = in0;
+        }
+
+        // 2. Shift 4-tap Catmull-Rom 4x inter-sample true-peak window
+        tpHist_[0][0] = tpHist_[0][1];
+        tpHist_[0][1] = tpHist_[0][2];
+        tpHist_[0][2] = tpHist_[0][3];
+        tpHist_[0][3] = in0;
+
+        float framePeak = estimateHistoryTruePeak4x(tpHist_[0]);
+        if (channels_ == 2) {
+            tpHist_[1][0] = tpHist_[1][1];
+            tpHist_[1][1] = tpHist_[1][2];
+            tpHist_[1][2] = tpHist_[1][3];
+            tpHist_[1][3] = in1;
+            framePeak = std::max(framePeak, estimateHistoryTruePeak4x(tpHist_[1]));
+        }
+
+        const float instTargetGain = (framePeak > ceilingLin_) ? (ceilingLin_ / framePeak) : 1.0f;
+
+        // 3. Store center sample tpHist_[c][1] & targetGain into lookahead ring buffer
+        const uint64_t curIdx = frameCount_;
+        const size_t writeSlot = static_cast<size_t>(curIdx) & ringMask_;
+        audioRing0_[writeSlot] = tpHist_[0][1];
+        if (channels_ == 2) {
+            audioRing1_[writeSlot] = tpHist_[1][1];
+        }
+        targetGainRing_[writeSlot] = instTargetGain;
+
+        // 4. Push into O(1) monotonic sliding-minimum deque
+        while (dequeSize_ > 0) {
+            const size_t backSlot = (dequeHead_ + dequeSize_ - 1) & ringMask_;
+            if (dequeVal_[backSlot] >= instTargetGain) {
+                --dequeSize_;
+            } else {
+                break;
+            }
+        }
+        const size_t pushSlot = (dequeHead_ + dequeSize_) & ringMask_;
+        dequeIdx_[pushSlot] = curIdx;
+        dequeVal_[pushSlot] = instTargetGain;
+        ++dequeSize_;
+
+        // 5. Pop expired lookahead window entries for delayed output frame `outIdx`
+        const uint64_t outIdx = curIdx - lookahead_;
+        while (dequeSize_ > 1 && dequeIdx_[dequeHead_] < outIdx) {
+            dequeHead_ = (dequeHead_ + 1) & ringMask_;
+            --dequeSize_;
+        }
+        const float mg = dequeVal_[dequeHead_];
+
+        // 6. Program-dependent dual-release (40ms transient + 240ms anti-pumping floor)
+        if (mg < fastEnv_) {
+            fastEnv_ = mg;
+        } else {
+            fastEnv_ = fastRelCoeff_ * fastEnv_ + (1.0f - fastRelCoeff_) * mg;
+        }
+        if (mg < slowEnv_) {
+            slowEnv_ = 0.85f * slowEnv_ + 0.15f * mg;
+        } else {
+            slowEnv_ = slowRelCoeff_ * slowEnv_ + (1.0f - slowRelCoeff_) * mg;
+        }
+        const float grDepth = 1.0f - slowEnv_;
+        const float blend = std::clamp(grDepth * 1.6f, 0.0f, 0.65f);
+        const float env = std::min(mg, (1.0f - blend) * fastEnv_ + blend * slowEnv_);
+
+        // 7. Two-pass causal boxcar (triangular kernel of width = lookahead) smooth attack
+        winSum1_ += static_cast<double>(env) - static_cast<double>(boxcar1Ring_[boxcarPos_]);
+        boxcar1Ring_[boxcarPos_] = env;
+        const float s1 = static_cast<float>(winSum1_ * invHalfWin_);
+
+        winSum2_ += static_cast<double>(s1) - static_cast<double>(boxcar2Ring_[boxcarPos_]);
+        boxcar2Ring_[boxcarPos_] = s1;
+        float g = static_cast<float>(winSum2_ * invHalfWin_);
+        if (++boxcarPos_ >= halfWin_) {
+            boxcarPos_ = 0;
+        }
+
+        // 8. Strict brickwall ceiling guard & output conversion
+        const size_t outSlot = static_cast<size_t>(outIdx) & ringMask_;
+        g = std::clamp(std::min(g, targetGainRing_[outSlot]), 0.0f, 1.0f);
+
+        const float y0 = std::clamp(audioRing0_[outSlot] * g, -hardGuard_, hardGuard_);
+        if (channels_ == 2) {
+            const float y1 = std::clamp(audioRing1_[outSlot] * g, -hardGuard_, hardGuard_);
+            outPcm16[i * 2] = floatToPcm16ExactScale(y0);
+            outPcm16[i * 2 + 1] = floatToPcm16ExactScale(y1);
+        } else {
+            outPcm16[i] = floatToPcm16ExactScale(y0);
+        }
+
+        ++frameCount_;
+    }
+}
+
 } // namespace soundtracker

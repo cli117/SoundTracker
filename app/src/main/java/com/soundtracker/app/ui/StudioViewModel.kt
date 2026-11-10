@@ -12,6 +12,7 @@ import com.soundtracker.app.audio.AudioCodecHelper
 import com.soundtracker.app.audio.NetEaseCloudMusicManager
 import com.soundtracker.app.audio.NetEaseLocalTrack
 import com.soundtracker.app.audio.RealtimePitchAudioProcessor
+import com.soundtracker.app.audio.RealtimeVolumeAudioProcessor
 import com.soundtracker.app.audio.buildRealtimePreviewExoPlayer
 import com.soundtracker.app.dsp.AudioMetrics
 import com.soundtracker.app.dsp.ExportFormat
@@ -82,13 +83,14 @@ data class StudioUiState(
     val targetBpm: Int = 120,
     val preserveTimbre: Boolean = false,
     val livePitchTempoPreview: Boolean = true,
-    // Tool 3 options
-    val volumeGainDb: Float = 4.0f,
+    // Tool 3 options (Volume Boost + Real-time "边听边调" preview)
+    val volumeGainDb: Float = 0.0f,
+    val liveVolumeBoostPreview: Boolean = true,
     // Export format
     val exportFormat: ExportFormat = ExportFormat.MP3_320,
     // Processing overlay & storage stats
-    val processingTask: ProcessingTaskState? = null,
     val storageInfo: EphemeralStorageInfo = EphemeralStorageInfo(0L, 0L, 0),
+    val processingTask: ProcessingTaskState? = null,
     // NetEase Cloud Music local scanner state
     val netEaseTracks: List<NetEaseLocalTrack> = emptyList(),
     val isScanningNetEase: Boolean = false,
@@ -111,19 +113,30 @@ data class StudioUiState(
             !isComparingOriginal &&
             (pitchSemitones != 0 || pitchCents != 0 || targetBpm != sourceBpm)
 
+    val isLiveVolumeBoostPreviewActive: Boolean
+        get() = activeTab == StudioToolTab.VOLUME_BOOST &&
+            liveVolumeBoostPreview &&
+            !isComparingOriginal &&
+            volumeGainDb > 0.05f
+
     val livePreviewSummaryLabel: String?
-        get() {
-            if (!isLivePitchTempoPreviewActive) return null
-            val parts = buildList {
-                if (pitchSemitones != 0 || pitchCents != 0) {
-                    val semiStr = if (pitchSemitones > 0) "+$pitchSemitones" else "$pitchSemitones"
-                    add("${semiStr}半音")
+        get() = when {
+            isLivePitchTempoPreviewActive -> {
+                val parts = buildList {
+                    if (pitchSemitones != 0 || pitchCents != 0) {
+                        val semiStr = if (pitchSemitones > 0) "+$pitchSemitones" else "$pitchSemitones"
+                        add("${semiStr}半音")
+                    }
+                    if (targetBpm != sourceBpm) {
+                        add("${targetBpm}BPM")
+                    }
                 }
-                if (targetBpm != sourceBpm) {
-                    add("${targetBpm}BPM")
-                }
+                if (parts.isEmpty()) null else "实时预览 · ${parts.joinToString(" · ")}"
             }
-            return if (parts.isEmpty()) null else "实时预览 · ${parts.joinToString(" · ")}"
+            isLiveVolumeBoostPreviewActive -> {
+                String.format(Locale.US, "实时预览 · +%.1fdB", volumeGainDb)
+            }
+            else -> null
         }
 }
 
@@ -143,7 +156,12 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     val events = _events.receiveAsFlow()
 
     private val realtimePitchProcessor = RealtimePitchAudioProcessor()
-    private val exoPlayer: ExoPlayer = buildRealtimePreviewExoPlayer(appContext, realtimePitchProcessor)
+    private val realtimeVolumeProcessor = RealtimeVolumeAudioProcessor()
+    private val exoPlayer: ExoPlayer = buildRealtimePreviewExoPlayer(
+        appContext,
+        realtimePitchProcessor,
+        realtimeVolumeProcessor
+    )
     private var loadedPlayerFilePath: String? = null
     private var activeProcessingJob: Job? = null
 
@@ -200,7 +218,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     sourceBpm = detectedBpm,
                     targetBpm = detectedBpm,
                     playbackDurationMs = (first.metrics.durationSec * 1000f).toLong(),
-                    volumeGainDb = suggestSmartGainDb(first.metrics)
+                    volumeGainDb = 0f
                 )
             }
             preparePlayerForTrack(first, seekMs = 0L, playImmediately = false)
@@ -222,7 +240,6 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     fun selectTrack(trackId: String) {
         val track = _uiState.value.tracks.firstOrNull { it.id == trackId } ?: return
         pausePlayback()
-        val smartDefaultGain = suggestSmartGainDb(track.metrics)
         val detectedBpm = track.metrics.detectedBpm.roundToInt().coerceIn(45, 220)
         _uiState.update {
             it.copy(
@@ -234,7 +251,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 pitchCents = 0,
                 sourceBpm = detectedBpm,
                 targetBpm = detectedBpm,
-                volumeGainDb = smartDefaultGain
+                volumeGainDb = 0f
             )
         }
         syncRealtimePreviewProcessor()
@@ -382,7 +399,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun syncRealtimePreviewProcessor(state: StudioUiState = _uiState.value) {
-        val enabled = state.activeTab == StudioToolTab.PITCH_SHIFT &&
+        val pitchEnabled = state.activeTab == StudioToolTab.PITCH_SHIFT &&
             state.livePitchTempoPreview &&
             !state.isComparingOriginal
         val semitones = state.pitchSemitones + (state.pitchCents / 100f)
@@ -390,16 +407,28 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         val dstBpm = state.targetBpm.coerceIn(40, 240).toDouble()
         val timeRatio = srcBpm / dstBpm
         realtimePitchProcessor.updatePreviewConfig(
-            enabled = enabled,
+            enabled = pitchEnabled,
             semitones = semitones,
             timeRatio = timeRatio,
             preserveTimbre = state.preserveTimbre
+        )
+
+        realtimeVolumeProcessor.updatePreviewConfig(
+            isVolumeTabActive = state.activeTab == StudioToolTab.VOLUME_BOOST && !state.isComparingOriginal,
+            previewEnabled = state.liveVolumeBoostPreview,
+            gainDb = state.volumeGainDb
         )
     }
 
     fun setVolumeGainDb(gainDb: Float) {
         val rounded = (gainDb.coerceIn(0f, 18f) * 10f).roundToInt() / 10f
         _uiState.update { it.copy(volumeGainDb = rounded) }
+        syncRealtimePreviewProcessor()
+    }
+
+    fun setLiveVolumeBoostPreview(enabled: Boolean) {
+        _uiState.update { it.copy(liveVolumeBoostPreview = enabled) }
+        syncRealtimePreviewProcessor()
     }
 
     fun setExportFormat(format: ExportFormat) {
@@ -1014,8 +1043,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 _uiState.update {
                     it.copy(
                         processingTask = ProcessingTaskState(
-                            title = "正在进行无损/防破音音量放大 ($gainStr)",
-                            subtitle = "32-bit 浮点线性增益 + 4x超采样真峰值限幅保护...",
+                            title = "正在生成音量放大音轨 ($gainStr)",
+                            subtitle = "正在提高整体音量并进行防破音峰值保护...",
                             progress = 0.08f,
                             cancellable = true
                         )
@@ -1044,9 +1073,9 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 val postMetrics = rawPostMetrics.copy(detectedBpm = sourceTrack.metrics.detectedBpm)
                 val bpmInt = postMetrics.detectedBpm.roundToInt()
                 val modeDesc = if (report.wasPureLossless) {
-                    "100%纯线性无损增益"
+                    "无损等比放大"
                 } else {
-                    String.format(Locale.US, "母带防破音保护(峰值抑制%.1fdB)", report.maxGainReductionDb)
+                    String.format(Locale.US, "防破音保护(压制峰值%.1fdB)", report.maxGainReductionDb)
                 }
                 val newName = appendSmartTag(sourceTrack.displayName, "音量$gainStr")
                 val boostedTrack = SessionTrack(
@@ -1059,7 +1088,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 )
 
                 appendTrackToWorkspace(boostedTrack)
-                sendMessage("音量放大完成（$modeDesc，零削波破音）")
+                sendMessage("已生成放大音轨（$modeDesc，无破音失真）")
             } catch (_: CancellationException) {
                 outWav.delete()
                 sendMessage("已取消音量放大")
@@ -1321,7 +1350,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 pitchSemitones = if (switchedTrack) 0 else it.pitchSemitones,
                 pitchCents = if (switchedTrack) 0 else it.pitchCents,
                 sourceBpm = if (switchedTrack) nextBpm else it.sourceBpm,
-                targetBpm = if (switchedTrack) nextBpm else it.targetBpm
+                targetBpm = if (switchedTrack) nextBpm else it.targetBpm,
+                volumeGainDb = if (switchedTrack) 0f else it.volumeGainDb
             )
         }
         syncRealtimePreviewProcessor()
@@ -1346,7 +1376,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 playbackPositionMs = 0L,
                 playbackDurationMs = 0L,
                 pitchSemitones = 0,
-                pitchCents = 0
+                pitchCents = 0,
+                volumeGainDb = 0f
             )
         }
         syncRealtimePreviewProcessor()
@@ -1376,7 +1407,6 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun appendTrackToWorkspace(newTrack: SessionTrack) {
-        val smartGain = suggestSmartGainDb(newTrack.metrics)
         val detectedBpm = newTrack.metrics.detectedBpm.roundToInt().coerceIn(45, 220)
         val updatedList = listOf(newTrack) + _uiState.value.tracks
 
@@ -1391,23 +1421,11 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 pitchCents = 0,
                 sourceBpm = detectedBpm,
                 targetBpm = detectedBpm,
-                volumeGainDb = smartGain
+                volumeGainDb = 0f
             )
         }
         syncRealtimePreviewProcessor()
         preparePlayerForTrack(newTrack, seekMs = 0L, playImmediately = false)
-    }
-
-    private fun suggestSmartGainDb(metrics: AudioMetrics): Float {
-        return when {
-            metrics.pureLosslessHeadroomDb >= 1.5f -> {
-                ((metrics.pureLosslessHeadroomDb.coerceAtMost(12f) * 10f).roundToInt() / 10f)
-            }
-            metrics.integratedLufs < -12.5f && metrics.integratedLufs > -60f -> {
-                (((-11.0f - metrics.integratedLufs).coerceIn(1.5f, 9.0f) * 10f).roundToInt() / 10f)
-            }
-            else -> 3.0f
-        }
     }
 
     private fun formatPitchTag(semitones: Int, cents: Int): String {

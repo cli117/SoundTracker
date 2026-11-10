@@ -190,6 +190,7 @@ fun StudioScreen(
     onLivePitchPreviewChange: (Boolean) -> Unit,
     onRunPitchShift: () -> Unit,
     onVolumeGainChange: (Float) -> Unit,
+    onLiveVolumePreviewChange: (Boolean) -> Unit,
     onRunVolumeBoost: () -> Unit,
     onExportFormatChange: (ExportFormat) -> Unit,
     onRenameTrack: (String, String) -> Unit,
@@ -298,6 +299,7 @@ fun StudioScreen(
                             onLivePitchPreviewChange = onLivePitchPreviewChange,
                             onRunPitchShift = onRunPitchShift,
                             onVolumeGainChange = onVolumeGainChange,
+                            onLiveVolumePreviewChange = onLiveVolumePreviewChange,
                             onRunVolumeBoost = onRunVolumeBoost
                         )
                     }
@@ -1145,6 +1147,7 @@ private fun StudioDspWorkbenchCard(
     onLivePitchPreviewChange: (Boolean) -> Unit,
     onRunPitchShift: () -> Unit,
     onVolumeGainChange: (Float) -> Unit,
+    onLiveVolumePreviewChange: (Boolean) -> Unit,
     onRunVolumeBoost: () -> Unit
 ) {
     Card(
@@ -1234,7 +1237,12 @@ private fun StudioDspWorkbenchCard(
                 StudioToolTab.VOLUME_BOOST -> {
                     VolumeBoostPanel(
                         track = activeTrack,
+                        isPlaying = uiState.isPlaying,
+                        isComparingOriginal = uiState.isComparingOriginal,
+                        livePreviewEnabled = uiState.liveVolumeBoostPreview,
                         gainDb = uiState.volumeGainDb,
+                        onTogglePlayPause = onTogglePlayPause,
+                        onLivePreviewChange = onLiveVolumePreviewChange,
                         onGainChange = onVolumeGainChange,
                         onRun = onRunVolumeBoost
                     )
@@ -2067,30 +2075,211 @@ private fun StepperIconButton(
 @Composable
 private fun VolumeBoostPanel(
     track: SessionTrack,
+    isPlaying: Boolean,
+    isComparingOriginal: Boolean,
+    livePreviewEnabled: Boolean,
     gainDb: Float,
+    onTogglePlayPause: () -> Unit,
+    onLivePreviewChange: (Boolean) -> Unit,
     onGainChange: (Float) -> Unit,
     onRun: () -> Unit
 ) {
     val metrics = track.metrics
     val headroom = metrics.pureLosslessHeadroomDb
-    val isPureLosslessZone = gainDb <= headroom + 0.05f
+    val hasGainChange = gainDb > 0.05f
+    val isPureLosslessZone = !hasGainChange || gainDb <= headroom + 0.05f
+    val isLiveAuditioningBoost = livePreviewEnabled && !isComparingOriginal && hasGainChange
+    val activeAccentColor = if (isPureLosslessZone) EmeraldLossless else AmberMastering
+
+    val losslessPresetGain = ((headroom.coerceIn(0f, 18f) * 10f).roundToInt() / 10f)
+    val moderatePresetGain = ((if (metrics.integratedLufs > -60f) {
+        (-11.0f - metrics.integratedLufs).coerceIn(1.5f, 14f)
+    } else 4.5f) * 10f).roundToInt() / 10f
+    val loudPresetGain = ((if (metrics.integratedLufs > -60f) {
+        (-8.5f - metrics.integratedLufs).coerceIn(3.0f, 16f)
+    } else 7.5f) * 10f).roundToInt() / 10f
 
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Icon(Icons.AutoMirrored.Rounded.VolumeUp, contentDescription = null, tint = EmeraldLossless)
-            Spacer(modifier = Modifier.width(8.dp))
-            Column {
+        // Header Row — Locked Constant Height (42.dp)
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(42.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(end = 8.dp)
+            ) {
+                Icon(Icons.AutoMirrored.Rounded.VolumeUp, contentDescription = null, tint = EmeraldLossless)
+                Spacer(modifier = Modifier.width(8.dp))
+                Column {
+                    Text(
+                        text = "音量放大",
+                        fontFamily = FontFamily.Serif,
+                        fontWeight = FontWeight.Bold,
+                        color = TextPrimary,
+                        maxLines = 1
+                    )
+                    Text(
+                        text = "可边播边调试听，调好后生成新音轨",
+                        fontSize = 12.sp,
+                        color = TextSecondary,
+                        minLines = 1,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+
+            val resetShape = RoundedCornerShape(8.dp)
+            Surface(
+                shape = resetShape,
+                color = if (hasGainChange) EmeraldLossless.copy(alpha = 0.12f) else StudioSurfaceElevated.copy(alpha = 0.5f),
+                border = BorderStroke(
+                    1.dp,
+                    if (hasGainChange) EmeraldLossless.copy(alpha = 0.45f) else StudioBorder.copy(alpha = 0.6f)
+                ),
+                modifier = Modifier
+                    .clip(resetShape)
+                    .clickable(enabled = hasGainChange) { onGainChange(0f) }
+            ) {
                 Text(
-                    "音量放大",
-                    fontFamily = FontFamily.Serif,
-                    fontWeight = FontWeight.Bold,
-                    color = TextPrimary
+                    text = "归零",
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = if (hasGainChange) EmeraldLossless else TextMuted.copy(alpha = 0.45f),
+                    maxLines = 1,
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
                 )
-                Text(
-                    "在无损空间内等比例放大；继续放大时自动限制峰值，防止爆音破音",
-                    fontSize = 12.sp,
-                    color = TextSecondary
-                )
+            }
+        }
+
+        // ====================================================================
+        // Real-Time Audition ("边听边调") Control Bar — Locked Constant Height
+        // ====================================================================
+        Surface(
+            shape = RoundedCornerShape(14.dp),
+            color = if (isLiveAuditioningBoost) activeAccentColor.copy(alpha = 0.08f) else StudioSurfaceElevated.copy(alpha = 0.65f),
+            border = BorderStroke(
+                width = 1.dp,
+                color = if (isLiveAuditioningBoost) activeAccentColor.copy(alpha = 0.55f) else StudioBorder
+            )
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(end = 10.dp),
+                        verticalArrangement = Arrangement.spacedBy(2.dp)
+                    ) {
+                        Text(
+                            text = "边听边调实时预览",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = TextPrimary,
+                            minLines = 1,
+                            maxLines = 1
+                        )
+                        Text(
+                            text = if (livePreviewEnabled) {
+                                "播放时拖动滑杆、点 − / + 或预设可直接听到放大效果；确定后点最下方按钮生成音轨"
+                            } else {
+                                "实时预览已关闭，播放时试听未放大的原音轨；调整增益后点最下方按钮生成音轨"
+                            },
+                            fontSize = 11.sp,
+                            lineHeight = 16.sp,
+                            color = TextMuted,
+                            minLines = 2,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+
+                    Switch(
+                        checked = livePreviewEnabled,
+                        onCheckedChange = onLivePreviewChange,
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = OnAccentLight,
+                            checkedTrackColor = EmeraldLossless
+                        )
+                    )
+                }
+
+                HorizontalDivider(color = StudioBorder.copy(alpha = 0.7f))
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(32.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    val playBtnShape = RoundedCornerShape(9.dp)
+                    Surface(
+                        shape = playBtnShape,
+                        color = if (isPlaying) EmeraldLossless else StudioSurface,
+                        border = BorderStroke(1.dp, if (isPlaying) EmeraldLossless else StudioBorder),
+                        modifier = Modifier
+                            .height(32.dp)
+                            .clip(playBtnShape)
+                            .clickable(onClick = onTogglePlayPause)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.padding(horizontal = 11.dp, vertical = 6.dp)
+                        ) {
+                            Icon(
+                                imageVector = if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
+                                contentDescription = null,
+                                tint = if (isPlaying) OnAccentLight else EmeraldLossless,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = if (isPlaying) "暂停试听" else "播放试听",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = if (isPlaying) OnAccentLight else TextPrimary,
+                                maxLines = 1
+                            )
+                        }
+                    }
+
+                    val liveStatusText = when {
+                        !livePreviewEnabled -> "已关闭：播放原音轨"
+                        isComparingOriginal -> "当前正在对比原曲"
+                        hasGainChange -> {
+                            val gainText = String.format(Locale.US, "+%.1f dB", gainDb)
+                            if (isPlaying) "生效中：$gainText" else "当前设定：$gainText"
+                        }
+                        isPlaying -> "正在原音量播放"
+                        else -> "点左侧播放即可边听边调"
+                    }
+
+                    Text(
+                        text = liveStatusText,
+                        fontSize = 11.sp,
+                        fontWeight = if (isLiveAuditioningBoost) FontWeight.SemiBold else FontWeight.Normal,
+                        color = if (isLiveAuditioningBoost) activeAccentColor else TextSecondary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(start = 10.dp)
+                    )
+                }
             }
         }
 
@@ -2120,111 +2309,217 @@ private fun VolumeBoostPanel(
             )
         }
 
-        // Smart 1-Tap Presets
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        // ====================================================================
+        // Gain Adjustment Card — [ − ]  ━━━━━━●━━━━━━  [ + ] + Presets (Constant Height)
+        // ====================================================================
+        Surface(
+            shape = RoundedCornerShape(14.dp),
+            color = StudioSurfaceElevated.copy(alpha = 0.65f),
+            border = BorderStroke(
+                width = 1.dp,
+                color = if (hasGainChange) activeAccentColor.copy(alpha = 0.55f) else StudioBorder
+            )
         ) {
-            OutlinedButton(
-                onClick = {
-                    onGainChange(if (headroom >= 0.2f) headroom else 1.5f)
-                },
-                modifier = Modifier.weight(1f),
-                shape = RoundedCornerShape(10.dp),
-                border = BorderStroke(1.dp, EmeraldLossless.copy(alpha = 0.55f)),
-                contentPadding = PaddingValues(vertical = 8.dp, horizontal = 4.dp)
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Text("无损最大", fontSize = 11.sp, color = EmeraldLossless, fontWeight = FontWeight.SemiBold)
-            }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(38.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(end = 8.dp)
+                    ) {
+                        Text(
+                            text = "放大增益 (dB)",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = TextPrimary,
+                            maxLines = 1
+                        )
+                        Text(
+                            text = when {
+                                !hasGainChange -> "当前保持原曲音量（未放大）"
+                                isPureLosslessZone -> "无损放大区间 · 等比例放大不失真"
+                                else -> "防破音保护中 · 自动压制峰值防爆音"
+                            },
+                            fontSize = 11.sp,
+                            color = if (hasGainChange) activeAccentColor else TextMuted,
+                            minLines = 1,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
 
-            OutlinedButton(
-                onClick = {
-                    val target = if (metrics.integratedLufs > -60f) {
-                        (-11.0f - metrics.integratedLufs).coerceIn(1.5f, 14f)
-                    } else 4.5f
-                    onGainChange(target)
-                },
-                modifier = Modifier.weight(1f),
-                shape = RoundedCornerShape(10.dp),
-                border = BorderStroke(1.dp, CyanPrimary.copy(alpha = 0.55f)),
-                contentPadding = PaddingValues(vertical = 8.dp, horizontal = 4.dp)
-            ) {
-                Text("适中音量", fontSize = 11.sp, color = CyanPrimary, fontWeight = FontWeight.SemiBold)
-            }
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = if (hasGainChange) activeAccentColor else StudioSurface,
+                        border = BorderStroke(1.dp, if (hasGainChange) activeAccentColor else StudioBorder),
+                        modifier = Modifier.widthIn(min = 80.dp)
+                    ) {
+                        Text(
+                            text = if (hasGainChange) {
+                                String.format(Locale.US, "+%.1f dB", gainDb)
+                            } else {
+                                "0.0 dB"
+                            },
+                            fontSize = 13.sp,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.Bold,
+                            color = if (hasGainChange) OnAccentLight else TextPrimary,
+                            textAlign = TextAlign.Center,
+                            maxLines = 1,
+                            modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp)
+                        )
+                    }
+                }
 
-            OutlinedButton(
-                onClick = {
-                    val target = if (metrics.integratedLufs > -60f) {
-                        (-8.5f - metrics.integratedLufs).coerceIn(3.0f, 16f)
-                    } else 7.5f
-                    onGainChange(target)
-                },
-                modifier = Modifier.weight(1f),
-                shape = RoundedCornerShape(10.dp),
-                border = BorderStroke(1.dp, AmberMastering.copy(alpha = 0.55f)),
-                contentPadding = PaddingValues(vertical = 8.dp, horizontal = 4.dp)
-            ) {
-                Text("较大音量", fontSize = 11.sp, color = AmberMastering, fontWeight = FontWeight.SemiBold)
-            }
-        }
+                // [ − ]  Slider  [ + ] (0.5 dB step)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    StepperIconButton(
+                        symbol = "−",
+                        enabled = gainDb > 0.01f,
+                        onClick = { onGainChange(gainDb - 0.5f) }
+                    )
 
-        // Gain Slider
-        Column {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = String.format(Locale.US, "放大增益: +%.1f dB", gainDb),
-                    fontSize = 15.sp,
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.Bold,
-                    color = if (isPureLosslessZone) EmeraldLossless else AmberMastering
-                )
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    OutlinedButton(
-                        onClick = { onGainChange(gainDb - 0.5f) },
-                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
-                        modifier = Modifier.height(28.dp)
-                    ) { Text("-0.5dB", fontSize = 11.sp) }
-                    OutlinedButton(
-                        onClick = { onGainChange(gainDb + 0.5f) },
-                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
-                        modifier = Modifier.height(28.dp)
-                    ) { Text("+0.5dB", fontSize = 11.sp) }
+                    Slider(
+                        value = gainDb,
+                        onValueChange = onGainChange,
+                        valueRange = 0f..18f,
+                        modifier = Modifier.weight(1f),
+                        colors = SliderDefaults.colors(
+                            thumbColor = activeAccentColor,
+                            activeTrackColor = activeAccentColor,
+                            inactiveTrackColor = StudioBorder
+                        )
+                    )
+
+                    StepperIconButton(
+                        symbol = "+",
+                        enabled = gainDb < 17.99f,
+                        onClick = { onGainChange(gainDb + 0.5f) }
+                    )
+                }
+
+                // Quick 1-Tap Presets — Constant 32.dp Height (no M3 48dp expansion)
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(32.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    val presetShape = RoundedCornerShape(9.dp)
+                    val losslessEnabled = losslessPresetGain >= 0.1f || hasGainChange
+                    val isLosslessSelected = hasGainChange && losslessPresetGain >= 0.1f && abs(gainDb - losslessPresetGain) < 0.06f
+                    val isModerateSelected = hasGainChange && abs(gainDb - moderatePresetGain) < 0.06f
+                    val isLoudSelected = hasGainChange && abs(gainDb - loudPresetGain) < 0.06f
+
+                    Surface(
+                        shape = presetShape,
+                        color = if (isLosslessSelected) EmeraldLossless.copy(alpha = 0.14f) else StudioSurface,
+                        border = BorderStroke(
+                            1.dp,
+                            if (losslessEnabled) EmeraldLossless.copy(alpha = 0.55f) else StudioBorder.copy(alpha = 0.5f)
+                        ),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(32.dp)
+                            .clip(presetShape)
+                            .clickable(enabled = losslessEnabled) {
+                                onGainChange(losslessPresetGain)
+                            }
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Text(
+                                text = "无损最大",
+                                fontSize = 11.sp,
+                                color = if (losslessEnabled) EmeraldLossless else TextMuted.copy(alpha = 0.45f),
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1
+                            )
+                        }
+                    }
+
+                    Surface(
+                        shape = presetShape,
+                        color = if (isModerateSelected) CyanPrimary.copy(alpha = 0.14f) else StudioSurface,
+                        border = BorderStroke(1.dp, CyanPrimary.copy(alpha = 0.55f)),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(32.dp)
+                            .clip(presetShape)
+                            .clickable { onGainChange(moderatePresetGain) }
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Text(
+                                text = "适中音量",
+                                fontSize = 11.sp,
+                                color = CyanPrimary,
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1
+                            )
+                        }
+                    }
+
+                    Surface(
+                        shape = presetShape,
+                        color = if (isLoudSelected) AmberMastering.copy(alpha = 0.14f) else StudioSurface,
+                        border = BorderStroke(1.dp, AmberMastering.copy(alpha = 0.55f)),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(32.dp)
+                            .clip(presetShape)
+                            .clickable { onGainChange(loudPresetGain) }
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Text(
+                                text = "较大音量",
+                                fontSize = 11.sp,
+                                color = AmberMastering,
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1
+                            )
+                        }
+                    }
                 }
             }
-
-            Slider(
-                value = gainDb,
-                onValueChange = onGainChange,
-                valueRange = 0f..18f,
-                colors = SliderDefaults.colors(
-                    thumbColor = if (isPureLosslessZone) EmeraldLossless else AmberMastering,
-                    activeTrackColor = if (isPureLosslessZone) EmeraldLossless else AmberMastering,
-                    inactiveTrackColor = StudioBorder
-                )
-            )
         }
 
         // Dynamic Lossless vs Limiter Status Banner (Constant 2-line height)
-        val modeColor = if (isPureLosslessZone) EmeraldLossless else AmberMastering
         Surface(
             shape = RoundedCornerShape(12.dp),
-            color = modeColor.copy(alpha = 0.10f),
-            border = BorderStroke(1.dp, modeColor.copy(alpha = 0.35f)),
+            color = activeAccentColor.copy(alpha = if (hasGainChange) 0.10f else 0.06f),
+            border = BorderStroke(1.dp, activeAccentColor.copy(alpha = if (hasGainChange) 0.35f else 0.22f)),
             modifier = Modifier.fillMaxWidth()
         ) {
             Text(
-                text = if (isPureLosslessZone) {
-                    "当前处于无损放大区间：仅等比例调大整体音量，不会产生任何失真或破音。"
-                } else {
-                    "已超出原始无损空间：自动启用防破音保护，提高音量的同时压制峰值避免爆音。"
+                text = when {
+                    !hasGainChange -> {
+                        "拖动滑杆、点击 − / +（每次 0.5 dB）或点选预设即可边听边调；超出无损空间时自动防破音。"
+                    }
+                    isPureLosslessZone -> {
+                        "当前处于无损放大区间：仅等比例调大整体音量，不会产生任何失真或破音。"
+                    }
+                    else -> {
+                        "已超出原始无损空间：自动启用防破音保护，提高音量的同时压制峰值避免爆音。"
+                    }
                 },
                 fontSize = 11.sp,
                 lineHeight = 17.sp,
-                color = modeColor,
+                color = if (hasGainChange) activeAccentColor else TextSecondary,
                 minLines = 2,
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
@@ -2237,7 +2532,7 @@ private fun VolumeBoostPanel(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(12.dp),
             colors = ButtonDefaults.buttonColors(
-                containerColor = EmeraldLossless,
+                containerColor = if (hasGainChange) EmeraldLossless else VioletAccent,
                 contentColor = OnAccentLight
             ),
             contentPadding = PaddingValues(vertical = 13.dp)
@@ -2245,9 +2540,15 @@ private fun VolumeBoostPanel(
             Icon(Icons.AutoMirrored.Rounded.VolumeUp, contentDescription = null, modifier = Modifier.size(19.dp))
             Spacer(modifier = Modifier.width(8.dp))
             Text(
-                text = String.format(Locale.US, "开始放大音量 (+%.1f dB)", gainDb),
+                text = if (hasGainChange) {
+                    String.format(Locale.US, "生成放大音轨 (+%.1f dB)", gainDb)
+                } else {
+                    "请先调整上方放大增益"
+                },
                 fontWeight = FontWeight.SemiBold,
-                fontSize = 14.sp
+                fontSize = 14.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
         }
     }
@@ -2270,7 +2571,7 @@ private fun MetricMiniCard(
             modifier = Modifier.padding(vertical = 9.dp, horizontal = 8.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Text(label, fontSize = 10.sp, color = TextMuted)
+            Text(label, fontSize = 10.sp, color = TextMuted, maxLines = 1)
             Spacer(modifier = Modifier.height(2.dp))
             Text(
                 value,

@@ -479,16 +479,261 @@ class RealtimePitchAudioProcessor : BaseAudioProcessor() {
 }
 
 /**
- * Custom [AudioProcessorChain] routing audio through [RealtimePitchAudioProcessor] and delegating
- * media position duration scaling to [RealtimePitchAudioProcessor.getMediaDurationUs] without
- * invoking Android's lower-quality Sonic speech WSOLA processor.
+ * Low-latency real-time volume maximizer + 5ms lookahead 4x true-peak brickwall limiter
+ * [AudioProcessor] ("音量放大边听边调").
+ *
+ * - Matches the exact transfer curve of offline `boostVolumeTransparent` (`-0.2 dBTP` ceiling).
+ * - Stays engaged at constant 5ms delay whenever the Volume Boost tab is active so toggling the
+ *   live-preview switch or dragging the gain slider (`0..+18 dB`) fades smoothly over 8ms with
+ *   zero clicks, zero zipper noise, and zero phase jump.
+ * - Uses 100% zero-CPU `ByteBuffer` pass-through on other tabs or during A/B original comparison.
+ */
+@OptIn(UnstableApi::class)
+class RealtimeVolumeAudioProcessor : BaseAudioProcessor() {
+
+    private val handleLock = Any()
+    private var nativeHandle: Long = 0L
+    private var nativeSampleRate: Int = 0
+    private var nativeChannels: Int = 0
+
+    @Volatile
+    private var activeOnVolumeTab: Boolean = false
+
+    @Volatile
+    private var targetEffectiveGainDb: Float = 0f
+
+    private var dspEngaged: Boolean = false
+    private var hasPrevSample: Boolean = false
+    private var prevSampleCh0: Short = 0
+    private var prevSampleCh1: Short = 0
+    private var pendingDeclickFrames: Int = 0
+    private var declickDeltaCh0: Float = 0f
+    private var declickDeltaCh1: Float = 0f
+    private var declickNeedsInit: Boolean = false
+
+    private var pcmScratch = ShortArray(8192)
+
+    fun updatePreviewConfig(
+        isVolumeTabActive: Boolean,
+        previewEnabled: Boolean,
+        gainDb: Float
+    ) {
+        val effectiveGain = if (isVolumeTabActive && previewEnabled) {
+            gainDb.coerceIn(0f, 18f)
+        } else {
+            0f
+        }
+        activeOnVolumeTab = isVolumeTabActive
+        targetEffectiveGainDb = effectiveGain
+
+        synchronized(handleLock) {
+            if (nativeHandle != 0L) {
+                NativeAudioEngine.nativeSetRealtimeMaximizerGain(nativeHandle, effectiveGain)
+            }
+        }
+    }
+
+    override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
+        if (inputAudioFormat.encoding != C.ENCODING_PCM_16BIT) {
+            throw AudioProcessor.UnhandledAudioFormatException(inputAudioFormat)
+        }
+        if (inputAudioFormat.channelCount !in 1..2 || inputAudioFormat.sampleRate !in 8000..192000) {
+            throw AudioProcessor.UnhandledAudioFormatException(inputAudioFormat)
+        }
+        return inputAudioFormat
+    }
+
+    override fun queueInput(inputBuffer: ByteBuffer) {
+        val remainingBytes = inputBuffer.remaining()
+        if (remainingBytes <= 0) return
+
+        val sr = inputAudioFormat.sampleRate
+        val ch = inputAudioFormat.channelCount
+        if (sr <= 0 || ch !in 1..2) {
+            val out = replaceOutputBuffer(remainingBytes)
+            out.put(inputBuffer)
+            out.flip()
+            return
+        }
+
+        val bytesPerFrame = ch * 2
+        val frames = remainingBytes / bytesPerFrame
+        if (frames <= 0) {
+            inputBuffer.position(inputBuffer.limit())
+            return
+        }
+
+        val shouldUseDsp = activeOnVolumeTab
+        val gainDb = targetEffectiveGainDb
+
+        if (shouldUseDsp != dspEngaged) {
+            dspEngaged = shouldUseDsp
+            if (hasPrevSample) {
+                pendingDeclickFrames = DECLICK_FRAMES
+                declickDeltaCh0 = prevSampleCh0.toFloat()
+                declickDeltaCh1 = prevSampleCh1.toFloat()
+                declickNeedsInit = true
+            }
+            if (shouldUseDsp) {
+                val handle = ensureNativeMaximizerOnAudioThread(sr, ch)
+                NativeAudioEngine.nativeSetRealtimeMaximizerGain(handle, gainDb)
+                NativeAudioEngine.nativeResetRealtimeMaximizer(handle)
+            }
+        }
+
+        val totalSamples = frames * ch
+        if (!dspEngaged) {
+            if (pendingDeclickFrames > 0) {
+                ensureScratchCapacity(totalSamples)
+                inputBuffer.asShortBuffer().get(pcmScratch, 0, totalSamples)
+                inputBuffer.position(inputBuffer.position() + frames * bytesPerFrame)
+                applyBoundaryDeclick(pcmScratch, frames, ch)
+                updatePrevSample(pcmScratch, frames, ch)
+                val outBuf = replaceOutputBuffer(frames * bytesPerFrame)
+                outBuf.asShortBuffer().put(pcmScratch, 0, totalSamples)
+                outBuf.limit(frames * bytesPerFrame)
+            } else {
+                val startPos = inputBuffer.position()
+                val copyBytes = frames * bytesPerFrame
+                val lastFrameBytePos = startPos + (frames - 1) * bytesPerFrame
+                prevSampleCh0 = inputBuffer.getShort(lastFrameBytePos)
+                prevSampleCh1 = if (ch == 2) inputBuffer.getShort(lastFrameBytePos + 2) else prevSampleCh0
+                hasPrevSample = true
+
+                val oldLimit = inputBuffer.limit()
+                inputBuffer.limit(startPos + copyBytes)
+                val outBuf = replaceOutputBuffer(copyBytes)
+                outBuf.put(inputBuffer)
+                outBuf.flip()
+                inputBuffer.limit(oldLimit)
+            }
+            return
+        }
+
+        val handle = ensureNativeMaximizerOnAudioThread(sr, ch)
+        NativeAudioEngine.nativeSetRealtimeMaximizerGain(handle, gainDb)
+
+        ensureScratchCapacity(totalSamples)
+        inputBuffer.asShortBuffer().get(pcmScratch, 0, totalSamples)
+        inputBuffer.position(inputBuffer.position() + frames * bytesPerFrame)
+
+        NativeAudioEngine.nativeProcessRealtimeMaximizer(handle, pcmScratch, frames)
+
+        applyBoundaryDeclick(pcmScratch, frames, ch)
+        updatePrevSample(pcmScratch, frames, ch)
+
+        val outBytes = frames * bytesPerFrame
+        val outBuf = replaceOutputBuffer(outBytes)
+        outBuf.asShortBuffer().put(pcmScratch, 0, totalSamples)
+        outBuf.limit(outBytes)
+    }
+
+    override fun onFlush() {
+        hasPrevSample = false
+        pendingDeclickFrames = 0
+        declickNeedsInit = false
+        dspEngaged = activeOnVolumeTab
+        if (nativeHandle != 0L) {
+            NativeAudioEngine.nativeSetRealtimeMaximizerGain(nativeHandle, targetEffectiveGainDb)
+            NativeAudioEngine.nativeResetRealtimeMaximizer(nativeHandle)
+        }
+    }
+
+    override fun onReset() {
+        dspEngaged = false
+        hasPrevSample = false
+        pendingDeclickFrames = 0
+        declickNeedsInit = false
+        destroyNativeMaximizerOnAudioThread()
+    }
+
+    private fun ensureNativeMaximizerOnAudioThread(sampleRate: Int, channels: Int): Long {
+        if (nativeHandle != 0L && nativeSampleRate == sampleRate && nativeChannels == channels) {
+            return nativeHandle
+        }
+        destroyNativeMaximizerOnAudioThread()
+        val created = NativeAudioEngine.nativeCreateRealtimeMaximizer(sampleRate, channels)
+        NativeAudioEngine.nativeSetRealtimeMaximizerGain(created, targetEffectiveGainDb)
+        synchronized(handleLock) {
+            nativeHandle = created
+            nativeSampleRate = sampleRate
+            nativeChannels = channels
+        }
+        return created
+    }
+
+    private fun destroyNativeMaximizerOnAudioThread() {
+        synchronized(handleLock) {
+            if (nativeHandle != 0L) {
+                NativeAudioEngine.nativeDestroyRealtimeMaximizer(nativeHandle)
+                nativeHandle = 0L
+                nativeSampleRate = 0
+                nativeChannels = 0
+            }
+        }
+    }
+
+    private fun applyBoundaryDeclick(pcm: ShortArray, frames: Int, channels: Int) {
+        if (pendingDeclickFrames <= 0 || frames <= 0) return
+        if (declickNeedsInit) {
+            val firstCh0 = pcm[0].toFloat()
+            val firstCh1 = if (channels == 2) pcm[1].toFloat() else firstCh0
+            declickDeltaCh0 -= firstCh0
+            declickDeltaCh1 -= firstCh1
+            declickNeedsInit = false
+        }
+        val count = minOf(frames, pendingDeclickFrames)
+        val d0 = declickDeltaCh0
+        val d1 = declickDeltaCh1
+        for (i in 0 until count) {
+            val weight = pendingDeclickFrames.toFloat() / DECLICK_FRAMES.toFloat()
+            if (channels == 2) {
+                val idx = i * 2
+                pcm[idx] = (pcm[idx].toFloat() + d0 * weight).roundToInt().coerceIn(-32768, 32767).toShort()
+                pcm[idx + 1] = (pcm[idx + 1].toFloat() + d1 * weight).roundToInt().coerceIn(-32768, 32767).toShort()
+            } else {
+                pcm[i] = (pcm[i].toFloat() + d0 * weight).roundToInt().coerceIn(-32768, 32767).toShort()
+            }
+            pendingDeclickFrames--
+        }
+    }
+
+    private fun updatePrevSample(pcm: ShortArray, frames: Int, channels: Int) {
+        if (frames <= 0) return
+        if (channels == 2) {
+            val base = (frames - 1) * 2
+            prevSampleCh0 = pcm[base]
+            prevSampleCh1 = pcm[base + 1]
+        } else {
+            prevSampleCh0 = pcm[frames - 1]
+            prevSampleCh1 = prevSampleCh0
+        }
+        hasPrevSample = true
+    }
+
+    private fun ensureScratchCapacity(minSamples: Int) {
+        if (pcmScratch.size < minSamples) {
+            pcmScratch = ShortArray(max(minSamples, pcmScratch.size * 2))
+        }
+    }
+
+    companion object {
+        private const val DECLICK_FRAMES = 64
+    }
+}
+
+/**
+ * Custom [AudioProcessorChain] routing audio through [RealtimePitchAudioProcessor] and
+ * [RealtimeVolumeAudioProcessor], delegating media position duration scaling to
+ * [RealtimePitchAudioProcessor.getMediaDurationUs].
  */
 @OptIn(UnstableApi::class)
 private class RealtimePitchAudioProcessorChain(
-    private val pitchProcessor: RealtimePitchAudioProcessor
+    private val pitchProcessor: RealtimePitchAudioProcessor,
+    volumeProcessor: RealtimeVolumeAudioProcessor
 ) : AudioProcessorChain {
 
-    private val processors: Array<AudioProcessor> = arrayOf(pitchProcessor)
+    private val processors: Array<AudioProcessor> = arrayOf(pitchProcessor, volumeProcessor)
 
     override fun getAudioProcessors(): Array<AudioProcessor> = processors
 
@@ -507,13 +752,14 @@ private class RealtimePitchAudioProcessorChain(
 }
 
 /**
- * Builds an [ExoPlayer] configured with a low-latency (~80–110ms) [DefaultAudioSink] and
- * [RealtimePitchAudioProcessor] so live pitch/BPM slider movements respond nearly instantaneously.
+ * Builds an [ExoPlayer] configured with a low-latency (~60–110ms) [DefaultAudioSink] and
+ * real-time Pitch/BPM + Volume Maximizer processors.
  */
 @OptIn(UnstableApi::class)
 fun buildRealtimePreviewExoPlayer(
     context: Context,
-    pitchProcessor: RealtimePitchAudioProcessor
+    pitchProcessor: RealtimePitchAudioProcessor,
+    volumeProcessor: RealtimeVolumeAudioProcessor
 ): ExoPlayer {
     val renderersFactory = object : DefaultRenderersFactory(context) {
         override fun buildAudioSink(
@@ -528,7 +774,7 @@ fun buildRealtimePreviewExoPlayer(
                 .build()
 
             return DefaultAudioSink.Builder(context)
-                .setAudioProcessorChain(RealtimePitchAudioProcessorChain(pitchProcessor))
+                .setAudioProcessorChain(RealtimePitchAudioProcessorChain(pitchProcessor, volumeProcessor))
                 .setEnableFloatOutput(false)
                 .setEnableAudioTrackPlaybackParams(false)
                 .setAudioTrackBufferSizeProvider(lowLatencyBufferProvider)

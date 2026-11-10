@@ -137,6 +137,7 @@ class MainActivity : ComponentActivity() {
                     onLivePitchPreviewChange = viewModel::setLivePitchTempoPreview,
                     onRunPitchShift = viewModel::runPitchShift,
                     onVolumeGainChange = viewModel::setVolumeGainDb,
+                    onLiveVolumePreviewChange = viewModel::setLiveVolumeBoostPreview,
                     onRunVolumeBoost = viewModel::runVolumeBoost,
                     onExportFormatChange = viewModel::setExportFormat,
                     onRenameTrack = viewModel::renameTrack,

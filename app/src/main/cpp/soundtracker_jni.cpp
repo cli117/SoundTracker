@@ -494,4 +494,80 @@ Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeFinishRealtimeShifter(
     return static_cast<jint>(outFrames);
 }
 
+// ============================================================================
+// Real-Time Streaming Volume Maximizer ("音量放大边听边调") JNI Bridge
+// ============================================================================
+
+JNIEXPORT jlong JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeCreateRealtimeMaximizer(
+    JNIEnv*,
+    jobject,
+    jint sampleRate,
+    jint channels
+) {
+    auto* maximizer = new soundtracker::RealtimeVolumeMaximizer(
+        static_cast<int>(sampleRate),
+        static_cast<int>(channels),
+        -0.2f
+    );
+    return reinterpret_cast<jlong>(maximizer);
+}
+
+JNIEXPORT void JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeDestroyRealtimeMaximizer(
+    JNIEnv*,
+    jobject,
+    jlong handle
+) {
+    if (handle == 0) return;
+    auto* maximizer = reinterpret_cast<soundtracker::RealtimeVolumeMaximizer*>(handle);
+    delete maximizer;
+}
+
+JNIEXPORT void JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeResetRealtimeMaximizer(
+    JNIEnv*,
+    jobject,
+    jlong handle
+) {
+    if (handle == 0) return;
+    auto* maximizer = reinterpret_cast<soundtracker::RealtimeVolumeMaximizer*>(handle);
+    maximizer->reset();
+}
+
+JNIEXPORT void JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeSetRealtimeMaximizerGain(
+    JNIEnv*,
+    jobject,
+    jlong handle,
+    jfloat gainDb
+) {
+    if (handle == 0) return;
+    auto* maximizer = reinterpret_cast<soundtracker::RealtimeVolumeMaximizer*>(handle);
+    maximizer->setGainDb(static_cast<float>(gainDb));
+}
+
+JNIEXPORT void JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeProcessRealtimeMaximizer(
+    JNIEnv* env,
+    jobject,
+    jlong handle,
+    jshortArray jPcm,
+    jint frames
+) {
+    if (handle == 0 || !jPcm || frames <= 0) return;
+    auto* maximizer = reinterpret_cast<soundtracker::RealtimeVolumeMaximizer*>(handle);
+    const int ch = maximizer->channels();
+    const size_t totalSamples = static_cast<size_t>(frames) * static_cast<size_t>(ch);
+
+    static thread_local std::vector<int16_t> tlBuf;
+    if (tlBuf.size() < totalSamples) {
+        tlBuf.resize(totalSamples);
+    }
+
+    env->GetShortArrayRegion(jPcm, 0, static_cast<jsize>(totalSamples), tlBuf.data());
+    maximizer->processInterleavedInt16(tlBuf.data(), tlBuf.data(), static_cast<int>(frames));
+    env->SetShortArrayRegion(jPcm, 0, static_cast<jsize>(totalSamples), tlBuf.data());
+}
+
 } // extern "C"
