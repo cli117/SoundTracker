@@ -84,6 +84,16 @@ sealed interface VocalSeparationOutcome {
     data class Error(val message: String) : VocalSeparationOutcome
 }
 
+data class NativeMixClip(
+    val wavPath: String,
+    val timelineStartFrame: Long,
+    val durationFrames: Long,
+    val sourceStartSec: Double,
+    val linearGain: Float,
+    val fadeInFrames: Long,
+    val fadeOutFrames: Long
+)
+
 fun interface NativeProgressListener {
     fun onProgress(progress: Float)
 }
@@ -175,6 +185,43 @@ object NativeAudioEngine {
     external fun nativeResetRealtimeMaximizer(handle: Long)
     external fun nativeSetRealtimeMaximizerGain(handle: Long, gainDb: Float)
     external fun nativeProcessRealtimeMaximizer(handle: Long, pcm: ShortArray, frames: Int)
+
+    // Multi-Track Arranger / Mashup Engine (1..10 tracks)
+    external fun nativeCreateMultiTrackEngine(outputSampleRate: Int): Long
+    external fun nativeDestroyMultiTrackEngine(handle: Long)
+    external fun nativeClearMultiTrackCache(handle: Long)
+    external fun nativeResetMultiTrackEnvelope(handle: Long)
+    external fun nativeSetMultiTrackSchedule(
+        handle: Long,
+        wavPaths: Array<String>,
+        timelineStarts: LongArray,
+        durations: LongArray,
+        sourceStartSecs: DoubleArray,
+        linearGains: FloatArray,
+        fadeIns: LongArray,
+        fadeOuts: LongArray,
+        totalDurationFrames: Long
+    )
+    external fun nativeRenderMultiTrackPreviewBlock(
+        handle: Long,
+        timelineStartFrame: Long,
+        outStereoPcm: ShortArray,
+        numFrames: Int
+    )
+    private external fun nativeExtractFastWavPeaks(wavPath: String, numBins: Int): FloatArray?
+    private external fun nativeRenderMultiTrackMixdown(
+        wavPaths: Array<String>,
+        timelineStarts: LongArray,
+        durations: LongArray,
+        sourceStartSecs: DoubleArray,
+        linearGains: FloatArray,
+        fadeIns: LongArray,
+        fadeOuts: LongArray,
+        totalDurationFrames: Long,
+        outputSampleRate: Int,
+        outWavPath: String,
+        progressListener: NativeProgressListener?
+    ): String?
 
     /**
      * Reclaims any legacy extracted `.onnx` files from `noBackupFilesDir/engine_models/`.
@@ -302,5 +349,72 @@ object NativeAudioEngine {
                 null
             }
         )
+    }
+
+    suspend fun extractFastWavPeaks(wavFile: File, numBins: Int = 480): List<Float>? =
+        withContext(Dispatchers.IO) {
+            nativeExtractFastWavPeaks(wavFile.absolutePath, numBins)?.toList()
+        }
+
+    fun updateMultiTrackEngineSchedule(
+        handle: Long,
+        clips: List<NativeMixClip>,
+        totalDurationFrames: Long
+    ) {
+        if (handle == 0L) return
+        val n = clips.size
+        val paths = Array(n) { clips[it].wavPath }
+        val starts = LongArray(n) { clips[it].timelineStartFrame }
+        val durs = LongArray(n) { clips[it].durationFrames }
+        val srcSecs = DoubleArray(n) { clips[it].sourceStartSec }
+        val gains = FloatArray(n) { clips[it].linearGain }
+        val fadeIns = LongArray(n) { clips[it].fadeInFrames }
+        val fadeOuts = LongArray(n) { clips[it].fadeOutFrames }
+        nativeSetMultiTrackSchedule(
+            handle = handle,
+            wavPaths = paths,
+            timelineStarts = starts,
+            durations = durs,
+            sourceStartSecs = srcSecs,
+            linearGains = gains,
+            fadeIns = fadeIns,
+            fadeOuts = fadeOuts,
+            totalDurationFrames = totalDurationFrames
+        )
+    }
+
+    suspend fun renderMultiTrackMixdown(
+        clips: List<NativeMixClip>,
+        totalDurationFrames: Long,
+        outputSampleRate: Int = 44100,
+        outputWav: File,
+        onProgress: (Float) -> Unit
+    ): VocalSeparationOutcome = withContext(Dispatchers.Default) {
+        val n = clips.size
+        val paths = Array(n) { clips[it].wavPath }
+        val starts = LongArray(n) { clips[it].timelineStartFrame }
+        val durs = LongArray(n) { clips[it].durationFrames }
+        val srcSecs = DoubleArray(n) { clips[it].sourceStartSec }
+        val gains = FloatArray(n) { clips[it].linearGain }
+        val fadeIns = LongArray(n) { clips[it].fadeInFrames }
+        val fadeOuts = LongArray(n) { clips[it].fadeOutFrames }
+        val err = nativeRenderMultiTrackMixdown(
+            wavPaths = paths,
+            timelineStarts = starts,
+            durations = durs,
+            sourceStartSecs = srcSecs,
+            linearGains = gains,
+            fadeIns = fadeIns,
+            fadeOuts = fadeOuts,
+            totalDurationFrames = totalDurationFrames,
+            outputSampleRate = outputSampleRate,
+            outWavPath = outputWav.absolutePath,
+            progressListener = { p -> onProgress(p.coerceIn(0f, 1f)) }
+        )
+        when {
+            err == null -> VocalSeparationOutcome.Success
+            err == "Cancelled" -> VocalSeparationOutcome.Cancelled
+            else -> VocalSeparationOutcome.Error(err)
+        }
     }
 }

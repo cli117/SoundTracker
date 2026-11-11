@@ -8,6 +8,15 @@ import androidx.lifecycle.viewModelScope
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
+import com.soundtracker.app.arranger.ARRANGER_SAMPLE_RATE
+import com.soundtracker.app.arranger.AppWorkspaceMode
+import com.soundtracker.app.arranger.ArrangerClip
+import com.soundtracker.app.arranger.ArrangerSnapshot
+import com.soundtracker.app.arranger.ArrangerTrack
+import com.soundtracker.app.arranger.ArrangerUiState
+import com.soundtracker.app.arranger.MAX_ARRANGER_TRACKS
+import com.soundtracker.app.arranger.MIN_CLIP_DURATION_MS
+import com.soundtracker.app.arranger.MultiTrackRealtimePlayer
 import com.soundtracker.app.audio.AudioCodecHelper
 import com.soundtracker.app.audio.NetEaseCloudMusicManager
 import com.soundtracker.app.audio.NetEaseLocalTrack
@@ -65,6 +74,11 @@ data class ProcessingTaskState(
 )
 
 data class StudioUiState(
+    val workspaceMode: AppWorkspaceMode = AppWorkspaceMode.SINGLE_TRACK,
+    val arranger: ArrangerUiState = run {
+        val defaultTrack = ArrangerTrack(name = "音轨 1", colorIndex = 0)
+        ArrangerUiState(tracks = listOf(defaultTrack), selectedTrackId = defaultTrack.id)
+    },
     val tracks: List<SessionTrack> = emptyList(),
     val selectedTrackId: String? = null,
     val activeTab: StudioToolTab = StudioToolTab.VOCAL_REMOVE,
@@ -162,6 +176,23 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         realtimePitchProcessor,
         realtimeVolumeProcessor
     )
+    private val arrangerPlayer = MultiTrackRealtimePlayer(
+        sampleRate = ARRANGER_SAMPLE_RATE,
+        onPositionUpdate = { posMs, playing ->
+            _uiState.update { st ->
+                st.copy(
+                    arranger = st.arranger.copy(
+                        playheadMs = posMs,
+                        isPlaying = playing
+                    )
+                )
+            }
+        }
+    )
+    private val arrangerUndoStack = ArrayDeque<ArrangerSnapshot>()
+    private val arrangerRedoStack = ArrayDeque<ArrangerSnapshot>()
+    private val highResPeaksCache = HashMap<String, List<Float>>()
+    private var mashupExportCounter = 1
     private var loadedPlayerFilePath: String? = null
     private var activeProcessingJob: Job? = null
 
@@ -269,6 +300,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         if (exoPlayer.isPlaying) {
             exoPlayer.pause()
         } else {
+            arrangerPlayer.pause()
             if (loadedPlayerFilePath != target.audioFile.absolutePath) {
                 preparePlayerForTrack(target, seekMs = state.playbackPositionMs, playImmediately = true)
             } else {
@@ -284,6 +316,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         if (exoPlayer.isPlaying) {
             exoPlayer.pause()
         }
+        arrangerPlayer.pause()
     }
 
     fun seekToFraction(fraction: Float) {
@@ -572,6 +605,13 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                         ).let { it.copy(originTrackId = it.id) }
 
                         appendTrackToWorkspace(newTrack)
+                        if (_uiState.value.workspaceMode == AppWorkspaceMode.MULTI_TRACK_ARRANGER) {
+                            appendImportedTrackToArrangerDirect(
+                                newTrack = newTrack,
+                                decodedTempWav = tempAnalysisWav,
+                                recordUndo = importedCount == 0
+                            )
+                        }
                         importedCount++
                         lastImportedName = newTrack.displayName
                         lastFormat = fmtUpper
@@ -590,10 +630,19 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     }
                 }
 
+                val inArranger = _uiState.value.workspaceMode == AppWorkspaceMode.MULTI_TRACK_ARRANGER
                 if (importedCount == 1) {
-                    sendMessage("已从网易云导入「$lastImportedName.$lastFormat」· 速度 $lastBpm BPM")
+                    if (inArranger) {
+                        sendMessage("已导入「$lastImportedName」并放入「${_uiState.value.arranger.selectedTrack.name}」")
+                    } else {
+                        sendMessage("已从网易云导入「$lastImportedName.$lastFormat」· 速度 $lastBpm BPM")
+                    }
                 } else if (importedCount > 1) {
-                    sendMessage("已从网易云成功导入 $importedCount 首音乐（自动转换为最佳 FLAC/MP3 格式）")
+                    if (inArranger) {
+                        sendMessage("已从网易云导入 $importedCount 首音乐并依次放入「${_uiState.value.arranger.selectedTrack.name}」")
+                    } else {
+                        sendMessage("已从网易云成功导入 $importedCount 首音乐（自动转换为最佳 FLAC/MP3 格式）")
+                    }
                 }
             } catch (_: CancellationException) {
                 sendMessage("已取消网易云导入")
@@ -744,7 +793,16 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 ).let { it.copy(originTrackId = it.id) }
 
                 appendTrackToWorkspace(newTrack)
-                sendMessage("已导入「${newTrack.displayName}.${workspaceFile.extension.lowercase()}」· 自动识别速度 ${detectedBpm} BPM")
+                if (_uiState.value.workspaceMode == AppWorkspaceMode.MULTI_TRACK_ARRANGER) {
+                    appendImportedTrackToArrangerDirect(
+                        newTrack = newTrack,
+                        decodedTempWav = tempAnalysisWav,
+                        recordUndo = true
+                    )
+                    sendMessage("已导入「${newTrack.displayName}」并放入「${_uiState.value.arranger.selectedTrack.name}」")
+                } else {
+                    sendMessage("已导入「${newTrack.displayName}.${workspaceFile.extension.lowercase()}」· 自动识别速度 ${detectedBpm} BPM")
+                }
             } catch (_: CancellationException) {
                 workspaceFile?.delete()
                 sendMessage("已取消导入")
@@ -1114,7 +1172,16 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             state.copy(
                 tracks = state.tracks.map { t ->
                     if (t.id == trackId) t.copy(displayName = sanitized) else t
-                }
+                },
+                arranger = state.arranger.copy(
+                    tracks = state.arranger.tracks.map { arrTrack ->
+                        arrTrack.copy(
+                            clips = arrTrack.clips.map { clip ->
+                                if (clip.sourceTrackId == trackId) clip.copy(sourceTitle = sanitized) else clip
+                            }
+                        )
+                    }
+                )
             )
         }
         refreshStorageInfo()
@@ -1335,8 +1402,20 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
         val freedBytes = SessionWorkspaceManager.deleteStoredResources(appContext, filePaths)
         val remaining = state.tracks.filterNot { it.audioFile.absolutePath in filePaths || !it.audioFile.exists() }
+        val remainingIds = remaining.map { it.id }.toSet()
         val nextSelectedTrack = remaining.firstOrNull { it.id == state.selectedTrackId } ?: remaining.firstOrNull()
         val nextBpm = nextSelectedTrack?.metrics?.detectedBpm?.roundToInt()?.coerceIn(45, 220) ?: 120
+
+        val cleanedArrangerTracks = state.arranger.tracks.map { aTrack ->
+            aTrack.copy(
+                clips = aTrack.clips.filter { clip ->
+                    clip.sourceTrackId in remainingIds && clip.wavFile.exists() && clip.wavFile.absolutePath !in filePaths
+                }
+            )
+        }
+        val cleanedSelectedClipId = state.arranger.selectedClipId?.takeIf { cid ->
+            cleanedArrangerTracks.any { t -> t.clips.any { it.id == cid } }
+        }
 
         val switchedTrack = nextSelectedTrack?.id != state.selectedTrackId
         _uiState.update {
@@ -1351,9 +1430,15 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 pitchCents = if (switchedTrack) 0 else it.pitchCents,
                 sourceBpm = if (switchedTrack) nextBpm else it.sourceBpm,
                 targetBpm = if (switchedTrack) nextBpm else it.targetBpm,
-                volumeGainDb = if (switchedTrack) 0f else it.volumeGainDb
+                volumeGainDb = if (switchedTrack) 0f else it.volumeGainDb,
+                arranger = it.arranger.copy(
+                    tracks = cleanedArrangerTracks,
+                    selectedClipId = cleanedSelectedClipId
+                )
             )
         }
+        arrangerPlayer.clearReaderCache()
+        syncArrangerPlayerSchedule()
         syncRealtimePreviewProcessor()
         refreshStorageInfo()
         val freedMb = String.format(Locale.US, "%.1f MB", freedBytes / (1024.0 * 1024.0))
@@ -1365,8 +1450,14 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
      */
     fun clearAllWorkspaceTracks() {
         exoPlayer.stop()
+        arrangerPlayer.pause()
+        arrangerPlayer.clearReaderCache()
+        arrangerUndoStack.clear()
+        arrangerRedoStack.clear()
+        highResPeaksCache.clear()
         loadedPlayerFilePath = null
         SessionWorkspaceManager.wipeSessionWorkspace(appContext)
+        val freshTrack = ArrangerTrack(name = "音轨 1", colorIndex = 0)
         _uiState.update {
             it.copy(
                 tracks = emptyList(),
@@ -1377,9 +1468,14 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 playbackDurationMs = 0L,
                 pitchSemitones = 0,
                 pitchCents = 0,
-                volumeGainDb = 0f
+                volumeGainDb = 0f,
+                arranger = ArrangerUiState(
+                    tracks = listOf(freshTrack),
+                    selectedTrackId = freshTrack.id
+                )
             )
         }
+        syncArrangerPlayerSchedule()
         syncRealtimePreviewProcessor()
         refreshStorageInfo()
         sendMessage("已一键清空全部应用内音频资源")
@@ -1465,8 +1561,916 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         _events.trySend(StudioUiEvent.ShowMessage(msg))
     }
 
+    // ========================================================================
+    // Feature 5: Multi-Track DAW Arranger & Splicing Studio (1..10 Tracks)
+    // ========================================================================
+
+    fun setWorkspaceMode(mode: AppWorkspaceMode) {
+        if (_uiState.value.workspaceMode == mode) return
+        if (mode == AppWorkspaceMode.MULTI_TRACK_ARRANGER) {
+            if (exoPlayer.isPlaying) exoPlayer.pause()
+            syncArrangerPlayerSchedule()
+        } else {
+            arrangerPlayer.pause()
+        }
+        _uiState.update { it.copy(workspaceMode = mode) }
+    }
+
+    private fun pushArrangerUndoSnapshot() {
+        val arr = _uiState.value.arranger
+        arrangerUndoStack.addLast(
+            ArrangerSnapshot(
+                tracks = arr.tracks,
+                selectedTrackId = arr.effectiveSelectedTrackId,
+                selectedClipId = arr.selectedClipId
+            )
+        )
+        while (arrangerUndoStack.size > 30) {
+            arrangerUndoStack.removeFirst()
+        }
+        arrangerRedoStack.clear()
+        updateArrangerUndoFlags()
+    }
+
+    private fun updateArrangerUndoFlags() {
+        _uiState.update { st ->
+            st.copy(
+                arranger = st.arranger.copy(
+                    canUndo = arrangerUndoStack.isNotEmpty(),
+                    canRedo = arrangerRedoStack.isNotEmpty()
+                )
+            )
+        }
+    }
+
+    fun beginArrangerGestureUndoSnapshot() {
+        pushArrangerUndoSnapshot()
+    }
+
+    fun undoArranger() {
+        val snap = arrangerUndoStack.removeLastOrNull() ?: return
+        val cur = _uiState.value.arranger
+        arrangerRedoStack.addLast(
+            ArrangerSnapshot(
+                tracks = cur.tracks,
+                selectedTrackId = cur.effectiveSelectedTrackId,
+                selectedClipId = cur.selectedClipId
+            )
+        )
+        _uiState.update { st ->
+            st.copy(
+                arranger = st.arranger.copy(
+                    tracks = snap.tracks,
+                    selectedTrackId = snap.selectedTrackId,
+                    selectedClipId = snap.selectedClipId,
+                    canUndo = arrangerUndoStack.isNotEmpty(),
+                    canRedo = arrangerRedoStack.isNotEmpty()
+                )
+            )
+        }
+        syncArrangerPlayerSchedule()
+    }
+
+    fun redoArranger() {
+        val snap = arrangerRedoStack.removeLastOrNull() ?: return
+        val cur = _uiState.value.arranger
+        arrangerUndoStack.addLast(
+            ArrangerSnapshot(
+                tracks = cur.tracks,
+                selectedTrackId = cur.effectiveSelectedTrackId,
+                selectedClipId = cur.selectedClipId
+            )
+        )
+        _uiState.update { st ->
+            st.copy(
+                arranger = st.arranger.copy(
+                    tracks = snap.tracks,
+                    selectedTrackId = snap.selectedTrackId,
+                    selectedClipId = snap.selectedClipId,
+                    canUndo = arrangerUndoStack.isNotEmpty(),
+                    canRedo = arrangerRedoStack.isNotEmpty()
+                )
+            )
+        }
+        syncArrangerPlayerSchedule()
+    }
+
+    private fun syncArrangerPlayerSchedule(state: StudioUiState = _uiState.value) {
+        val (nativeClips, totalFrames) = state.arranger.buildNativeSchedule(ARRANGER_SAMPLE_RATE)
+        arrangerPlayer.updateSchedule(nativeClips, totalFrames)
+    }
+
+    fun toggleArrangerPlayPause() {
+        val arr = _uiState.value.arranger
+        if (arrangerPlayer.isPlaying) {
+            arrangerPlayer.pause()
+        } else {
+            if (arr.totalDurationMs <= 0L) {
+                sendMessage("请先点击「+ 添加片段」把音乐放到音轨上")
+                return
+            }
+            if (exoPlayer.isPlaying) exoPlayer.pause()
+            syncArrangerPlayerSchedule()
+            arrangerPlayer.play(arr.playheadMs)
+        }
+    }
+
+    fun seekArrangerToMs(targetMs: Long) {
+        val arr = _uiState.value.arranger
+        val maxAllowed = (arr.totalDurationMs + 30_000L).coerceAtLeast(60_000L)
+        val clamped = targetMs.coerceIn(0L, maxAllowed)
+        arrangerPlayer.seekToMs(clamped)
+        _uiState.update { st ->
+            st.copy(arranger = st.arranger.copy(playheadMs = clamped))
+        }
+    }
+
+    fun setArrangerZoom(dpPerSec: Float) {
+        val clamped = dpPerSec.coerceIn(6f, 120f)
+        _uiState.update { st ->
+            st.copy(arranger = st.arranger.copy(zoomDpPerSec = clamped))
+        }
+    }
+
+    fun addArrangerTrack() {
+        val curTracks = _uiState.value.arranger.tracks
+        if (curTracks.size >= MAX_ARRANGER_TRACKS) {
+            sendMessage("最多支持添加 $MAX_ARRANGER_TRACKS 条音轨")
+            return
+        }
+        pushArrangerUndoSnapshot()
+        val usedNumbers = curTracks.mapNotNull { t ->
+            t.name.removePrefix("音轨 ").trim().toIntOrNull()
+        }.toSet()
+        var nextNum = curTracks.size + 1
+        while (nextNum in usedNumbers) nextNum++
+        val newTrack = ArrangerTrack(
+            name = "音轨 $nextNum",
+            colorIndex = (nextNum - 1) % 6
+        )
+        _uiState.update { st ->
+            st.copy(
+                arranger = st.arranger.copy(
+                    tracks = st.arranger.tracks + newTrack,
+                    selectedTrackId = newTrack.id,
+                    selectedClipId = null
+                )
+            )
+        }
+    }
+
+    fun selectArrangerTrack(trackId: String) {
+        _uiState.update { st ->
+            val keepClip = st.arranger.selectedClipWithTrack?.let { (t, c) ->
+                if (t.id == trackId) c.id else null
+            }
+            st.copy(
+                arranger = st.arranger.copy(
+                    selectedTrackId = trackId,
+                    selectedClipId = keepClip
+                )
+            )
+        }
+    }
+
+    fun selectArrangerClip(clipId: String?) {
+        _uiState.update { st ->
+            if (clipId == null) {
+                st.copy(arranger = st.arranger.copy(selectedClipId = null))
+            } else {
+                val ownerTrack = st.arranger.tracks.firstOrNull { t -> t.clips.any { it.id == clipId } }
+                st.copy(
+                    arranger = st.arranger.copy(
+                        selectedClipId = clipId,
+                        selectedTrackId = ownerTrack?.id ?: st.arranger.effectiveSelectedTrackId
+                    )
+                )
+            }
+        }
+    }
+
+    fun toggleArrangerTrackMute(trackId: String) {
+        pushArrangerUndoSnapshot()
+        _uiState.update { st ->
+            st.copy(
+                arranger = st.arranger.copy(
+                    tracks = st.arranger.tracks.map { t ->
+                        if (t.id == trackId) t.copy(muted = !t.muted) else t
+                    }
+                )
+            )
+        }
+        syncArrangerPlayerSchedule()
+    }
+
+    fun toggleArrangerTrackSolo(trackId: String) {
+        pushArrangerUndoSnapshot()
+        _uiState.update { st ->
+            st.copy(
+                arranger = st.arranger.copy(
+                    tracks = st.arranger.tracks.map { t ->
+                        if (t.id == trackId) t.copy(solo = !t.solo) else t
+                    }
+                )
+            )
+        }
+        syncArrangerPlayerSchedule()
+    }
+
+    fun setArrangerTrackVolumeDb(trackId: String, gainDb: Float) {
+        val rounded = ((gainDb.coerceIn(-18f, 12f) * 2f).roundToInt()) / 2f
+        _uiState.update { st ->
+            st.copy(
+                arranger = st.arranger.copy(
+                    tracks = st.arranger.tracks.map { t ->
+                        if (t.id == trackId) t.copy(volumeDb = rounded) else t
+                    }
+                )
+            )
+        }
+        syncArrangerPlayerSchedule()
+    }
+
+    fun removeArrangerTrack(trackId: String) {
+        val cur = _uiState.value.arranger
+        pushArrangerUndoSnapshot()
+        if (cur.tracks.size <= 1) {
+            val single = cur.tracks.first().copy(clips = emptyList(), muted = false, solo = false, volumeDb = 0f)
+            _uiState.update { st ->
+                st.copy(
+                    arranger = st.arranger.copy(
+                        tracks = listOf(single),
+                        selectedTrackId = single.id,
+                        selectedClipId = null
+                    )
+                )
+            }
+            syncArrangerPlayerSchedule()
+            sendMessage("已清空音轨片段")
+            return
+        }
+
+        val idx = cur.tracks.indexOfFirst { it.id == trackId }
+        val remaining = cur.tracks.filterNot { it.id == trackId }
+        val nextSelected = remaining.getOrElse((idx - 1).coerceAtLeast(0)) { remaining.first() }
+        val keepClip = cur.selectedClipId?.takeIf { cid ->
+            remaining.any { t -> t.clips.any { it.id == cid } }
+        }
+        _uiState.update { st ->
+            st.copy(
+                arranger = st.arranger.copy(
+                    tracks = remaining,
+                    selectedTrackId = nextSelected.id,
+                    selectedClipId = keepClip
+                )
+            )
+        }
+        syncArrangerPlayerSchedule()
+    }
+
+    fun clearArrangerProject() {
+        arrangerPlayer.pause()
+        pushArrangerUndoSnapshot()
+        val fresh = ArrangerTrack(name = "音轨 1", colorIndex = 0)
+        _uiState.update { st ->
+            st.copy(
+                arranger = st.arranger.copy(
+                    tracks = listOf(fresh),
+                    selectedTrackId = fresh.id,
+                    selectedClipId = null,
+                    playheadMs = 0L,
+                    isPlaying = false
+                )
+            )
+        }
+        syncArrangerPlayerSchedule()
+    }
+
+    private suspend fun appendImportedTrackToArrangerDirect(
+        newTrack: SessionTrack,
+        decodedTempWav: File,
+        recordUndo: Boolean
+    ) {
+        val backingWav: File = if (newTrack.audioFile.extension.equals("wav", ignoreCase = true)) {
+            newTrack.audioFile
+        } else {
+            val cachedWav = File(
+                SessionWorkspaceManager.tempDir(appContext),
+                "arranger_pcm_${newTrack.id}.wav"
+            )
+            if (decodedTempWav.exists()) {
+                if (!decodedTempWav.renameTo(cachedWav)) {
+                    runCatching { decodedTempWav.copyTo(cachedWav, overwrite = true) }
+                    decodedTempWav.delete()
+                }
+            }
+            if (cachedWav.exists() && cachedWav.length() > 44L) cachedWav else return
+        }
+
+        val highResPeaks = NativeAudioEngine.extractFastWavPeaks(backingWav, 480)?.also {
+            highResPeaksCache[newTrack.id] = it
+        } ?: newTrack.metrics.waveformPeaks
+
+        val fullDurMs = ((newTrack.metrics.durationSec * 1000f).roundToInt().toLong())
+            .coerceAtLeast(MIN_CLIP_DURATION_MS)
+        if (recordUndo) {
+            pushArrangerUndoSnapshot()
+        }
+
+        val arr = _uiState.value.arranger
+        val targetTrack = arr.selectedTrack
+        val startMs = targetTrack.clips.maxOfOrNull { it.timelineEndMs } ?: 0L
+        val distinctColor = (arr.totalClipCount + arr.tracks.indexOfFirst { it.id == targetTrack.id }.coerceAtLeast(0)) % 6
+
+        val newClip = ArrangerClip(
+            sourceTrackId = newTrack.id,
+            sourceTitle = newTrack.displayName,
+            wavFile = backingWav,
+            sourceDurationMs = fullDurMs,
+            timelineStartMs = startMs,
+            sourceInMs = 0L,
+            sourceOutMs = fullDurMs,
+            colorIndex = distinctColor,
+            fullWaveformPeaks = highResPeaks
+        )
+
+        _uiState.update { st ->
+            val updatedTracks = st.arranger.tracks.map { t ->
+                if (t.id == targetTrack.id) {
+                    t.copy(clips = (t.clips + newClip).sortedBy { it.timelineStartMs })
+                } else {
+                    t
+                }
+            }
+            st.copy(
+                arranger = st.arranger.copy(
+                    tracks = updatedTracks,
+                    selectedTrackId = targetTrack.id,
+                    selectedClipId = newClip.id
+                )
+            )
+        }
+        syncArrangerPlayerSchedule()
+    }
+
+    private suspend fun ensureArrangerBackingWav(track: SessionTrack): File? {
+        if (!track.audioFile.exists()) return null
+        if (track.audioFile.extension.equals("wav", ignoreCase = true)) {
+            return track.audioFile
+        }
+        val cachedWav = File(
+            SessionWorkspaceManager.tempDir(appContext),
+            "arranger_pcm_${track.id}.wav"
+        )
+        if (cachedWav.exists() && cachedWav.length() > 44L) {
+            return cachedWav
+        }
+        val ok = AudioCodecHelper.decodeUriToWav(
+            context = appContext,
+            uri = Uri.fromFile(track.audioFile),
+            tempDir = SessionWorkspaceManager.tempDir(appContext),
+            targetWav = cachedWav,
+            onProgress = { p ->
+                _uiState.update { st ->
+                    st.copy(
+                        processingTask = st.processingTask?.copy(
+                            progress = (0.1f + p * 0.85f).coerceIn(0.1f, 0.95f)
+                        )
+                    )
+                }
+            }
+        )
+        return if (ok && cachedWav.exists()) cachedWav else null
+    }
+
+    /**
+     * Adds a full song or a pre-selected slice [customInMs..customOutMs] onto an Arranger track.
+     * - [placeAtPlayhead]: if true, places at current playheadMs; if false, appends right after the end of the target track.
+     */
+    fun addTrackToArranger(
+        sessionTrackId: String,
+        customInMs: Long? = null,
+        customOutMs: Long? = null,
+        placeAtPlayhead: Boolean = false,
+        switchToArranger: Boolean = true
+    ) {
+        val sourceTrack = _uiState.value.tracks.firstOrNull { it.id == sessionTrackId } ?: return
+        if (_uiState.value.processingTask != null) return
+
+        viewModelScope.launch {
+            val needsDecode = !sourceTrack.audioFile.extension.equals("wav", ignoreCase = true) &&
+                !File(SessionWorkspaceManager.tempDir(appContext), "arranger_pcm_${sourceTrack.id}.wav").exists()
+
+            try {
+                if (needsDecode) {
+                    _uiState.update {
+                        it.copy(
+                            processingTask = ProcessingTaskState(
+                                title = "正在准备剪辑音频",
+                                subtitle = "正在解码「${sourceTrack.displayName}」以便毫秒级顺滑剪切...",
+                                progress = 0.1f,
+                                cancellable = false
+                            )
+                        )
+                    }
+                }
+
+                val wavFile = ensureArrangerBackingWav(sourceTrack) ?: run {
+                    sendMessage("无法加载该音频到多轨剪辑台")
+                    return@launch
+                }
+
+                val highResPeaks = highResPeaksCache[sourceTrack.id]
+                    ?: NativeAudioEngine.extractFastWavPeaks(wavFile, 480)?.also {
+                        highResPeaksCache[sourceTrack.id] = it
+                    }
+                    ?: sourceTrack.metrics.waveformPeaks
+
+                val fullDurMs = ((sourceTrack.metrics.durationSec * 1000f).roundToInt().toLong())
+                    .coerceAtLeast(MIN_CLIP_DURATION_MS)
+                val inMs = (customInMs ?: 0L).coerceIn(0L, (fullDurMs - MIN_CLIP_DURATION_MS).coerceAtLeast(0L))
+                val outMs = (customOutMs ?: fullDurMs).coerceIn(inMs + MIN_CLIP_DURATION_MS, fullDurMs)
+
+                pushArrangerUndoSnapshot()
+                val arr = _uiState.value.arranger
+                val targetTrack = arr.selectedTrack
+                val startMs = if (placeAtPlayhead) {
+                    arr.playheadMs.coerceAtLeast(0L)
+                } else {
+                    targetTrack.clips.maxOfOrNull { it.timelineEndMs } ?: 0L
+                }
+
+                val distinctColor = (_uiState.value.tracks.indexOfFirst { it.id == sourceTrack.id }.coerceAtLeast(0) +
+                    arr.tracks.indexOfFirst { it.id == targetTrack.id }.coerceAtLeast(0)) % 6
+
+                val newClip = ArrangerClip(
+                    sourceTrackId = sourceTrack.id,
+                    sourceTitle = sourceTrack.displayName,
+                    wavFile = wavFile,
+                    sourceDurationMs = fullDurMs,
+                    timelineStartMs = startMs,
+                    sourceInMs = inMs,
+                    sourceOutMs = outMs,
+                    colorIndex = distinctColor,
+                    fullWaveformPeaks = highResPeaks
+                )
+
+                if (switchToArranger && exoPlayer.isPlaying) {
+                    exoPlayer.pause()
+                }
+
+                _uiState.update { st ->
+                    val updatedTracks = st.arranger.tracks.map { t ->
+                        if (t.id == targetTrack.id) {
+                            t.copy(clips = (t.clips + newClip).sortedBy { it.timelineStartMs })
+                        } else {
+                            t
+                        }
+                    }
+                    st.copy(
+                        workspaceMode = if (switchToArranger) AppWorkspaceMode.MULTI_TRACK_ARRANGER else st.workspaceMode,
+                        arranger = st.arranger.copy(
+                            tracks = updatedTracks,
+                            selectedTrackId = targetTrack.id,
+                            selectedClipId = newClip.id
+                        )
+                    )
+                }
+                syncArrangerPlayerSchedule()
+                if (needsDecode) refreshStorageInfo()
+                sendMessage("已添加到「${targetTrack.name}」")
+            } finally {
+                if (needsDecode) {
+                    _uiState.update { it.copy(processingTask = null) }
+                }
+            }
+        }
+    }
+
+    fun splitArrangerClipAtPlayhead() {
+        val arr = _uiState.value.arranger
+        val ph = arr.playheadMs
+
+        // Candidate priority: 1) Selected clip, 2) Clip on selected track, 3) Unique clip across any track
+        val targetPair: Pair<ArrangerTrack, ArrangerClip>? = run {
+            arr.selectedClipWithTrack?.let { (t, c) ->
+                if (ph >= c.timelineStartMs + MIN_CLIP_DURATION_MS && ph <= c.timelineEndMs - MIN_CLIP_DURATION_MS) {
+                    return@run t to c
+                }
+            }
+            val onSelectedTrack = arr.selectedTrack.clips.firstOrNull { c ->
+                ph >= c.timelineStartMs + MIN_CLIP_DURATION_MS && ph <= c.timelineEndMs - MIN_CLIP_DURATION_MS
+            }
+            if (onSelectedTrack != null) return@run arr.selectedTrack to onSelectedTrack
+
+            val acrossAll = arr.tracks.flatMap { t ->
+                t.clips.filter { c ->
+                    ph >= c.timelineStartMs + MIN_CLIP_DURATION_MS && ph <= c.timelineEndMs - MIN_CLIP_DURATION_MS
+                }.map { t to it }
+            }
+            acrossAll.firstOrNull()
+        }
+
+        if (targetPair == null) {
+            sendMessage("请先滑动波形，把中间指针停在要切开的音频片段内部")
+            return
+        }
+
+        val (track, clip) = targetPair
+        val cutOffsetMs = ph - clip.timelineStartMs
+        val splitSourceMs = clip.sourceInMs + cutOffsetMs
+
+        val leftClip = clip.copy(
+            id = UUID.randomUUID().toString(),
+            sourceOutMs = splitSourceMs,
+            fadeOutMs = 0L
+        )
+        val rightClip = clip.copy(
+            id = UUID.randomUUID().toString(),
+            timelineStartMs = ph,
+            sourceInMs = splitSourceMs,
+            fadeInMs = 0L
+        )
+
+        pushArrangerUndoSnapshot()
+        _uiState.update { st ->
+            val updatedTracks = st.arranger.tracks.map { t ->
+                if (t.id == track.id) {
+                    val replaced = t.clips.flatMap { c ->
+                        if (c.id == clip.id) listOf(leftClip, rightClip) else listOf(c)
+                    }.sortedBy { it.timelineStartMs }
+                    t.copy(clips = replaced)
+                } else {
+                    t
+                }
+            }
+            st.copy(
+                arranger = st.arranger.copy(
+                    tracks = updatedTracks,
+                    selectedTrackId = track.id,
+                    selectedClipId = rightClip.id
+                )
+            )
+        }
+        syncArrangerPlayerSchedule()
+    }
+
+    fun deleteSelectedArrangerClip() {
+        val cid = _uiState.value.arranger.selectedClipId ?: return
+        pushArrangerUndoSnapshot()
+        _uiState.update { st ->
+            val updatedTracks = st.arranger.tracks.map { t ->
+                t.copy(clips = t.clips.filterNot { it.id == cid })
+            }
+            st.copy(
+                arranger = st.arranger.copy(
+                    tracks = updatedTracks,
+                    selectedClipId = null
+                )
+            )
+        }
+        syncArrangerPlayerSchedule()
+    }
+
+    fun duplicateSelectedArrangerClip() {
+        val (track, clip) = _uiState.value.arranger.selectedClipWithTrack ?: return
+        pushArrangerUndoSnapshot()
+        val copyClip = clip.copy(
+            id = UUID.randomUUID().toString(),
+            timelineStartMs = clip.timelineEndMs
+        )
+        _uiState.update { st ->
+            val updatedTracks = st.arranger.tracks.map { t ->
+                if (t.id == track.id) {
+                    t.copy(clips = (t.clips + copyClip).sortedBy { it.timelineStartMs })
+                } else {
+                    t
+                }
+            }
+            st.copy(
+                arranger = st.arranger.copy(
+                    tracks = updatedTracks,
+                    selectedClipId = copyClip.id
+                )
+            )
+        }
+        syncArrangerPlayerSchedule()
+    }
+
+    fun moveArrangerClipRealtime(
+        clipId: String,
+        newTimelineStartMs: Long,
+        targetTrackIndex: Int
+    ) {
+        val clampedStart = newTimelineStartMs.coerceAtLeast(0L)
+        _uiState.update { st ->
+            val tracks = st.arranger.tracks
+            if (tracks.isEmpty()) return@update st
+            val dstIdx = targetTrackIndex.coerceIn(0, tracks.lastIndex)
+
+            var movingClip: ArrangerClip? = null
+            for (t in tracks) {
+                val found = t.clips.firstOrNull { it.id == clipId }
+                if (found != null) {
+                    movingClip = found
+                    break
+                }
+            }
+            val updatedClip = movingClip?.copy(timelineStartMs = clampedStart) ?: return@update st
+
+            val newTracks = tracks.mapIndexed { idx, t ->
+                val without = t.clips.filterNot { it.id == clipId }
+                if (idx == dstIdx) {
+                    t.copy(clips = (without + updatedClip).sortedBy { it.timelineStartMs })
+                } else {
+                    t.copy(clips = without)
+                }
+            }
+
+            st.copy(
+                arranger = st.arranger.copy(
+                    tracks = newTracks,
+                    selectedTrackId = newTracks[dstIdx].id,
+                    selectedClipId = clipId
+                )
+            )
+        }
+        syncArrangerPlayerSchedule()
+    }
+
+    fun moveSelectedClipToAdjacentTrack(deltaTrack: Int) {
+        val arr = _uiState.value.arranger
+        val (curTrack, clip) = arr.selectedClipWithTrack ?: return
+        val curIdx = arr.tracks.indexOfFirst { it.id == curTrack.id }
+        if (curIdx < 0) return
+
+        val dstIdx = curIdx + deltaTrack
+        if (dstIdx < 0) return
+
+        if (dstIdx >= arr.tracks.size) {
+            if (arr.tracks.size >= MAX_ARRANGER_TRACKS) {
+                sendMessage("已达最大音轨上限 ($MAX_ARRANGER_TRACKS 条)")
+                return
+            }
+            // Auto-create next track and move clip directly onto it!
+            pushArrangerUndoSnapshot()
+            val nextNum = arr.tracks.size + 1
+            val createdTrack = ArrangerTrack(
+                name = "音轨 $nextNum",
+                colorIndex = (nextNum - 1) % 6,
+                clips = listOf(clip)
+            )
+            _uiState.update { st ->
+                val stripped = st.arranger.tracks.map { t ->
+                    if (t.id == curTrack.id) t.copy(clips = t.clips.filterNot { it.id == clip.id }) else t
+                }
+                st.copy(
+                    arranger = st.arranger.copy(
+                        tracks = stripped + createdTrack,
+                        selectedTrackId = createdTrack.id,
+                        selectedClipId = clip.id
+                    )
+                )
+            }
+            syncArrangerPlayerSchedule()
+            return
+        }
+
+        pushArrangerUndoSnapshot()
+        moveArrangerClipRealtime(clip.id, clip.timelineStartMs, dstIdx)
+    }
+
+    fun nudgeSelectedClipPosition(deltaMs: Long) {
+        val (track, clip) = _uiState.value.arranger.selectedClipWithTrack ?: return
+        val trackIdx = _uiState.value.arranger.tracks.indexOfFirst { it.id == track.id }
+        if (trackIdx < 0) return
+        pushArrangerUndoSnapshot()
+        moveArrangerClipRealtime(clip.id, (clip.timelineStartMs + deltaMs).coerceAtLeast(0L), trackIdx)
+    }
+
+    fun snapSelectedClipToPlayhead() {
+        val arr = _uiState.value.arranger
+        val (track, clip) = arr.selectedClipWithTrack ?: return
+        val trackIdx = arr.tracks.indexOfFirst { it.id == track.id }
+        if (trackIdx < 0) return
+        pushArrangerUndoSnapshot()
+        moveArrangerClipRealtime(clip.id, arr.playheadMs.coerceAtLeast(0L), trackIdx)
+    }
+
+    fun snapSelectedClipToPrevious() {
+        val arr = _uiState.value.arranger
+        val (track, clip) = arr.selectedClipWithTrack ?: return
+        val trackIdx = arr.tracks.indexOfFirst { it.id == track.id }
+        if (trackIdx < 0) return
+        val prevEnd = track.clips
+            .filter { it.id != clip.id && it.timelineStartMs < clip.timelineStartMs }
+            .maxOfOrNull { it.timelineEndMs } ?: 0L
+        pushArrangerUndoSnapshot()
+        moveArrangerClipRealtime(clip.id, prevEnd, trackIdx)
+    }
+
+    fun trimArrangerClipRealtime(
+        clipId: String,
+        newTimelineStartMs: Long,
+        newSourceInMs: Long,
+        newSourceOutMs: Long
+    ) {
+        _uiState.update { st ->
+            val updatedTracks = st.arranger.tracks.map { t ->
+                val idx = t.clips.indexOfFirst { it.id == clipId }
+                if (idx < 0) {
+                    t
+                } else {
+                    val c = t.clips[idx]
+                    val safeIn = newSourceInMs.coerceIn(0L, (c.sourceDurationMs - MIN_CLIP_DURATION_MS).coerceAtLeast(0L))
+                    val safeOut = newSourceOutMs.coerceIn(safeIn + MIN_CLIP_DURATION_MS, c.sourceDurationMs)
+                    val trimmed = c.copy(
+                        timelineStartMs = newTimelineStartMs.coerceAtLeast(0L),
+                        sourceInMs = safeIn,
+                        sourceOutMs = safeOut
+                    )
+                    t.copy(
+                        clips = t.clips.map { if (it.id == clipId) trimmed else it }.sortedBy { it.timelineStartMs }
+                    )
+                }
+            }
+            st.copy(arranger = st.arranger.copy(tracks = updatedTracks))
+        }
+        syncArrangerPlayerSchedule()
+    }
+
+    fun nudgeSelectedClipTrim(isLeftHandle: Boolean, deltaMs: Long) {
+        val (_, clip) = _uiState.value.arranger.selectedClipWithTrack ?: return
+        pushArrangerUndoSnapshot()
+        if (isLeftHandle) {
+            val maxShiftRight = clip.durationMs - MIN_CLIP_DURATION_MS
+            val maxShiftLeft = minOf(clip.sourceInMs, clip.timelineStartMs)
+            val actualDelta = deltaMs.coerceIn(-maxShiftLeft, maxShiftRight)
+            trimArrangerClipRealtime(
+                clipId = clip.id,
+                newTimelineStartMs = clip.timelineStartMs + actualDelta,
+                newSourceInMs = clip.sourceInMs + actualDelta,
+                newSourceOutMs = clip.sourceOutMs
+            )
+        } else {
+            val nextOut = (clip.sourceOutMs + deltaMs).coerceIn(
+                clip.sourceInMs + MIN_CLIP_DURATION_MS,
+                clip.sourceDurationMs
+            )
+            trimArrangerClipRealtime(
+                clipId = clip.id,
+                newTimelineStartMs = clip.timelineStartMs,
+                newSourceInMs = clip.sourceInMs,
+                newSourceOutMs = nextOut
+            )
+        }
+    }
+
+    fun setSelectedClipGainDb(gainDb: Float) {
+        val cid = _uiState.value.arranger.selectedClipId ?: return
+        val rounded = ((gainDb.coerceIn(-18f, 12f) * 2f).roundToInt()) / 2f
+        _uiState.update { st ->
+            st.copy(
+                arranger = st.arranger.copy(
+                    tracks = st.arranger.tracks.map { t ->
+                        t.copy(
+                            clips = t.clips.map { c ->
+                                if (c.id == cid) c.copy(gainDb = rounded) else c
+                            }
+                        )
+                    }
+                )
+            )
+        }
+        syncArrangerPlayerSchedule()
+    }
+
+    fun setSelectedClipFades(fadeInMs: Long, fadeOutMs: Long) {
+        val cid = _uiState.value.arranger.selectedClipId ?: return
+        pushArrangerUndoSnapshot()
+        _uiState.update { st ->
+            st.copy(
+                arranger = st.arranger.copy(
+                    tracks = st.arranger.tracks.map { t ->
+                        t.copy(
+                            clips = t.clips.map { c ->
+                                if (c.id == cid) {
+                                    val half = c.durationMs / 2
+                                    c.copy(
+                                        fadeInMs = fadeInMs.coerceIn(0L, half),
+                                        fadeOutMs = fadeOutMs.coerceIn(0L, half)
+                                    )
+                                } else c
+                            }
+                        )
+                    }
+                )
+            )
+        }
+        syncArrangerPlayerSchedule()
+    }
+
+    fun exportArrangerMixdown() {
+        val state = _uiState.value
+        val arr = state.arranger
+        if (arr.totalClipCount == 0 || arr.totalDurationMs <= 0L) {
+            sendMessage("请先在音轨上添加音频片段后再合成")
+            return
+        }
+        if (state.processingTask != null) return
+        pausePlayback()
+
+        val (nativeClips, totalFrames) = arr.buildNativeSchedule(ARRANGER_SAMPLE_RATE)
+        if (nativeClips.isEmpty()) {
+            sendMessage("当前没有可输出的有声片段（请检查音轨是否已全部静音）")
+            return
+        }
+
+        val activeTrackCount = arr.tracks.count { it.clips.isNotEmpty() }
+        val clipCount = arr.totalClipCount
+
+        activeProcessingJob = viewModelScope.launch {
+            val outWav = SessionWorkspaceManager.createSessionTrackFile(appContext, "mashup", "wav")
+            try {
+                NativeAudioEngine.nativeResetCancel()
+                _uiState.update {
+                    it.copy(
+                        processingTask = ProcessingTaskState(
+                            title = "正在合成多轨混剪音频",
+                            subtitle = "正在混合 $activeTrackCount 条音轨（共 $clipCount 段）并进行防破音保护...",
+                            progress = 0.05f,
+                            cancellable = true
+                        )
+                    )
+                }
+
+                val outcome = NativeAudioEngine.renderMultiTrackMixdown(
+                    clips = nativeClips,
+                    totalDurationFrames = totalFrames,
+                    outputSampleRate = ARRANGER_SAMPLE_RATE,
+                    outputWav = outWav
+                ) { p ->
+                    val pct = (p * 100).roundToInt()
+                    _uiState.update { st ->
+                        st.copy(
+                            processingTask = st.processingTask?.copy(
+                                progress = p,
+                                subtitle = "正在合成多轨音频与防破音保护 · $pct%"
+                            )
+                        )
+                    }
+                }
+
+                when (outcome) {
+                    VocalSeparationOutcome.Cancelled -> {
+                        outWav.delete()
+                        sendMessage("已取消多轨合成")
+                        return@launch
+                    }
+                    is VocalSeparationOutcome.Error -> {
+                        outWav.delete()
+                        sendMessage("多轨合成失败：${outcome.message}")
+                        return@launch
+                    }
+                    VocalSeparationOutcome.Success -> Unit
+                }
+
+                if (!outWav.exists()) {
+                    sendMessage("多轨合成输出文件缺失")
+                    return@launch
+                }
+
+                val metrics = NativeAudioEngine.analyzeWav(outWav) ?: error("合成音频分析失败")
+                val bpmInt = metrics.detectedBpm.roundToInt()
+                val idxStr = String.format(Locale.US, "%02d", mashupExportCounter++)
+                val mashupTrack = SessionTrack(
+                    displayName = "多轨混剪_$idxStr",
+                    badge = "多轨混剪 · ${activeTrackCount}轨${clipCount}段",
+                    detailNote = "${activeTrackCount}条音轨合成 · ${formatMetricsSummary(metrics)}",
+                    audioFile = outWav,
+                    originTrackId = null,
+                    metrics = metrics
+                ).let { it.copy(originTrackId = it.id) }
+
+                appendTrackToWorkspace(mashupTrack)
+                _uiState.update { it.copy(workspaceMode = AppWorkspaceMode.SINGLE_TRACK) }
+                sendMessage("多轨混剪合成完成！已切换至单曲工作台，可直接试听、调音或分享到微信")
+            } catch (_: CancellationException) {
+                outWav.delete()
+                sendMessage("已取消多轨合成")
+            } catch (e: Exception) {
+                outWav.delete()
+                sendMessage("多轨合成失败：${e.message ?: "未知错误"}")
+            } finally {
+                _uiState.update { it.copy(processingTask = null) }
+                refreshStorageInfo()
+            }
+        }
+    }
+
     override fun onCleared() {
         super.onCleared()
+        runCatching { arrangerPlayer.release() }
         runCatching { exoPlayer.release() }
     }
 }

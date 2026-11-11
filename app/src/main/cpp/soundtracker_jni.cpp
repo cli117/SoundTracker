@@ -5,6 +5,7 @@
 #include "audio_buffer.h"
 #include "loudness_maximizer.h"
 #include "mp3_encoder.h"
+#include "multi_track_mixer.h"
 #include "pitch_shifter.h"
 #include "vocal_separator.h"
 #include "wav_io.h"
@@ -568,6 +569,214 @@ Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeProcessRealtimeMaximizer(
     env->GetShortArrayRegion(jPcm, 0, static_cast<jsize>(totalSamples), tlBuf.data());
     maximizer->processInterleavedInt16(tlBuf.data(), tlBuf.data(), static_cast<int>(frames));
     env->SetShortArrayRegion(jPcm, 0, static_cast<jsize>(totalSamples), tlBuf.data());
+}
+
+// ============================================================================
+// Multi-Track Arranger / Mashup Engine (1..10 Tracks Real-Time + Offline Mixdown)
+// ============================================================================
+
+static std::vector<soundtracker::MixClipSpec> unpackMixClipSpecs(
+    JNIEnv* env,
+    jobjectArray jWavPaths,
+    jlongArray jTimelineStarts,
+    jlongArray jDurations,
+    jdoubleArray jSourceStartSecs,
+    jfloatArray jLinearGains,
+    jlongArray jFadeIns,
+    jlongArray jFadeOuts
+) {
+    std::vector<soundtracker::MixClipSpec> specs;
+    if (!jWavPaths || !jTimelineStarts || !jDurations || !jSourceStartSecs ||
+        !jLinearGains || !jFadeIns || !jFadeOuts) {
+        return specs;
+    }
+
+    const jsize count = env->GetArrayLength(jWavPaths);
+    if (count <= 0) return specs;
+
+    std::vector<jlong> starts(static_cast<size_t>(count));
+    std::vector<jlong> durs(static_cast<size_t>(count));
+    std::vector<jdouble> srcSecs(static_cast<size_t>(count));
+    std::vector<jfloat> gains(static_cast<size_t>(count));
+    std::vector<jlong> fadeIns(static_cast<size_t>(count));
+    std::vector<jlong> fadeOuts(static_cast<size_t>(count));
+
+    env->GetLongArrayRegion(jTimelineStarts, 0, count, starts.data());
+    env->GetLongArrayRegion(jDurations, 0, count, durs.data());
+    env->GetDoubleArrayRegion(jSourceStartSecs, 0, count, srcSecs.data());
+    env->GetFloatArrayRegion(jLinearGains, 0, count, gains.data());
+    env->GetLongArrayRegion(jFadeIns, 0, count, fadeIns.data());
+    env->GetLongArrayRegion(jFadeOuts, 0, count, fadeOuts.data());
+
+    specs.reserve(static_cast<size_t>(count));
+    for (jsize i = 0; i < count; ++i) {
+        auto jPath = static_cast<jstring>(env->GetObjectArrayElement(jWavPaths, i));
+        soundtracker::MixClipSpec s;
+        s.wavPath = jstringToStd(env, jPath);
+        if (jPath) env->DeleteLocalRef(jPath);
+        s.timelineStartFrame = static_cast<int64_t>(starts[static_cast<size_t>(i)]);
+        s.durationFrames = static_cast<int64_t>(durs[static_cast<size_t>(i)]);
+        s.sourceStartSec = static_cast<double>(srcSecs[static_cast<size_t>(i)]);
+        s.linearGain = static_cast<float>(gains[static_cast<size_t>(i)]);
+        s.fadeInFrames = static_cast<int64_t>(fadeIns[static_cast<size_t>(i)]);
+        s.fadeOutFrames = static_cast<int64_t>(fadeOuts[static_cast<size_t>(i)]);
+        specs.push_back(std::move(s));
+    }
+    return specs;
+}
+
+JNIEXPORT jlong JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeCreateMultiTrackEngine(
+    JNIEnv*,
+    jobject,
+    jint outputSampleRate
+) {
+    auto* eng = new soundtracker::RealtimeMultiTrackEngine(static_cast<int>(outputSampleRate));
+    return reinterpret_cast<jlong>(eng);
+}
+
+JNIEXPORT void JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeDestroyMultiTrackEngine(
+    JNIEnv*,
+    jobject,
+    jlong handle
+) {
+    if (handle == 0) return;
+    auto* eng = reinterpret_cast<soundtracker::RealtimeMultiTrackEngine*>(handle);
+    delete eng;
+}
+
+JNIEXPORT void JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeClearMultiTrackCache(
+    JNIEnv*,
+    jobject,
+    jlong handle
+) {
+    if (handle == 0) return;
+    auto* eng = reinterpret_cast<soundtracker::RealtimeMultiTrackEngine*>(handle);
+    eng->clearCache();
+}
+
+JNIEXPORT void JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeResetMultiTrackEnvelope(
+    JNIEnv*,
+    jobject,
+    jlong handle
+) {
+    if (handle == 0) return;
+    auto* eng = reinterpret_cast<soundtracker::RealtimeMultiTrackEngine*>(handle);
+    eng->resetEnvelope();
+}
+
+JNIEXPORT void JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeSetMultiTrackSchedule(
+    JNIEnv* env,
+    jobject,
+    jlong handle,
+    jobjectArray jWavPaths,
+    jlongArray jTimelineStarts,
+    jlongArray jDurations,
+    jdoubleArray jSourceStartSecs,
+    jfloatArray jLinearGains,
+    jlongArray jFadeIns,
+    jlongArray jFadeOuts,
+    jlong totalDurationFrames
+) {
+    if (handle == 0) return;
+    auto* eng = reinterpret_cast<soundtracker::RealtimeMultiTrackEngine*>(handle);
+    auto specs = unpackMixClipSpecs(
+        env,
+        jWavPaths,
+        jTimelineStarts,
+        jDurations,
+        jSourceStartSecs,
+        jLinearGains,
+        jFadeIns,
+        jFadeOuts
+    );
+    eng->setSchedule(specs, static_cast<int64_t>(totalDurationFrames));
+}
+
+JNIEXPORT void JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeRenderMultiTrackPreviewBlock(
+    JNIEnv* env,
+    jobject,
+    jlong handle,
+    jlong timelineStartFrame,
+    jshortArray jOutStereoPcm,
+    jint numFrames
+) {
+    if (handle == 0 || !jOutStereoPcm || numFrames <= 0) return;
+    auto* eng = reinterpret_cast<soundtracker::RealtimeMultiTrackEngine*>(handle);
+    const size_t totalSamples = static_cast<size_t>(numFrames) * 2;
+    static thread_local std::vector<int16_t> tlOut;
+    if (tlOut.size() < totalSamples) {
+        tlOut.resize(totalSamples);
+    }
+    eng->renderPreviewBlock(static_cast<int64_t>(timelineStartFrame), tlOut.data(), static_cast<int>(numFrames));
+    env->SetShortArrayRegion(jOutStereoPcm, 0, static_cast<jsize>(totalSamples), tlOut.data());
+}
+
+JNIEXPORT jfloatArray JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeExtractFastWavPeaks(
+    JNIEnv* env,
+    jobject,
+    jstring jWavPath,
+    jint numBins
+) {
+    std::string path = jstringToStd(env, jWavPath);
+    std::vector<float> peaks;
+    if (!soundtracker::extractFastWavPeaks(path, static_cast<int>(numBins), peaks) || peaks.empty()) {
+        return nullptr;
+    }
+    jfloatArray out = env->NewFloatArray(static_cast<jsize>(peaks.size()));
+    if (out) {
+        env->SetFloatArrayRegion(out, 0, static_cast<jsize>(peaks.size()), peaks.data());
+    }
+    return out;
+}
+
+// Returns nullptr on success, or error/cancellation message string on failure
+JNIEXPORT jstring JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeRenderMultiTrackMixdown(
+    JNIEnv* env,
+    jobject,
+    jobjectArray jWavPaths,
+    jlongArray jTimelineStarts,
+    jlongArray jDurations,
+    jdoubleArray jSourceStartSecs,
+    jfloatArray jLinearGains,
+    jlongArray jFadeIns,
+    jlongArray jFadeOuts,
+    jlong totalDurationFrames,
+    jint outputSampleRate,
+    jstring jOutWavPath,
+    jobject progressListener
+) {
+    auto specs = unpackMixClipSpecs(
+        env,
+        jWavPaths,
+        jTimelineStarts,
+        jDurations,
+        jSourceStartSecs,
+        jLinearGains,
+        jFadeIns,
+        jFadeOuts
+    );
+    std::string outPath = jstringToStd(env, jOutWavPath);
+    auto cb = makeJniProgress(env, progressListener);
+    std::string errMsg;
+    bool ok = soundtracker::renderMultiTrackMixdownToWav(
+        specs,
+        static_cast<int64_t>(totalDurationFrames),
+        static_cast<int>(outputSampleRate),
+        outPath,
+        cb,
+        &errMsg
+    );
+    if (ok) return nullptr;
+    if (errMsg.empty()) errMsg = "多轨合成失败";
+    return env->NewStringUTF(errMsg.c_str());
 }
 
 } // extern "C"

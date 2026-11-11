@@ -12,14 +12,17 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.soundtracker.app.audio.AudioCodecHelper
+import com.soundtracker.app.ui.MultiTrackArrangerScreen
 import com.soundtracker.app.ui.StudioScreen
 import com.soundtracker.app.ui.StudioUiEvent
 import com.soundtracker.app.ui.StudioViewModel
@@ -158,7 +161,61 @@ class MainActivity : ComponentActivity() {
                     onDeleteSelectedResources = viewModel::deleteSelectedStoredResources,
                     onClearWorkspace = viewModel::clearAllWorkspaceTracks,
                     onRefreshStorage = viewModel::refreshStorageInfo,
-                    onCancelProcessing = viewModel::cancelActiveProcessing
+                    onCancelProcessing = viewModel::cancelActiveProcessing,
+                    onWorkspaceModeChange = viewModel::setWorkspaceMode,
+                    onSendTrackToArranger = { trackId ->
+                        viewModel.addTrackToArranger(
+                            sessionTrackId = trackId,
+                            switchToArranger = true
+                        )
+                    },
+                    arrangerContent = { bottomPadding, openNetEaseSheet ->
+                        MultiTrackArrangerScreen(
+                            arranger = uiState.arranger,
+                            workspaceTracks = uiState.tracks,
+                            onUndo = viewModel::undoArranger,
+                            onRedo = viewModel::redoArranger,
+                            onClearProject = viewModel::clearArrangerProject,
+                            onExportMixdown = viewModel::exportArrangerMixdown,
+                            onTogglePlayPause = viewModel::toggleArrangerPlayPause,
+                            onSeekToMs = viewModel::seekArrangerToMs,
+                            onZoomChange = viewModel::setArrangerZoom,
+                            onAddTrack = viewModel::addArrangerTrack,
+                            onSelectTrack = viewModel::selectArrangerTrack,
+                            onToggleTrackMute = viewModel::toggleArrangerTrackMute,
+                            onToggleTrackSolo = viewModel::toggleArrangerTrackSolo,
+                            onTrackVolumeChange = viewModel::setArrangerTrackVolumeDb,
+                            onRemoveTrack = viewModel::removeArrangerTrack,
+                            onSelectClip = viewModel::selectArrangerClip,
+                            onBeginGestureUndo = viewModel::beginArrangerGestureUndoSnapshot,
+                            onAddClipFromWorkspace = { trackId, inMs, outMs, atPlayhead ->
+                                viewModel.addTrackToArranger(
+                                    sessionTrackId = trackId,
+                                    customInMs = inMs,
+                                    customOutMs = outMs,
+                                    placeAtPlayhead = atPlayhead,
+                                    switchToArranger = false
+                                )
+                            },
+                            onOpenNetEaseImport = openNetEaseSheet,
+                            onPickLocalAudio = {
+                                openAudioLauncher.launch(arrayOf("*/*"))
+                            },
+                            onSplitAtPlayhead = viewModel::splitArrangerClipAtPlayhead,
+                            onDeleteSelectedClip = viewModel::deleteSelectedArrangerClip,
+                            onDuplicateSelectedClip = viewModel::duplicateSelectedArrangerClip,
+                            onMoveClipRealtime = viewModel::moveArrangerClipRealtime,
+                            onMoveSelectedClipTrack = viewModel::moveSelectedClipToAdjacentTrack,
+                            onNudgeSelectedClipPos = viewModel::nudgeSelectedClipPosition,
+                            onSnapSelectedToPlayhead = viewModel::snapSelectedClipToPlayhead,
+                            onSnapSelectedToPrevious = viewModel::snapSelectedClipToPrevious,
+                            onTrimClipRealtime = viewModel::trimArrangerClipRealtime,
+                            onNudgeSelectedClipTrim = viewModel::nudgeSelectedClipTrim,
+                            onSelectedClipGainChange = viewModel::setSelectedClipGainDb,
+                            onSelectedClipFadesChange = viewModel::setSelectedClipFades,
+                            modifier = Modifier.padding(bottom = bottomPadding)
+                        )
+                    }
                 )
             }
         }

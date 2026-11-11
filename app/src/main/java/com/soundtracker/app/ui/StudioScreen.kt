@@ -55,6 +55,7 @@ import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.CleaningServices
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.CloudDownload
+import androidx.compose.material.icons.rounded.ContentCut
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.DeleteSweep
 import androidx.compose.material.icons.rounded.DriveFileRenameOutline
@@ -129,12 +130,14 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import com.soundtracker.app.arranger.AppWorkspaceMode
 import com.soundtracker.app.audio.NetEaseLocalTrack
 import com.soundtracker.app.dsp.ExportFormat
 import com.soundtracker.app.dsp.VocalEngineMode
@@ -203,154 +206,179 @@ fun StudioScreen(
     onDeleteSelectedResources: (Set<String>) -> Unit,
     onClearWorkspace: () -> Unit,
     onRefreshStorage: () -> Unit,
-    onCancelProcessing: () -> Unit
+    onCancelProcessing: () -> Unit,
+    onWorkspaceModeChange: (AppWorkspaceMode) -> Unit,
+    onSendTrackToArranger: (String) -> Unit,
+    arrangerContent: @Composable (bottomPadding: Dp, onOpenNetEaseSheet: () -> Unit) -> Unit
 ) {
     var renameTargetTrack by remember { mutableStateOf<SessionTrack?>(null) }
     var saveTargetTrack by remember { mutableStateOf<SessionTrack?>(null) }
     var showStorageSheet by rememberSaveable { mutableStateOf(false) }
     var showNetEaseSheet by rememberSaveable { mutableStateOf(false) }
 
+    BackHandler(enabled = uiState.workspaceMode == AppWorkspaceMode.MULTI_TRACK_ARRANGER) {
+        onWorkspaceModeChange(AppWorkspaceMode.SINGLE_TRACK)
+    }
+
     Box(modifier = Modifier.fillMaxSize()) {
         Scaffold(
             containerColor = StudioBg,
             snackbarHost = {
-                SnackbarHost(
-                    hostState = snackbarHostState,
-                    modifier = Modifier.navigationBarsPadding()
-                )
+                SnackbarHost(hostState = snackbarHostState)
             },
             topBar = {
-                StudioTopBar(
-                    ephemeralBytes = uiState.storageInfo.totalEphemeralBytes,
-                    trackCount = uiState.tracks.size,
-                    onStoragePillClick = {
-                        onRefreshStorage()
-                        showStorageSheet = true
-                    },
-                    onNetEaseClick = {
-                        onScanNetEaseClick()
-                        showNetEaseSheet = true
-                    },
-                    onImportClick = onPickAudioClick
+                if (uiState.workspaceMode == AppWorkspaceMode.SINGLE_TRACK) {
+                    StudioTopBar(
+                        ephemeralBytes = uiState.storageInfo.totalEphemeralBytes,
+                        trackCount = uiState.tracks.size,
+                        onStoragePillClick = {
+                            onRefreshStorage()
+                            showStorageSheet = true
+                        },
+                        onNetEaseClick = {
+                            onScanNetEaseClick()
+                            showNetEaseSheet = true
+                        },
+                        onImportClick = onPickAudioClick
+                    )
+                }
+            },
+            bottomBar = {
+                StudioWorkspaceBottomBar(
+                    currentMode = uiState.workspaceMode,
+                    arrangerClipCount = uiState.arranger.totalClipCount,
+                    onSelectMode = onWorkspaceModeChange
                 )
             }
         ) { innerPadding ->
-            val activeTrack = uiState.selectedTrack
-
-            LazyColumn(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(innerPadding),
-                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(14.dp)
-            ) {
-                if (activeTrack == null) {
-                    item {
-                        EmptyStudioHeroCard(
-                            onNetEaseImportClick = {
-                                onScanNetEaseClick()
-                                showNetEaseSheet = true
-                            },
-                            onImportClick = onPickAudioClick
-                        )
-                    }
-                } else {
-                    // 1. Active Waveform Player + A/B Audition + Delivery Actions
-                    item {
-                        ActiveTrackDeckCard(
-                            track = activeTrack,
-                            hasOriginForAb = uiState.originComparisonTrack != null,
-                            isComparingOriginal = uiState.isComparingOriginal,
-                            livePreviewBadgeText = uiState.livePreviewSummaryLabel,
-                            isPlaying = uiState.isPlaying,
-                            positionMs = uiState.playbackPositionMs,
-                            durationMs = uiState.playbackDurationMs.takeIf { it > 0 }
-                                ?: (activeTrack.metrics.durationSec * 1000f).toLong(),
-                            exportFormat = uiState.exportFormat,
-                            onExportFormatChange = onExportFormatChange,
-                            onTogglePlayPause = onTogglePlayPause,
-                            onSeekFraction = onSeekFraction,
-                            onSkipMs = onSkipMs,
-                            onToggleAbCompare = onToggleAbCompare,
-                            onRenameClick = { renameTargetTrack = activeTrack },
-                            onShareWeChatClick = { onShareWeChat(activeTrack.id) },
-                            onShareMoreClick = { onShareSystemMore(activeTrack.id) },
-                            onSaveAsClick = { saveTargetTrack = activeTrack }
-                        )
-                    }
-
-                    // 2. Three Studio DSP Modules
-                    item {
-                        StudioDspWorkbenchCard(
-                            uiState = uiState,
-                            activeTrack = activeTrack,
-                            onSelectTab = onSelectTab,
-                            onTogglePlayPause = onTogglePlayPause,
-                            onVocalEngineModeChange = onVocalEngineModeChange,
-                            onEnableDeepDenoiseChange = onEnableDeepDenoiseChange,
-                            onKeepVocalChange = onKeepVocalChange,
-                            onRunVocalSeparation = onRunVocalSeparation,
-                            onPitchSemitonesChange = onPitchSemitonesChange,
-                            onPitchCentsChange = onPitchCentsChange,
-                            onTargetBpmChange = onTargetBpmChange,
-                            onAdjustTargetBpmBy = onAdjustTargetBpmBy,
-                            onCalibrateSourceBpm = onCalibrateSourceBpm,
-                            onPreserveTimbreChange = onPreserveTimbreChange,
-                            onLivePitchPreviewChange = onLivePitchPreviewChange,
-                            onRunPitchShift = onRunPitchShift,
-                            onVolumeGainChange = onVolumeGainChange,
-                            onLiveVolumePreviewChange = onLiveVolumePreviewChange,
-                            onRunVolumeBoost = onRunVolumeBoost
-                        )
-                    }
+            if (uiState.workspaceMode == AppWorkspaceMode.MULTI_TRACK_ARRANGER) {
+                arrangerContent(innerPadding.calculateBottomPadding()) {
+                    onScanNetEaseClick()
+                    showNetEaseSheet = true
                 }
+            } else {
+                val activeTrack = uiState.selectedTrack
 
-                // 3. Persistent Workspace Track Tray
-                if (uiState.tracks.isNotEmpty()) {
-                    item {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(top = 4.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column {
-                                Text(
-                                    text = "工作台音轨 (${uiState.tracks.size})",
-                                    style = MaterialTheme.typography.titleMedium,
-                                    color = TextPrimary
-                                )
-                                Text(
-                                    text = "点击任意音轨试听或继续处理 · 右上角扫把按钮可随时按需清理空间",
-                                    fontSize = 11.sp,
-                                    color = TextMuted
-                                )
-                            }
-                            TextButton(onClick = {
-                                onRefreshStorage()
-                                showStorageSheet = true
-                            }) {
-                                Text("资源管理", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = CyanPrimary)
-                            }
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(innerPadding),
+                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
+                    if (activeTrack == null) {
+                        item {
+                            EmptyStudioHeroCard(
+                                onNetEaseImportClick = {
+                                    onScanNetEaseClick()
+                                    showNetEaseSheet = true
+                                },
+                                onImportClick = onPickAudioClick,
+                                onOpenArrangerClick = {
+                                    onWorkspaceModeChange(AppWorkspaceMode.MULTI_TRACK_ARRANGER)
+                                }
+                            )
+                        }
+                    } else {
+                        // 1. Active Waveform Player + A/B Audition + Delivery Actions
+                        item {
+                            ActiveTrackDeckCard(
+                                track = activeTrack,
+                                hasOriginForAb = uiState.originComparisonTrack != null,
+                                isComparingOriginal = uiState.isComparingOriginal,
+                                livePreviewBadgeText = uiState.livePreviewSummaryLabel,
+                                isPlaying = uiState.isPlaying,
+                                positionMs = uiState.playbackPositionMs,
+                                durationMs = uiState.playbackDurationMs.takeIf { it > 0 }
+                                    ?: (activeTrack.metrics.durationSec * 1000f).toLong(),
+                                exportFormat = uiState.exportFormat,
+                                onExportFormatChange = onExportFormatChange,
+                                onTogglePlayPause = onTogglePlayPause,
+                                onSeekFraction = onSeekFraction,
+                                onSkipMs = onSkipMs,
+                                onToggleAbCompare = onToggleAbCompare,
+                                onRenameClick = { renameTargetTrack = activeTrack },
+                                onSendToArrangerClick = { onSendTrackToArranger(activeTrack.id) },
+                                onShareWeChatClick = { onShareWeChat(activeTrack.id) },
+                                onShareMoreClick = { onShareSystemMore(activeTrack.id) },
+                                onSaveAsClick = { saveTargetTrack = activeTrack }
+                            )
+                        }
+
+                        // 2. Three Studio DSP Modules
+                        item {
+                            StudioDspWorkbenchCard(
+                                uiState = uiState,
+                                activeTrack = activeTrack,
+                                onSelectTab = onSelectTab,
+                                onTogglePlayPause = onTogglePlayPause,
+                                onVocalEngineModeChange = onVocalEngineModeChange,
+                                onEnableDeepDenoiseChange = onEnableDeepDenoiseChange,
+                                onKeepVocalChange = onKeepVocalChange,
+                                onRunVocalSeparation = onRunVocalSeparation,
+                                onPitchSemitonesChange = onPitchSemitonesChange,
+                                onPitchCentsChange = onPitchCentsChange,
+                                onTargetBpmChange = onTargetBpmChange,
+                                onAdjustTargetBpmBy = onAdjustTargetBpmBy,
+                                onCalibrateSourceBpm = onCalibrateSourceBpm,
+                                onPreserveTimbreChange = onPreserveTimbreChange,
+                                onLivePitchPreviewChange = onLivePitchPreviewChange,
+                                onRunPitchShift = onRunPitchShift,
+                                onVolumeGainChange = onVolumeGainChange,
+                                onLiveVolumePreviewChange = onLiveVolumePreviewChange,
+                                onRunVolumeBoost = onRunVolumeBoost
+                            )
                         }
                     }
 
-                    items(items = uiState.tracks, key = { it.id }) { item ->
-                        SessionTrackItemCard(
-                            track = item,
-                            isSelected = item.id == activeTrack?.id,
-                            onClick = { onSelectTrack(item.id) },
-                            onRenameClick = { renameTargetTrack = item },
-                            onShareWeChatClick = { onShareWeChat(item.id) },
-                            onSaveAsClick = { saveTargetTrack = item },
-                            onDeleteClick = { onDeleteTrack(item.id) }
-                        )
-                    }
-                }
+                    // 3. Persistent Workspace Track Tray
+                    if (uiState.tracks.isNotEmpty()) {
+                        item {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(top = 4.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column {
+                                    Text(
+                                        text = "工作台音轨 (${uiState.tracks.size})",
+                                        style = MaterialTheme.typography.titleMedium,
+                                        color = TextPrimary
+                                    )
+                                    Text(
+                                        text = "点音轨试听处理 · 点剪刀图标可直接送入多轨剪辑",
+                                        fontSize = 11.sp,
+                                        color = TextMuted
+                                    )
+                                }
+                                TextButton(onClick = {
+                                    onRefreshStorage()
+                                    showStorageSheet = true
+                                }) {
+                                    Text("资源管理", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = CyanPrimary)
+                                }
+                            }
+                        }
 
-                item {
-                    Spacer(modifier = Modifier.height(28.dp))
+                        items(items = uiState.tracks, key = { it.id }) { item ->
+                            SessionTrackItemCard(
+                                track = item,
+                                isSelected = item.id == activeTrack?.id,
+                                onClick = { onSelectTrack(item.id) },
+                                onSendToArrangerClick = { onSendTrackToArranger(item.id) },
+                                onRenameClick = { renameTargetTrack = item },
+                                onShareWeChatClick = { onShareWeChat(item.id) },
+                                onSaveAsClick = { saveTargetTrack = item },
+                                onDeleteClick = { onDeleteTrack(item.id) }
+                            )
+                        }
+                    }
+
+                    item {
+                        Spacer(modifier = Modifier.height(16.dp))
+                    }
                 }
             }
         }
@@ -432,6 +460,109 @@ fun StudioScreen(
 }
 
 @Composable
+private fun StudioWorkspaceBottomBar(
+    currentMode: AppWorkspaceMode,
+    arrangerClipCount: Int,
+    onSelectMode: (AppWorkspaceMode) -> Unit
+) {
+    Surface(
+        color = StudioSurface,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+        ) {
+            HorizontalDivider(color = StudioBorder)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(54.dp)
+                    .padding(horizontal = 16.dp, vertical = 7.dp),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                WorkspaceModeTabItem(
+                    label = "单曲处理",
+                    icon = Icons.Rounded.Tune,
+                    badgeText = null,
+                    selected = currentMode == AppWorkspaceMode.SINGLE_TRACK,
+                    onClick = { onSelectMode(AppWorkspaceMode.SINGLE_TRACK) },
+                    modifier = Modifier.weight(1f)
+                )
+                WorkspaceModeTabItem(
+                    label = "多轨剪辑",
+                    icon = Icons.Rounded.ContentCut,
+                    badgeText = arrangerClipCount.takeIf { it > 0 }?.let { "${it}段" },
+                    selected = currentMode == AppWorkspaceMode.MULTI_TRACK_ARRANGER,
+                    onClick = { onSelectMode(AppWorkspaceMode.MULTI_TRACK_ARRANGER) },
+                    modifier = Modifier.weight(1f)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun WorkspaceModeTabItem(
+    label: String,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    badgeText: String?,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val shape = RoundedCornerShape(11.dp)
+    Surface(
+        shape = shape,
+        color = if (selected) CyanPrimary else StudioSurfaceElevated.copy(alpha = 0.72f),
+        border = BorderStroke(1.dp, if (selected) CyanPrimary else StudioBorder),
+        modifier = modifier
+            .height(40.dp)
+            .clip(shape)
+            .clickable(onClick = onClick)
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center,
+            modifier = Modifier.padding(horizontal = 10.dp)
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = if (selected) OnAccentLight else TextSecondary,
+                modifier = Modifier.size(16.dp)
+            )
+            Spacer(modifier = Modifier.width(6.dp))
+            Text(
+                text = label,
+                fontSize = 13.sp,
+                fontWeight = if (selected) FontWeight.Bold else FontWeight.SemiBold,
+                color = if (selected) OnAccentLight else TextSecondary,
+                maxLines = 1
+            )
+            if (badgeText != null) {
+                Spacer(modifier = Modifier.width(6.dp))
+                Surface(
+                    shape = RoundedCornerShape(6.dp),
+                    color = if (selected) OnAccentLight.copy(alpha = 0.22f) else CyanPrimary.copy(alpha = 0.14f)
+                ) {
+                    Text(
+                        text = badgeText,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = if (selected) OnAccentLight else CyanPrimary,
+                        maxLines = 1,
+                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun StudioTopBar(
     ephemeralBytes: Long,
     trackCount: Int,
@@ -484,7 +615,7 @@ private fun StudioTopBar(
                             maxLines = 1
                         )
                         Text(
-                            text = "伴奏提取 · 移调变速 · 音量放大",
+                            text = "伴奏提取 · 移调 · 放大 · 多轨剪辑",
                             fontSize = 11.sp,
                             color = TextSecondary,
                             maxLines = 1
@@ -598,7 +729,8 @@ private fun StudioTopBar(
 @Composable
 private fun EmptyStudioHeroCard(
     onNetEaseImportClick: () -> Unit,
-    onImportClick: () -> Unit
+    onImportClick: () -> Unit,
+    onOpenArrangerClick: () -> Unit
 ) {
     Card(
         shape = RoundedCornerShape(20.dp),
@@ -682,29 +814,37 @@ private fun EmptyStudioHeroCard(
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceEvenly
+                horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 FeaturePillBadge("提取伴奏", CyanPrimary)
-                FeaturePillBadge("升降调与变速", WarmUmber)
+                FeaturePillBadge("移调变速", WarmUmber)
                 FeaturePillBadge("音量放大", EmeraldLossless)
+                FeaturePillBadge("多轨剪辑", VioletAccent, onClick = onOpenArrangerClick)
             }
         }
     }
 }
 
 @Composable
-private fun FeaturePillBadge(text: String, accent: Color) {
+private fun FeaturePillBadge(
+    text: String,
+    accent: Color,
+    onClick: (() -> Unit)? = null
+) {
+    val shape = RoundedCornerShape(8.dp)
     Surface(
-        shape = RoundedCornerShape(8.dp),
+        shape = shape,
         color = accent.copy(alpha = 0.10f),
-        border = BorderStroke(1.dp, accent.copy(alpha = 0.28f))
+        border = BorderStroke(1.dp, accent.copy(alpha = 0.28f)),
+        modifier = if (onClick != null) Modifier.clip(shape).clickable(onClick = onClick) else Modifier
     ) {
         Text(
             text = text,
             fontSize = 11.sp,
             fontWeight = FontWeight.Medium,
             color = accent,
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+            maxLines = 1,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
         )
     }
 }
@@ -726,6 +866,7 @@ private fun ActiveTrackDeckCard(
     onSkipMs: (Long) -> Unit,
     onToggleAbCompare: () -> Unit,
     onRenameClick: () -> Unit,
+    onSendToArrangerClick: () -> Unit,
     onShareWeChatClick: () -> Unit,
     onShareMoreClick: () -> Unit,
     onSaveAsClick: () -> Unit
@@ -848,20 +989,35 @@ private fun ActiveTrackDeckCard(
                     )
                 }
 
-                OutlinedButton(
-                    onClick = onRenameClick,
-                    shape = RoundedCornerShape(10.dp),
-                    border = BorderStroke(1.dp, StudioBorder),
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+                val sendClipShape = RoundedCornerShape(10.dp)
+                Surface(
+                    shape = sendClipShape,
+                    color = CyanPrimary.copy(alpha = 0.12f),
+                    border = BorderStroke(1.dp, CyanPrimary.copy(alpha = 0.45f)),
+                    modifier = Modifier
+                        .height(32.dp)
+                        .clip(sendClipShape)
+                        .clickable(onClick = onSendToArrangerClick)
                 ) {
-                    Icon(
-                        imageVector = Icons.Rounded.DriveFileRenameOutline,
-                        contentDescription = null,
-                        tint = TextPrimary,
-                        modifier = Modifier.size(15.dp)
-                    )
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text("重命名", fontSize = 12.sp, color = TextPrimary)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(horizontal = 9.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.ContentCut,
+                            contentDescription = null,
+                            tint = CyanPrimary,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "送去剪辑",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = CyanPrimary,
+                            maxLines = 1
+                        )
+                    }
                 }
             }
 
@@ -2590,6 +2746,7 @@ private fun SessionTrackItemCard(
     track: SessionTrack,
     isSelected: Boolean,
     onClick: () -> Unit,
+    onSendToArrangerClick: () -> Unit,
     onRenameClick: () -> Unit,
     onShareWeChatClick: () -> Unit,
     onSaveAsClick: () -> Unit,
@@ -2641,36 +2798,44 @@ private fun SessionTrackItemCard(
                 }
 
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(onClick = onRenameClick, modifier = Modifier.size(34.dp)) {
+                    IconButton(onClick = onSendToArrangerClick, modifier = Modifier.size(32.dp)) {
+                        Icon(
+                            Icons.Rounded.ContentCut,
+                            contentDescription = "送去多轨剪辑",
+                            tint = CyanPrimary,
+                            modifier = Modifier.size(17.dp)
+                        )
+                    }
+                    IconButton(onClick = onRenameClick, modifier = Modifier.size(32.dp)) {
                         Icon(
                             Icons.Rounded.DriveFileRenameOutline,
                             contentDescription = "重命名",
                             tint = TextSecondary,
-                            modifier = Modifier.size(18.dp)
+                            modifier = Modifier.size(17.dp)
                         )
                     }
-                    IconButton(onClick = onShareWeChatClick, modifier = Modifier.size(34.dp)) {
+                    IconButton(onClick = onShareWeChatClick, modifier = Modifier.size(32.dp)) {
                         Icon(
                             Icons.AutoMirrored.Rounded.Send,
                             contentDescription = "分享微信",
                             tint = WeChatGreen,
-                            modifier = Modifier.size(18.dp)
+                            modifier = Modifier.size(17.dp)
                         )
                     }
-                    IconButton(onClick = onSaveAsClick, modifier = Modifier.size(34.dp)) {
+                    IconButton(onClick = onSaveAsClick, modifier = Modifier.size(32.dp)) {
                         Icon(
                             Icons.Rounded.SaveAlt,
                             contentDescription = "另存为本地",
                             tint = CyanPrimary,
-                            modifier = Modifier.size(18.dp)
+                            modifier = Modifier.size(17.dp)
                         )
                     }
-                    IconButton(onClick = onDeleteClick, modifier = Modifier.size(34.dp)) {
+                    IconButton(onClick = onDeleteClick, modifier = Modifier.size(32.dp)) {
                         Icon(
                             Icons.Rounded.DeleteOutline,
                             contentDescription = "删除音轨",
                             tint = TextMuted,
-                            modifier = Modifier.size(18.dp)
+                            modifier = Modifier.size(17.dp)
                         )
                     }
                 }
