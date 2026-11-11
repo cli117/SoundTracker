@@ -43,6 +43,7 @@ import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -64,6 +65,7 @@ import androidx.compose.material.icons.rounded.Forward5
 import androidx.compose.material.icons.rounded.GraphicEq
 import androidx.compose.material.icons.rounded.LibraryMusic
 import androidx.compose.material.icons.rounded.MusicNote
+import androidx.compose.material.icons.rounded.OpenInBrowser
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.RadioButtonUnchecked
@@ -73,6 +75,7 @@ import androidx.compose.material.icons.rounded.SaveAlt
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material.icons.rounded.Speed
+import androidx.compose.material.icons.rounded.SystemUpdateAlt
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -104,6 +107,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -144,6 +148,9 @@ import com.soundtracker.app.dsp.VocalEngineMode
 import com.soundtracker.app.storage.EphemeralStorageInfo
 import com.soundtracker.app.storage.StoredResourceCategory
 import com.soundtracker.app.storage.StoredResourceItem
+import com.soundtracker.app.update.AppUpdateUiState
+import com.soundtracker.app.update.UpdateCheckStatus
+import com.soundtracker.app.update.UpdateDownloadChannel
 import com.soundtracker.app.ui.theme.AmberMastering
 import com.soundtracker.app.ui.theme.CyanPrimary
 import com.soundtracker.app.ui.theme.DangerRed
@@ -209,12 +216,18 @@ fun StudioScreen(
     onCancelProcessing: () -> Unit,
     onWorkspaceModeChange: (AppWorkspaceMode) -> Unit,
     onSendTrackToArranger: (String) -> Unit,
+    onCheckAppUpdate: () -> Unit,
+    onSelectUpdateChannel: (UpdateDownloadChannel) -> Unit,
+    onStartOrInstallUpdate: () -> Unit,
+    onCancelUpdateDownload: () -> Unit,
+    onOpenReleaseBrowser: () -> Unit,
     arrangerContent: @Composable (bottomPadding: Dp, onOpenNetEaseSheet: () -> Unit) -> Unit
 ) {
     var renameTargetTrack by remember { mutableStateOf<SessionTrack?>(null) }
     var saveTargetTrack by remember { mutableStateOf<SessionTrack?>(null) }
     var showStorageSheet by rememberSaveable { mutableStateOf(false) }
     var showNetEaseSheet by rememberSaveable { mutableStateOf(false) }
+    var showUpdateSheet by rememberSaveable { mutableStateOf(false) }
 
     BackHandler(enabled = uiState.workspaceMode == AppWorkspaceMode.MULTI_TRACK_ARRANGER) {
         onWorkspaceModeChange(AppWorkspaceMode.SINGLE_TRACK)
@@ -231,6 +244,13 @@ fun StudioScreen(
                     StudioTopBar(
                         ephemeralBytes = uiState.storageInfo.totalEphemeralBytes,
                         trackCount = uiState.tracks.size,
+                        appUpdate = uiState.appUpdate,
+                        onUpdatePillClick = {
+                            if (uiState.appUpdate.checkStatus == UpdateCheckStatus.IDLE) {
+                                onCheckAppUpdate()
+                            }
+                            showUpdateSheet = true
+                        },
                         onStoragePillClick = {
                             onRefreshStorage()
                             showStorageSheet = true
@@ -449,6 +469,19 @@ fun StudioScreen(
             )
         }
 
+        // GitHub Releases OTA Version Update Sheet
+        if (showUpdateSheet) {
+            AppUpdateBottomSheet(
+                appUpdate = uiState.appUpdate,
+                onCheckNow = onCheckAppUpdate,
+                onSelectChannel = onSelectUpdateChannel,
+                onStartOrInstall = onStartOrInstallUpdate,
+                onCancelDownload = onCancelUpdateDownload,
+                onOpenInBrowser = onOpenReleaseBrowser,
+                onDismiss = { showUpdateSheet = false }
+            )
+        }
+
         // Processing Progress Modal
         uiState.processingTask?.let { task ->
             ProcessingProgressDialog(
@@ -566,6 +599,8 @@ private fun WorkspaceModeTabItem(
 private fun StudioTopBar(
     ephemeralBytes: Long,
     trackCount: Int,
+    appUpdate: AppUpdateUiState,
+    onUpdatePillClick: () -> Unit,
     onStoragePillClick: () -> Unit,
     onNetEaseClick: () -> Unit,
     onImportClick: () -> Unit
@@ -579,7 +614,7 @@ private fun StudioTopBar(
                 .fillMaxWidth()
                 .statusBarsPadding()
         ) {
-            // Row 1: App Title (full width, never squeezed) + Storage Resource Pill on right
+            // Row 1: App Title (full width, never squeezed) + Update Pill + Storage Resource Pill on right
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -589,7 +624,9 @@ private fun StudioTopBar(
             ) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(end = 6.dp)
                 ) {
                     Box(
                         modifier = Modifier
@@ -606,7 +643,7 @@ private fun StudioTopBar(
                             modifier = Modifier.size(20.dp)
                         )
                     }
-                    Spacer(modifier = Modifier.width(10.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
                     Column {
                         Text(
                             text = "SoundTracker",
@@ -615,7 +652,7 @@ private fun StudioTopBar(
                             maxLines = 1
                         )
                         Text(
-                            text = "伴奏提取 · 移调 · 放大 · 多轨剪辑",
+                            text = "伴奏 · 移调 · 放大 · 多轨剪辑",
                             fontSize = 11.sp,
                             color = TextSecondary,
                             maxLines = 1
@@ -623,31 +660,99 @@ private fun StudioTopBar(
                     }
                 }
 
-                // Broom + Storage Size Button -> Opens Resource Manager List
-                Surface(
-                    onClick = onStoragePillClick,
-                    shape = RoundedCornerShape(20.dp),
-                    color = StudioSurface,
-                    border = BorderStroke(1.dp, StudioBorder)
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 11.dp, vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically
+                    // Version / GitHub Release Update Pill (fixed 30.dp height, zero layout shift)
+                    val updShape = RoundedCornerShape(16.dp)
+                    val hasNew = appUpdate.hasUpdate
+                    val dlPct = if (appUpdate.isDownloading && appUpdate.totalBytes > 0L) {
+                        ((appUpdate.downloadedBytes * 100L) / appUpdate.totalBytes).toInt().coerceIn(0, 99)
+                    } else {
+                        null
+                    }
+                    Surface(
+                        shape = updShape,
+                        color = when {
+                            appUpdate.isDownloading -> CyanPrimary.copy(alpha = 0.15f)
+                            hasNew -> CyanPrimary
+                            else -> StudioSurface
+                        },
+                        border = BorderStroke(
+                            1.dp,
+                            if (hasNew || appUpdate.isDownloading) CyanPrimary else StudioBorder
+                        ),
+                        modifier = Modifier
+                            .height(30.dp)
+                            .clip(updShape)
+                            .clickable(onClick = onUpdatePillClick)
                     ) {
-                        Icon(
-                            imageVector = Icons.Rounded.CleaningServices,
-                            contentDescription = "存储资源管理",
-                            tint = CyanPrimary,
-                            modifier = Modifier.size(15.dp)
-                        )
-                        Spacer(modifier = Modifier.width(5.dp))
-                        Text(
-                            text = formatBytesShort(ephemeralBytes),
-                            fontSize = 12.sp,
-                            fontFamily = FontFamily.Monospace,
-                            fontWeight = FontWeight.SemiBold,
-                            color = TextPrimary
-                        )
+                        Row(
+                            modifier = Modifier.padding(horizontal = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.SystemUpdateAlt,
+                                contentDescription = "检查版本更新",
+                                tint = when {
+                                    appUpdate.isDownloading -> CyanPrimary
+                                    hasNew -> OnAccentLight
+                                    else -> TextSecondary
+                                },
+                                modifier = Modifier.size(13.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = when {
+                                    dlPct != null -> "$dlPct%"
+                                    hasNew -> "新版"
+                                    else -> "v${appUpdate.currentVersionName}"
+                                },
+                                fontSize = 11.sp,
+                                fontFamily = if (hasNew) FontFamily.Default else FontFamily.Monospace,
+                                fontWeight = FontWeight.SemiBold,
+                                color = when {
+                                    appUpdate.isDownloading -> CyanPrimary
+                                    hasNew -> OnAccentLight
+                                    else -> TextPrimary
+                                },
+                                maxLines = 1
+                            )
+                        }
+                    }
+
+                    // Broom + Storage Size Button -> Opens Resource Manager List
+                    val broomShape = RoundedCornerShape(16.dp)
+                    Surface(
+                        shape = broomShape,
+                        color = StudioSurface,
+                        border = BorderStroke(1.dp, StudioBorder),
+                        modifier = Modifier
+                            .height(30.dp)
+                            .clip(broomShape)
+                            .clickable(onClick = onStoragePillClick)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 9.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.CleaningServices,
+                                contentDescription = "存储资源管理",
+                                tint = CyanPrimary,
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = formatBytesShort(ephemeralBytes),
+                                fontSize = 11.sp,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.SemiBold,
+                                color = TextPrimary,
+                                maxLines = 1
+                            )
+                        }
                     }
                 }
             }
@@ -3679,6 +3784,7 @@ private fun StoredResourceRowCell(
         StoredResourceCategory.WORKSPACE_TRACK -> CyanPrimary
         StoredResourceCategory.SHARE_EXPORT -> WeChatGreen
         StoredResourceCategory.TEMP_CACHE -> AmberMastering
+        StoredResourceCategory.APK_UPDATE -> VioletAccent
     }
 
     Surface(
@@ -4242,6 +4348,478 @@ private fun NetEaseTrackRowCell(
                     fontWeight = FontWeight.Bold
                 )
             }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AppUpdateBottomSheet(
+    appUpdate: AppUpdateUiState,
+    onCheckNow: () -> Unit,
+    onSelectChannel: (UpdateDownloadChannel) -> Unit,
+    onStartOrInstall: () -> Unit,
+    onCancelDownload: () -> Unit,
+    onOpenInBrowser: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val release = appUpdate.latestRelease
+    val isChecking = appUpdate.checkStatus == UpdateCheckStatus.CHECKING
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        containerColor = StudioSurface
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .padding(horizontal = 18.dp, vertical = 6.dp)
+        ) {
+            // Header Row
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "应用版本更新",
+                        fontFamily = FontFamily.Serif,
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = TextPrimary
+                    )
+                    Text(
+                        text = buildString {
+                            append("当前安装版本 v${appUpdate.currentVersionName}")
+                            if (!appUpdate.lastCheckedTimeText.isNullOrBlank()) {
+                                append(" · 上次检查 ${appUpdate.lastCheckedTimeText}")
+                            }
+                        },
+                        fontSize = 11.sp,
+                        color = TextSecondary
+                    )
+                }
+
+                val checkBtnShape = RoundedCornerShape(10.dp)
+                Surface(
+                    shape = checkBtnShape,
+                    color = StudioSurfaceElevated,
+                    border = BorderStroke(1.dp, StudioBorder),
+                    modifier = Modifier
+                        .height(32.dp)
+                        .clip(checkBtnShape)
+                        .clickable(enabled = !isChecking && !appUpdate.isDownloading, onClick = onCheckNow)
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(horizontal = 10.dp)
+                    ) {
+                        if (isChecking) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(13.dp),
+                                strokeWidth = 1.8.dp,
+                                color = CyanPrimary
+                            )
+                        } else {
+                            Icon(
+                                imageVector = Icons.Rounded.Refresh,
+                                contentDescription = null,
+                                tint = CyanPrimary,
+                                modifier = Modifier.size(14.dp)
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = if (isChecking) "检查中" else "检查更新",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = TextPrimary,
+                            maxLines = 1
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            // Main Content Card
+            when {
+                appUpdate.hasUpdate && release != null -> {
+                    Surface(
+                        shape = RoundedCornerShape(14.dp),
+                        color = StudioBg,
+                        border = BorderStroke(1.dp, CyanPrimary.copy(alpha = 0.55f)),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(modifier = Modifier.padding(14.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Surface(
+                                        shape = RoundedCornerShape(6.dp),
+                                        color = CyanPrimary
+                                    ) {
+                                        Text(
+                                            text = "发现新版本 ${release.tagName}",
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = OnAccentLight,
+                                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
+                                        )
+                                    }
+                                    if (release.apkSizeBytes > 0L) {
+                                        Text(
+                                            text = formatBytesShort(release.apkSizeBytes),
+                                            fontSize = 11.sp,
+                                            fontFamily = FontFamily.Monospace,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = TextSecondary
+                                        )
+                                    }
+                                }
+
+                                if (release.publishedAtText.isNotBlank()) {
+                                    Text(
+                                        text = release.publishedAtText,
+                                        fontSize = 11.sp,
+                                        color = TextMuted
+                                    )
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = release.releaseTitle,
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = TextPrimary
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
+
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(max = 150.dp)
+                                    .verticalScroll(rememberScrollState())
+                            ) {
+                                Text(
+                                    text = release.releaseNotes,
+                                    fontSize = 12.sp,
+                                    lineHeight = 18.sp,
+                                    color = TextSecondary
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    // Download Channel Selector (GitHub Direct vs Mirror Accelerated)
+                    Text(
+                        text = "下载路线（免流量服务器费用 · 基于 GitHub Release）",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = TextSecondary
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        UpdateDownloadChannel.entries.forEach { ch ->
+                            val selected = appUpdate.downloadChannel == ch
+                            val chipShape = RoundedCornerShape(10.dp)
+                            Surface(
+                                shape = chipShape,
+                                color = if (selected) CyanPrimary.copy(alpha = 0.14f) else StudioSurfaceElevated.copy(alpha = 0.7f),
+                                border = BorderStroke(
+                                    1.dp,
+                                    if (selected) CyanPrimary else StudioBorder
+                                ),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(36.dp)
+                                    .clip(chipShape)
+                                    .clickable(enabled = !appUpdate.isDownloading) {
+                                        onSelectChannel(ch)
+                                    }
+                            ) {
+                                Box(contentAlignment = Alignment.Center) {
+                                    Text(
+                                        text = ch.label,
+                                        fontSize = 12.sp,
+                                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                                        color = if (selected) CyanPrimary else TextPrimary,
+                                        maxLines = 1
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = appUpdate.downloadChannel.description,
+                        fontSize = 11.sp,
+                        color = TextMuted
+                    )
+
+                    if (!appUpdate.errorMessage.isNullOrBlank()) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Surface(
+                            shape = RoundedCornerShape(10.dp),
+                            color = DangerRed.copy(alpha = 0.10f),
+                            border = BorderStroke(1.dp, DangerRed.copy(alpha = 0.35f)),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = appUpdate.errorMessage,
+                                fontSize = 11.sp,
+                                color = DangerRed,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp)
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(14.dp))
+
+                    if (appUpdate.isDownloading) {
+                        val frac = if (appUpdate.totalBytes > 0L) {
+                            (appUpdate.downloadedBytes.toFloat() / appUpdate.totalBytes.toFloat()).coerceIn(0f, 1f)
+                        } else {
+                            0f
+                        }
+                        val pctInt = (frac * 100f).roundToInt()
+                        val speedStr = if (appUpdate.speedBytesPerSec > 0L) {
+                            "${formatBytesShort(appUpdate.speedBytesPerSec)}/s"
+                        } else {
+                            "正在连接..."
+                        }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "正在下载安装包 · $pctInt% ($speedStr)",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = CyanPrimary
+                            )
+                            Text(
+                                text = if (appUpdate.totalBytes > 0L) {
+                                    "${formatBytesShort(appUpdate.downloadedBytes)} / ${formatBytesShort(appUpdate.totalBytes)}"
+                                } else {
+                                    formatBytesShort(appUpdate.downloadedBytes)
+                                },
+                                fontSize = 11.sp,
+                                fontFamily = FontFamily.Monospace,
+                                color = TextSecondary
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(6.dp))
+                        LinearProgressIndicator(
+                            progress = { frac },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(8.dp)
+                                .clip(RoundedCornerShape(4.dp)),
+                            color = CyanPrimary,
+                            trackColor = StudioSurfaceElevated
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        OutlinedButton(
+                            onClick = onCancelDownload,
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(11.dp),
+                            border = BorderStroke(1.dp, DangerRed.copy(alpha = 0.5f))
+                        ) {
+                            Text("暂停 / 取消下载", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = DangerRed)
+                        }
+                    } else {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Button(
+                                onClick = onStartOrInstall,
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(11.dp),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = if (appUpdate.hasReadyApk) EmeraldLossless else CyanPrimary,
+                                    contentColor = OnAccentLight
+                                ),
+                                contentPadding = PaddingValues(vertical = 12.dp, horizontal = 12.dp)
+                            ) {
+                                Icon(
+                                    imageVector = if (appUpdate.hasReadyApk) Icons.Rounded.CheckCircle else Icons.Rounded.SystemUpdateAlt,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(17.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = if (appUpdate.hasReadyApk) {
+                                        "安装包已就绪 · 立即安装"
+                                    } else if (release.apkSizeBytes > 0L) {
+                                        "下载并更新 (${formatBytesShort(release.apkSizeBytes)})"
+                                    } else {
+                                        "立即下载并更新"
+                                    },
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    maxLines = 1
+                                )
+                            }
+
+                            OutlinedButton(
+                                onClick = onOpenInBrowser,
+                                shape = RoundedCornerShape(11.dp),
+                                border = BorderStroke(1.dp, StudioBorder),
+                                contentPadding = PaddingValues(vertical = 12.dp, horizontal = 12.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.OpenInBrowser,
+                                    contentDescription = "浏览器打开",
+                                    tint = TextPrimary,
+                                    modifier = Modifier.size(17.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+
+                appUpdate.checkStatus == UpdateCheckStatus.ERROR -> {
+                    Surface(
+                        shape = RoundedCornerShape(14.dp),
+                        color = StudioBg,
+                        border = BorderStroke(1.dp, DangerRed.copy(alpha = 0.40f)),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            Text(
+                                text = "暂时无法连接 GitHub 检查更新",
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = TextPrimary
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = appUpdate.errorMessage ?: "请检查手机网络连接，或点击下方按钮在浏览器查看 GitHub Release 页面。",
+                                fontSize = 12.sp,
+                                color = TextSecondary,
+                                lineHeight = 18.sp
+                            )
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Button(
+                                    onClick = onCheckNow,
+                                    shape = RoundedCornerShape(10.dp),
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = CyanPrimary,
+                                        contentColor = OnAccentLight
+                                    )
+                                ) {
+                                    Text("重新检查", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                                }
+                                OutlinedButton(
+                                    onClick = onOpenInBrowser,
+                                    shape = RoundedCornerShape(10.dp),
+                                    border = BorderStroke(1.dp, StudioBorder)
+                                ) {
+                                    Icon(Icons.Rounded.OpenInBrowser, contentDescription = null, tint = TextPrimary, modifier = Modifier.size(15.dp))
+                                    Spacer(modifier = Modifier.width(5.dp))
+                                    Text("浏览器打开 GitHub", fontSize = 12.sp, color = TextPrimary)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                isChecking -> {
+                    Surface(
+                        shape = RoundedCornerShape(14.dp),
+                        color = StudioBg,
+                        border = BorderStroke(1.dp, StudioBorder),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(18.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center
+                        ) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(20.dp),
+                                strokeWidth = 2.2.dp,
+                                color = CyanPrimary
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Text(
+                                text = "正在连接 GitHub Release 查询最新版本...",
+                                fontSize = 13.sp,
+                                color = TextSecondary
+                            )
+                        }
+                    }
+                }
+
+                else -> {
+                    Surface(
+                        shape = RoundedCornerShape(14.dp),
+                        color = StudioBg,
+                        border = BorderStroke(1.dp, EmeraldLossless.copy(alpha = 0.35f)),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(
+                                    imageVector = Icons.Rounded.CheckCircle,
+                                    contentDescription = null,
+                                    tint = EmeraldLossless,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = "当前已是最新版本 (v${appUpdate.currentVersionName})",
+                                    fontSize = 14.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = TextPrimary
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = "后续发布新版本后，打开 App 右上角会自动亮起「新版」提示，点一下即可在应用内直接下载覆盖升级（所有本地音轨都会保留）。",
+                                fontSize = 12.sp,
+                                color = TextSecondary,
+                                lineHeight = 18.sp
+                            )
+                            Spacer(modifier = Modifier.height(12.dp))
+                            OutlinedButton(
+                                onClick = onOpenInBrowser,
+                                shape = RoundedCornerShape(10.dp),
+                                border = BorderStroke(1.dp, StudioBorder)
+                            ) {
+                                Icon(Icons.Rounded.OpenInBrowser, contentDescription = null, tint = TextPrimary, modifier = Modifier.size(15.dp))
+                                Spacer(modifier = Modifier.width(5.dp))
+                                Text("查看 GitHub Releases 页面", fontSize = 12.sp, color = TextPrimary)
+                            }
+                        }
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
         }
     }
 }

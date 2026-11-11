@@ -24,7 +24,8 @@ import java.io.File
 enum class StoredResourceCategory(val label: String) {
     WORKSPACE_TRACK("工作台音轨"),
     SHARE_EXPORT("微信/分享导出"),
-    TEMP_CACHE("临时转码缓存")
+    TEMP_CACHE("临时转码缓存"),
+    APK_UPDATE("更新安装包")
 }
 
 data class StoredResourceItem(
@@ -53,6 +54,7 @@ object SessionWorkspaceManager {
     private const val LEGACY_CACHE_WORKSPACE_DIR = "workspace_session"
     private const val WORKSPACE_TMP_DIR = "workspace_tmp"
     private const val WECHAT_STAGING_DIR = "wechat_share_staging"
+    private const val APK_UPDATES_DIR = "apk_updates"
     private const val TRACKS_INDEX_FILE = "workspace_tracks_index.json"
     private const val WECHAT_PACKAGE = "com.tencent.mm"
     private const val WECHAT_SHARE_UI = "com.tencent.mm.ui.tools.ShareImgUI"
@@ -283,6 +285,30 @@ object SessionWorkspaceManager {
                 }
         }
 
+        // 4. Scan downloaded OTA APK update packages (if any waiting for installation)
+        val apkRoot = File(context.cacheDir, APK_UPDATES_DIR)
+        if (apkRoot.exists()) {
+            apkRoot.walkTopDown()
+                .filter { it.isFile && it.length() > 0L }
+                .forEach { file ->
+                    val len = file.length()
+                    stagingBytes += len
+                    val isPart = file.name.endsWith(".part", ignoreCase = true)
+                    items.add(
+                        StoredResourceItem(
+                            id = file.absolutePath,
+                            filePath = file.absolutePath,
+                            displayName = file.name,
+                            subtitle = if (isPart) "未完成的版本更新缓存" else "已下载的版本更新安装包",
+                            category = StoredResourceCategory.APK_UPDATE,
+                            sizeBytes = len,
+                            lastModifiedMs = file.lastModified(),
+                            linkedTrackId = null
+                        )
+                    )
+                }
+        }
+
         val sortedItems = items.sortedByDescending { it.lastModifiedMs }
         return EphemeralStorageInfo(
             workspaceBytes = workspaceBytes,
@@ -339,6 +365,9 @@ object SessionWorkspaceManager {
             File(context.cacheDir, WECHAT_STAGING_DIR).let {
                 if (it.exists()) it.deleteRecursively()
                 it.mkdirs()
+            }
+            File(context.cacheDir, APK_UPDATES_DIR).let {
+                if (it.exists()) it.deleteRecursively()
             }
             tracksIndexFile(context).delete()
         }

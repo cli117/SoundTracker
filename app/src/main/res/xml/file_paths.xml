@@ -3,6 +3,9 @@
     <cache-path
         name="wechat_share_staging"
         path="wechat_share_staging/" />
+    <cache-path
+        name="apk_updates"
+        path="apk_updates/" />
     <files-path
         name="workspace_tracks"
         path="workspace_tracks/" />

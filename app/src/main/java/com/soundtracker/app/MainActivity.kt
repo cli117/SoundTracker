@@ -27,6 +27,8 @@ import com.soundtracker.app.ui.StudioScreen
 import com.soundtracker.app.ui.StudioUiEvent
 import com.soundtracker.app.ui.StudioViewModel
 import com.soundtracker.app.ui.theme.SoundTrackerTheme
+import com.soundtracker.app.update.AppUpdateManager
+import java.io.File
 
 class MainActivity : ComponentActivity() {
 
@@ -54,6 +56,33 @@ class MainActivity : ComponentActivity() {
                 val uiState by viewModel.uiState.collectAsStateWithLifecycle()
                 val snackbarHostState = remember { SnackbarHostState() }
                 var pendingCustomSaveTrackId by remember { mutableStateOf<String?>(null) }
+                var pendingInstallApkFile by remember { mutableStateOf<File?>(null) }
+
+                val launchApkInstaller: (File) -> Unit = { apkFile ->
+                    runCatching {
+                        startActivity(AppUpdateManager.buildInstallApkIntent(this@MainActivity, apkFile))
+                    }.onFailure { err ->
+                        viewModel.refreshStorageInfo()
+                        android.widget.Toast.makeText(
+                            this@MainActivity,
+                            "无法调起系统安装器：${err.message}",
+                            android.widget.Toast.LENGTH_LONG
+                        ).show()
+                    }
+                }
+
+                // Launcher for first-time "Allow from this source" (Unknown App Sources) permission
+                val unknownSourcesLauncher = rememberLauncherForActivityResult(
+                    contract = ActivityResultContracts.StartActivityForResult()
+                ) {
+                    val targetApk = pendingInstallApkFile
+                    if (targetApk != null && targetApk.exists() &&
+                        AppUpdateManager.canRequestInstallPackages(this@MainActivity)
+                    ) {
+                        pendingInstallApkFile = null
+                        launchApkInstaller(targetApk)
+                    }
+                }
 
                 // Picker for importing audio, video, or .ncm files
                 val openAudioLauncher = rememberLauncherForActivityResult(
@@ -93,6 +122,35 @@ class MainActivity : ComponentActivity() {
                                     startActivity(event.intent)
                                 }.onFailure {
                                     snackbarHostState.showSnackbar("无法唤起分享面板：${it.message}")
+                                }
+                            }
+                            is StudioUiEvent.RequestInstallApk -> {
+                                val apkFile = event.apkFile
+                                if (!apkFile.exists()) {
+                                    snackbarHostState.showSnackbar("更新安装包不存在，请重新下载")
+                                } else if (AppUpdateManager.canRequestInstallPackages(this@MainActivity)) {
+                                    launchApkInstaller(apkFile)
+                                } else {
+                                    pendingInstallApkFile = apkFile
+                                    android.widget.Toast.makeText(
+                                        this@MainActivity,
+                                        "首次应用内更新请先开启「允许来自此来源的应用」，返回后将自动弹出安装",
+                                        android.widget.Toast.LENGTH_LONG
+                                    ).show()
+                                    runCatching {
+                                        unknownSourcesLauncher.launch(
+                                            AppUpdateManager.buildUnknownSourcesSettingsIntent(this@MainActivity)
+                                        )
+                                    }.onFailure {
+                                        snackbarHostState.showSnackbar("请在系统设置中允许 SoundTracker 安装未知应用")
+                                    }
+                                }
+                            }
+                            is StudioUiEvent.OpenExternalUrl -> {
+                                runCatching {
+                                    startActivity(AppUpdateManager.buildBrowserIntent(event.url))
+                                }.onFailure {
+                                    snackbarHostState.showSnackbar("无法打开浏览器：${it.message}")
                                 }
                             }
                         }
@@ -169,6 +227,11 @@ class MainActivity : ComponentActivity() {
                             switchToArranger = true
                         )
                     },
+                    onCheckAppUpdate = { viewModel.checkForAppUpdate(manual = true) },
+                    onSelectUpdateChannel = viewModel::setUpdateDownloadChannel,
+                    onStartOrInstallUpdate = viewModel::startOrInstallAppUpdate,
+                    onCancelUpdateDownload = viewModel::cancelAppUpdateDownload,
+                    onOpenReleaseBrowser = viewModel::openGithubReleaseInBrowser,
                     arrangerContent = { bottomPadding, openNetEaseSheet ->
                         MultiTrackArrangerScreen(
                             arranger = uiState.arranger,

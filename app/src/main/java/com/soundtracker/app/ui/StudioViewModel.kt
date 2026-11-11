@@ -30,6 +30,10 @@ import com.soundtracker.app.dsp.VocalEngineMode
 import com.soundtracker.app.dsp.VocalSeparationOutcome
 import com.soundtracker.app.storage.EphemeralStorageInfo
 import com.soundtracker.app.storage.SessionWorkspaceManager
+import com.soundtracker.app.update.AppUpdateManager
+import com.soundtracker.app.update.AppUpdateUiState
+import com.soundtracker.app.update.UpdateCheckStatus
+import com.soundtracker.app.update.UpdateDownloadChannel
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
@@ -42,6 +46,8 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.File
+import java.time.LocalTime
+import java.time.format.DateTimeFormatter
 import java.util.Locale
 import java.util.UUID
 import kotlin.math.abs
@@ -108,7 +114,9 @@ data class StudioUiState(
     // NetEase Cloud Music local scanner state
     val netEaseTracks: List<NetEaseLocalTrack> = emptyList(),
     val isScanningNetEase: Boolean = false,
-    val hasNetEaseStorageAccess: Boolean = true
+    val hasNetEaseStorageAccess: Boolean = true,
+    // GitHub Releases OTA self-update state
+    val appUpdate: AppUpdateUiState = AppUpdateUiState()
 ) {
     val selectedTrack: SessionTrack?
         get() = tracks.firstOrNull { it.id == selectedTrackId } ?: tracks.firstOrNull()
@@ -157,6 +165,8 @@ data class StudioUiState(
 sealed interface StudioUiEvent {
     data class ShowMessage(val message: String) : StudioUiEvent
     data class LaunchShareIntent(val intent: Intent) : StudioUiEvent
+    data class RequestInstallApk(val apkFile: File) : StudioUiEvent
+    data class OpenExternalUrl(val url: String) : StudioUiEvent
 }
 
 class StudioViewModel(application: Application) : AndroidViewModel(application) {
@@ -195,6 +205,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     private var mashupExportCounter = 1
     private var loadedPlayerFilePath: String? = null
     private var activeProcessingJob: Job? = null
+    private var updateCheckJob: Job? = null
+    private var updateDownloadJob: Job? = null
 
     init {
         viewModelScope.launch {
@@ -255,13 +267,26 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             preparePlayerForTrack(first, seekMs = 0L, playImmediately = false)
         }
         refreshStorageInfo()
+
+        // Silent non-blocking GitHub Release update check after initial UI settles
+        viewModelScope.launch {
+            delay(1_200L)
+            checkForAppUpdate(manual = false)
+        }
     }
 
     fun refreshStorageInfo() {
         val currentTracks = _uiState.value.tracks
         SessionWorkspaceManager.saveTracksIndex(appContext, currentTracks)
         val info = SessionWorkspaceManager.getStorageInfo(appContext, currentTracks)
-        _uiState.update { it.copy(storageInfo = info) }
+        _uiState.update { st ->
+            val currentReadyPath = st.appUpdate.readyApkPath
+            val verifiedReadyPath = currentReadyPath?.takeIf { File(it).exists() }
+            st.copy(
+                storageInfo = info,
+                appUpdate = st.appUpdate.copy(readyApkPath = verifiedReadyPath)
+            )
+        }
     }
 
     // ========================================================================
@@ -2468,8 +2493,198 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    // ========================================================================
+    // Feature 6: GitHub Releases Free OTA Update Check, Download & Install
+    // ========================================================================
+
+    fun checkForAppUpdate(manual: Boolean = true) {
+        if (_uiState.value.appUpdate.checkStatus == UpdateCheckStatus.CHECKING) return
+        updateCheckJob?.cancel()
+        updateCheckJob = viewModelScope.launch {
+            _uiState.update { st ->
+                st.copy(
+                    appUpdate = st.appUpdate.copy(
+                        checkStatus = UpdateCheckStatus.CHECKING,
+                        errorMessage = null
+                    )
+                )
+            }
+
+            val result = AppUpdateManager.fetchLatestRelease()
+            val timeStr = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm", Locale.CHINA))
+
+            result.fold(
+                onSuccess = { release ->
+                    val curVer = _uiState.value.appUpdate.currentVersionName
+                    val newer = release != null && AppUpdateManager.isNewerVersion(release.versionName, curVer)
+                    val readyFile = if (newer) {
+                        AppUpdateManager.findReadyApkFile(appContext, release)
+                    } else {
+                        null
+                    }
+                    _uiState.update { st ->
+                        st.copy(
+                            appUpdate = st.appUpdate.copy(
+                                checkStatus = if (newer) UpdateCheckStatus.UPDATE_AVAILABLE else UpdateCheckStatus.UP_TO_DATE,
+                                latestRelease = release,
+                                hasUpdate = newer,
+                                errorMessage = null,
+                                lastCheckedTimeText = timeStr,
+                                readyApkPath = readyFile?.absolutePath
+                            )
+                        )
+                    }
+                    if (manual) {
+                        if (newer) {
+                            sendMessage("发现新版本 ${release.tagName}，可直接下载更新")
+                        } else {
+                            sendMessage("当前已是最新版本 v$curVer")
+                        }
+                    }
+                },
+                onFailure = { err ->
+                    val errText = err.message ?: "网络连接失败，请稍后重试"
+                    _uiState.update { st ->
+                        st.copy(
+                            appUpdate = st.appUpdate.copy(
+                                checkStatus = UpdateCheckStatus.ERROR,
+                                errorMessage = errText,
+                                lastCheckedTimeText = timeStr
+                            )
+                        )
+                    }
+                    if (manual) {
+                        sendMessage("检查更新失败：$errText")
+                    }
+                }
+            )
+        }
+    }
+
+    fun setUpdateDownloadChannel(channel: UpdateDownloadChannel) {
+        if (_uiState.value.appUpdate.isDownloading) return
+        _uiState.update { st ->
+            st.copy(
+                appUpdate = st.appUpdate.copy(
+                    downloadChannel = channel,
+                    errorMessage = null
+                )
+            )
+        }
+    }
+
+    fun startOrInstallAppUpdate() {
+        val upd = _uiState.value.appUpdate
+        if (upd.isDownloading) return
+
+        // If already downloaded & verified on disk, jump straight to system PackageInstaller!
+        val existingPath = upd.readyApkPath
+        if (!existingPath.isNullOrBlank()) {
+            val existingFile = File(existingPath)
+            if (existingFile.exists() && existingFile.length() > 0L) {
+                _events.trySend(StudioUiEvent.RequestInstallApk(existingFile))
+                return
+            }
+        }
+
+        val release = upd.latestRelease ?: run {
+            checkForAppUpdate(manual = true)
+            return
+        }
+        val channel = upd.downloadChannel
+
+        updateDownloadJob?.cancel()
+        updateDownloadJob = viewModelScope.launch {
+            _uiState.update { st ->
+                st.copy(
+                    appUpdate = st.appUpdate.copy(
+                        isDownloading = true,
+                        downloadedBytes = 0L,
+                        totalBytes = release.apkSizeBytes,
+                        speedBytesPerSec = 0L,
+                        errorMessage = null
+                    )
+                )
+            }
+
+            try {
+                val res = AppUpdateManager.downloadReleaseApk(
+                    context = appContext,
+                    release = release,
+                    channel = channel
+                ) { downloaded, total, speed ->
+                    _uiState.update { st ->
+                        st.copy(
+                            appUpdate = st.appUpdate.copy(
+                                downloadedBytes = downloaded,
+                                totalBytes = total,
+                                speedBytesPerSec = speed
+                            )
+                        )
+                    }
+                }
+
+                res.fold(
+                    onSuccess = { apkFile ->
+                        _uiState.update { st ->
+                            st.copy(
+                                appUpdate = st.appUpdate.copy(
+                                    isDownloading = false,
+                                    downloadedBytes = apkFile.length(),
+                                    totalBytes = apkFile.length(),
+                                    speedBytesPerSec = 0L,
+                                    readyApkPath = apkFile.absolutePath,
+                                    errorMessage = null
+                                )
+                            )
+                        }
+                        refreshStorageInfo()
+                        _events.trySend(StudioUiEvent.RequestInstallApk(apkFile))
+                    },
+                    onFailure = { err ->
+                        val msg = err.message ?: "下载更新包失败"
+                        _uiState.update { st ->
+                            st.copy(
+                                appUpdate = st.appUpdate.copy(
+                                    isDownloading = false,
+                                    speedBytesPerSec = 0L,
+                                    errorMessage = "$msg（可尝试切换下载通道或用浏览器打开）"
+                                )
+                            )
+                        }
+                        refreshStorageInfo()
+                    }
+                )
+            } catch (_: CancellationException) {
+                _uiState.update { st ->
+                    st.copy(
+                        appUpdate = st.appUpdate.copy(
+                            isDownloading = false,
+                            speedBytesPerSec = 0L
+                        )
+                    )
+                }
+                refreshStorageInfo()
+                sendMessage("已暂停下载（保留已下载进度）")
+            }
+        }
+    }
+
+    fun cancelAppUpdateDownload() {
+        updateDownloadJob?.cancel()
+        updateDownloadJob = null
+    }
+
+    fun openGithubReleaseInBrowser() {
+        val url = _uiState.value.appUpdate.latestRelease?.htmlReleaseUrl
+            ?: AppUpdateManager.RELEASES_HOME_URL
+        _events.trySend(StudioUiEvent.OpenExternalUrl(url))
+    }
+
     override fun onCleared() {
         super.onCleared()
+        updateCheckJob?.cancel()
+        updateDownloadJob?.cancel()
         runCatching { arrangerPlayer.release() }
         runCatching { exoPlayer.release() }
     }
