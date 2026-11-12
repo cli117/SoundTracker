@@ -268,6 +268,177 @@ float estimateTempoBpm(const PlanarAudioBuffer& buf) {
     return static_cast<float>(std::clamp(std::round(bestBpm), 45.0, 220.0));
 }
 
+void estimateMusicalKey(
+    const PlanarAudioBuffer& buf,
+    int& outFifths,
+    bool& outMinor,
+    float& outConfidence
+) {
+    outFifths = 0;
+    outMinor = false;
+    outConfidence = 0.0f;
+
+    const int sr = buf.sampleRate;
+    const int nCh = buf.numChannels();
+    const size_t totalFrames = buf.numFrames();
+    if (sr <= 0 || nCh <= 0 || totalFrames < static_cast<size_t>(sr)) {
+        return;
+    }
+
+    constexpr size_t kNfft = 4096;
+    constexpr size_t kHop = 2048;
+    constexpr size_t kHalf = kNfft / 2;
+    if (totalFrames < kNfft) {
+        return;
+    }
+
+    const size_t maxWindow = static_cast<size_t>(sr) * 60;
+    size_t startFrame = 0;
+    size_t analysisFrames = totalFrames;
+    if (totalFrames > maxWindow) {
+        startFrame = (totalFrames - maxWindow) / 2;
+        analysisFrames = maxWindow;
+    }
+
+    const size_t nFramesStft = (analysisFrames - kNfft) / kHop + 1;
+    if (nFramesStft < 4) {
+        return;
+    }
+
+    std::vector<float> hannWin(kNfft);
+    for (size_t i = 0; i < kNfft; ++i) {
+        hannWin[i] = 0.5f - 0.5f * std::cos(static_cast<float>(2.0 * M_PI * i / kNfft));
+    }
+
+    signalsmith::linear::RealFFT<float> fft(kNfft);
+    std::vector<float> timeFrame(kNfft);
+    std::vector<std::complex<float>> spec(kHalf);
+    std::vector<float> mag(kHalf, 0.0f);
+
+    const int kMin = std::max(2, static_cast<int>(std::ceil(65.0 * kNfft / sr)));
+    const int kMax = std::min(static_cast<int>(kHalf) - 2, static_cast<int>(std::floor(2000.0 * kNfft / sr)));
+    if (kMax <= kMin + 4) {
+        return;
+    }
+
+    double chroma[12] = {0.0};
+    const float invCh = 1.0f / static_cast<float>(nCh);
+    const size_t frameStride = std::max<size_t>(1, nFramesStft / 600);
+
+    for (size_t t = 0; t < nFramesStft; t += frameStride) {
+        const size_t base = startFrame + t * kHop;
+        double frameEnergy = 0.0;
+        for (size_t i = 0; i < kNfft; ++i) {
+            float mono = 0.0f;
+            for (int c = 0; c < nCh; ++c) {
+                mono += buf.channels[c][base + i];
+            }
+            const float v = mono * invCh;
+            frameEnergy += static_cast<double>(v) * static_cast<double>(v);
+            timeFrame[i] = v * hannWin[i];
+        }
+        if (frameEnergy < 1e-7 * static_cast<double>(kNfft)) {
+            continue;
+        }
+
+        fft.fft(timeFrame.data(), spec.data());
+        for (int k = kMin - 1; k <= kMax + 1; ++k) {
+            mag[k] = std::abs(spec[k]);
+        }
+
+        // Accumulate local harmonic spectral peaks into 12-bin HPCP chroma
+        for (int k = kMin; k <= kMax; ++k) {
+            const float mCur = mag[k];
+            const float mPrev = mag[k - 1];
+            const float mNext = mag[k + 1];
+            if (mCur <= 1e-5f || mCur <= mPrev || mCur < mNext) {
+                continue;
+            }
+            const float denom = mPrev - 2.0f * mCur + mNext;
+            float delta = 0.0f;
+            if (std::abs(denom) > 1e-9f) {
+                delta = std::clamp(0.5f * (mPrev - mNext) / denom, -0.5f, 0.5f);
+            }
+            const double freq = (static_cast<double>(k) + static_cast<double>(delta)) *
+                static_cast<double>(sr) / static_cast<double>(kNfft);
+            if (freq < 60.0 || freq > 2100.0) continue;
+
+            const double midiF = 69.0 + 12.0 * std::log2(freq / 440.0);
+            const int nearestMidi = static_cast<int>(std::round(midiF));
+            const double centsDev = std::abs(midiF - static_cast<double>(nearestMidi));
+            const double tuneWeight = std::exp(-4.5 * centsDev * centsDev);
+            const double octWeight = (freq < 600.0) ? 1.0 : (600.0 / freq);
+            const int pc = ((nearestMidi % 12) + 12) % 12;
+            chroma[pc] += std::log1p(24.0 * static_cast<double>(mCur)) * tuneWeight * octWeight;
+        }
+    }
+
+    double chromaMean = 0.0;
+    for (int i = 0; i < 12; ++i) chromaMean += chroma[i];
+    chromaMean /= 12.0;
+
+    double chromaVar = 0.0;
+    for (int i = 0; i < 12; ++i) {
+        const double d = chroma[i] - chromaMean;
+        chromaVar += d * d;
+    }
+    if (chromaVar <= 1e-12) {
+        return;
+    }
+
+    // Krumhansl-Kessler Major & Minor key profiles
+    static constexpr double kMajorProfile[12] = {
+        6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88
+    };
+    static constexpr double kMinorProfile[12] = {
+        6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17
+    };
+    static constexpr int kMajorTonicToFifths[12] = {
+        0, -5, 2, -3, 4, -1, 6, 1, -4, 3, -2, 5
+    };
+    static constexpr int kMinorTonicToFifths[12] = {
+        -3, 4, -1, -6, 1, -4, 3, -2, 5, 0, -5, 2
+    };
+
+    auto corrWithProfile = [&](const double prof[12], int tonicPc) -> double {
+        double pMean = 0.0;
+        for (int i = 0; i < 12; ++i) pMean += prof[i];
+        pMean /= 12.0;
+        double num = 0.0;
+        double pVar = 0.0;
+        for (int i = 0; i < 12; ++i) {
+            const double dc = chroma[(tonicPc + i) % 12] - chromaMean;
+            const double dp = prof[i] - pMean;
+            num += dc * dp;
+            pVar += dp * dp;
+        }
+        return num / std::sqrt(chromaVar * pVar);
+    };
+
+    double bestCorr = -2.0;
+    int bestTonic = 0;
+    bool bestIsMinor = false;
+
+    for (int pc = 0; pc < 12; ++pc) {
+        const double rMaj = corrWithProfile(kMajorProfile, pc);
+        if (rMaj > bestCorr) {
+            bestCorr = rMaj;
+            bestTonic = pc;
+            bestIsMinor = false;
+        }
+        const double rMin = corrWithProfile(kMinorProfile, pc);
+        if (rMin > bestCorr) {
+            bestCorr = rMin;
+            bestTonic = pc;
+            bestIsMinor = true;
+        }
+    }
+
+    outFifths = bestIsMinor ? kMinorTonicToFifths[bestTonic] : kMajorTonicToFifths[bestTonic];
+    outMinor = bestIsMinor;
+    outConfidence = static_cast<float>(std::clamp(bestCorr, 0.0, 1.0));
+}
+
 } // namespace
 
 AudioAnalysis analyzeAudio(const PlanarAudioBuffer& buf, int numWaveformBins) {
@@ -376,6 +547,7 @@ AudioAnalysis analyzeAudio(const PlanarAudioBuffer& buf, int numWaveformBins) {
     // Waveform visual envelope bins & automatic BPM detection (only when full track analysis is requested)
     if (numWaveformBins > 0) {
         res.detectedBpm = estimateTempoBpm(buf);
+        estimateMusicalKey(buf, res.detectedKeyFifths, res.detectedKeyMinor, res.detectedKeyConfidence);
         res.waveformPeaks.assign(numWaveformBins, 0.0f);
         for (int b = 0; b < numWaveformBins; ++b) {
             size_t s = (static_cast<size_t>(b) * nFrames) / numWaveformBins;

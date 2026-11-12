@@ -22,6 +22,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.soundtracker.app.audio.AudioCodecHelper
+import com.soundtracker.app.ui.MelodyStudioScreen
 import com.soundtracker.app.ui.MultiTrackArrangerScreen
 import com.soundtracker.app.ui.StudioScreen
 import com.soundtracker.app.ui.StudioUiEvent
@@ -56,6 +57,8 @@ class MainActivity : ComponentActivity() {
                 val uiState by viewModel.uiState.collectAsStateWithLifecycle()
                 val snackbarHostState = remember { SnackbarHostState() }
                 var pendingCustomSaveTrackId by remember { mutableStateOf<String?>(null) }
+                var pendingPdfCustomSaveTitle by remember { mutableStateOf<String?>(null) }
+                var pendingMelodyProjectSaveSpec by remember { mutableStateOf<Pair<String?, String?>?>(null) }
                 var pendingInstallApkFile by remember { mutableStateOf<File?>(null) }
 
                 val launchApkInstaller: (File) -> Unit = { apkFile ->
@@ -108,6 +111,41 @@ class MainActivity : ComponentActivity() {
                     pendingCustomSaveTrackId = null
                     if (targetUri != null && trackId != null) {
                         viewModel.saveTrackToCustomUri(trackId, targetUri)
+                    }
+                }
+
+                // SAF "Save PDF Sheet Music As" custom folder/file picker
+                val createPdfDocumentLauncher = rememberLauncherForActivityResult(
+                    contract = ActivityResultContracts.CreateDocument("application/pdf")
+                ) { targetUri: Uri? ->
+                    val pdfTitle = pendingPdfCustomSaveTitle
+                    pendingPdfCustomSaveTitle = null
+                    if (targetUri != null && pdfTitle != null) {
+                        viewModel.saveMelodyScorePdfToCustomUri(pdfTitle, targetUri)
+                    }
+                }
+
+                // SAF "Save Melody Score Project (.stscore.json)" custom folder/file picker
+                val createMelodyProjectLauncher = rememberLauncherForActivityResult(
+                    contract = ActivityResultContracts.CreateDocument("application/json")
+                ) { targetUri: Uri? ->
+                    val spec = pendingMelodyProjectSaveSpec
+                    pendingMelodyProjectSaveSpec = null
+                    if (targetUri != null && spec != null) {
+                        viewModel.saveMelodyProjectFileToCustomUri(
+                            projectId = spec.first,
+                            customTitle = spec.second,
+                            targetUri = targetUri
+                        )
+                    }
+                }
+
+                // SAF "Import Melody Score Project (.json)" picker
+                val openMelodyProjectLauncher = rememberLauncherForActivityResult(
+                    contract = ActivityResultContracts.OpenDocument()
+                ) { srcUri: Uri? ->
+                    if (srcUri != null) {
+                        viewModel.importMelodyProjectFromUri(srcUri)
                     }
                 }
 
@@ -232,6 +270,115 @@ class MainActivity : ComponentActivity() {
                     onStartOrInstallUpdate = viewModel::startOrInstallAppUpdate,
                     onCancelUpdateDownload = viewModel::cancelAppUpdateDownload,
                     onOpenReleaseBrowser = viewModel::openGithubReleaseInBrowser,
+                    melodyContent = { bottomPadding ->
+                        MelodyStudioScreen(
+                            melody = uiState.melody,
+                            referenceTrackBpm = uiState.sourceBpm.takeIf { uiState.tracks.isNotEmpty() },
+                            referenceTrackKeySignature = uiState.referenceTrackKeySignature,
+                            referenceTrackName = uiState.selectedTrack?.displayName,
+                            onScoreTitleChange = viewModel::setMelodyScoreTitle,
+                            onUndo = viewModel::undoMelody,
+                            onRedo = viewModel::redoMelody,
+                            onClearScore = viewModel::clearMelodyScore,
+                            onLoadDemoMelody = viewModel::loadMelodyDemoShowcase,
+                            onExportMelodyToWorkspace = viewModel::exportMelodyToWorkspace,
+                            onShareStaffPdfWeChat = { title ->
+                                viewModel.shareMelodyScorePdf(title, targetWeChatDirectly = true)
+                            },
+                            onShareStaffPdfSystem = { title ->
+                                viewModel.shareMelodyScorePdf(title, targetWeChatDirectly = false)
+                            },
+                            onSaveStaffPdfDownloads = viewModel::saveMelodyScorePdfToDownloads,
+                            onSaveStaffPdfCustomFolder = { title ->
+                                val clean = title.trim().ifBlank { "未命名乐谱" }
+                                pendingPdfCustomSaveTitle = clean
+                                val suggested = "${AudioCodecHelper.sanitizeFileName(clean)}.pdf"
+                                createPdfDocumentLauncher.launch(suggested)
+                            },
+                            onSelectPrimaryInstrument = viewModel::selectPrimaryMelodyInstrument,
+                            onSelectSecondaryInstrument = viewModel::selectSecondaryMelodyInstrument,
+                            onToggleDualKeyboard = viewModel::toggleDualKeyboard,
+                            onToggleCollapseScoreInDual = viewModel::toggleCollapseScoreInDual,
+                            onSetCollapseScoreInDual = viewModel::setCollapseScoreInDual,
+                            onPrimaryScrollChange = viewModel::setPrimaryKeyboardScroll,
+                            onSecondaryScrollChange = viewModel::setSecondaryKeyboardScroll,
+                            onTimeSignatureChange = viewModel::setMelodyTimeSignature,
+                            onInitialKeySignatureChange = viewModel::setMelodyInitialKeySignature,
+                            onUpsertKeySignatureEvent = viewModel::upsertMelodyKeySignatureEvent,
+                            onDeleteKeySignatureEvent = viewModel::deleteMelodyKeySignatureEvent,
+                            onBpmChange = viewModel::setMelodyBpm,
+                            onSwingPresetChange = viewModel::setMelodySwingPreset,
+                            onCycleReverb = viewModel::cycleMelodyReverb,
+                            onTogglePrimarySustain = viewModel::togglePrimaryMelodySustain,
+                            onToggleSecondarySustain = viewModel::toggleSecondaryMelodySustain,
+                            onPrimarySustainDurationChange = viewModel::setPrimaryMelodySustainDuration,
+                            onSecondarySustainDurationChange = viewModel::setSecondaryMelodySustainDuration,
+                            onSelectInputMode = viewModel::setMelodyInputMode,
+                            onSelectNoteDuration = viewModel::setMelodyNoteDuration,
+                            onSelectActiveTuplet = viewModel::setMelodyActiveTuplet,
+                            onToggleChordMode = viewModel::toggleMelodyChordMode,
+                            onInsertRest = viewModel::insertMelodyRest,
+                            onExtendPreviousNote = viewModel::extendPreviousMelodyNote,
+                            onBackspaceNote = viewModel::backspaceMelodyNote,
+                            onDeleteSelectedItem = viewModel::deleteSelectedMelodyItem,
+                            onQuantizeNotes = viewModel::quantizeMelodyNotes,
+                            onAddBars = viewModel::addMelodyBars,
+                            onToggleMetronome = viewModel::toggleMelodyMetronome,
+                            onToggleLoop = viewModel::toggleMelodyLoop,
+                            onTogglePlayStop = viewModel::toggleMelodyPlayStop,
+                            onToggleRecordStop = viewModel::toggleMelodyRecordStop,
+                            onTapCursorTick = viewModel::setMelodyCursorTick,
+                            onSelectNote = viewModel::selectMelodyNote,
+                            onSelectAnnotation = viewModel::selectMelodyAnnotation,
+                            onTogglePhraseSlurMode = viewModel::toggleMelodyPhraseSlurMode,
+                            onSlurSelectedOrExtendNext = viewModel::slurSelectedOrExtendNext,
+                            onApplySlurSpan = viewModel::applyMelodySlurSpan,
+                            onClearSelectedSlur = { viewModel.clearSelectedMelodySlur() },
+                            onToggleArticulation = viewModel::toggleMelodyArticulation,
+                            onToggleAccent = viewModel::toggleMelodyAccent,
+                            onToggleFermata = viewModel::toggleMelodyFermata,
+                            onUpsertDynamicMark = viewModel::upsertMelodyDynamicMark,
+                            onDeleteDynamicMark = viewModel::deleteMelodyDynamicMark,
+                            onUpsertHairpin = viewModel::upsertMelodyHairpin,
+                            onDeleteHairpin = viewModel::deleteMelodyHairpin,
+                            onUpsertTempoEvent = viewModel::upsertMelodyTempoEvent,
+                            onDeleteTempoEvent = viewModel::deleteMelodyTempoEvent,
+                            onNewBlankProject = viewModel::createNewBlankMelodyProject,
+                            onSaveProject = viewModel::saveCurrentMelodyProject,
+                            onLoadProject = viewModel::loadMelodyProject,
+                            onRestoreAutoSaveDraft = viewModel::restoreMelodyAutoSaveDraft,
+                            onRenameProject = viewModel::renameMelodyProject,
+                            onDeleteProject = viewModel::deleteMelodyProject,
+                            onShareProjectWeChat = { projectId, customTitle ->
+                                viewModel.shareMelodyProjectFile(
+                                    projectId = projectId,
+                                    customTitle = customTitle,
+                                    targetWeChatDirectly = true
+                                )
+                            },
+                            onShareProjectSystem = { projectId, customTitle ->
+                                viewModel.shareMelodyProjectFile(
+                                    projectId = projectId,
+                                    customTitle = customTitle,
+                                    targetWeChatDirectly = false
+                                )
+                            },
+                            onSaveProjectDownloads = viewModel::saveMelodyProjectFileToDownloads,
+                            onSaveProjectCustomFolder = { projectId, customTitle ->
+                                val clean = (customTitle ?: uiState.melody.scoreTitle).trim().ifBlank { "未命名乐谱" }
+                                pendingMelodyProjectSaveSpec = projectId to clean
+                                val suggested = "${AudioCodecHelper.sanitizeFileName(clean)}.stscore.json"
+                                createMelodyProjectLauncher.launch(suggested)
+                            },
+                            onImportProjectClick = {
+                                openMelodyProjectLauncher.launch(arrayOf("application/json", "text/plain", "*/*"))
+                            },
+                            onTouchGuardConfigChange = viewModel::setMelodyTouchGuardConfig,
+                            onPianoKeyDown = viewModel::onMelodyPianoKeyDown,
+                            onPianoKeyUp = viewModel::onMelodyPianoKeyUp,
+                            modifier = Modifier.padding(bottom = bottomPadding)
+                        )
+                    },
                     arrangerContent = { bottomPadding, openNetEaseSheet ->
                         MultiTrackArrangerScreen(
                             arranger = uiState.arranger,
@@ -289,18 +436,37 @@ class MainActivity : ComponentActivity() {
         handleIncomingAudioIntent(intent)
     }
 
+    override fun onStart() {
+        super.onStart()
+        viewModel.onAppForegrounded()
+    }
+
     override fun onStop() {
         super.onStop()
+        viewModel.onAppBackgrounded()
         if (!isChangingConfigurations) {
             viewModel.pausePlayback()
         }
+    }
+
+    private fun isMelodyScoreProjectUri(uri: Uri, intentType: String?): Boolean {
+        val raw = uri.toString().lowercase()
+        if (raw.endsWith(".stscore.json") || raw.endsWith(".json")) return true
+        if (intentType?.lowercase() == "application/json") return true
+        return false
     }
 
     private fun handleIncomingAudioIntent(intent: Intent?) {
         if (intent == null) return
         when (intent.action) {
             Intent.ACTION_VIEW -> {
-                intent.data?.let { uri -> viewModel.importAudioUri(uri) }
+                intent.data?.let { uri ->
+                    if (isMelodyScoreProjectUri(uri, intent.type)) {
+                        viewModel.importMelodyProjectFromUri(uri)
+                    } else {
+                        viewModel.importAudioUri(uri)
+                    }
+                }
             }
             Intent.ACTION_SEND -> {
                 val streamUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -309,7 +475,13 @@ class MainActivity : ComponentActivity() {
                     @Suppress("DEPRECATION")
                     intent.getParcelableExtra(Intent.EXTRA_STREAM)
                 }
-                streamUri?.let { uri -> viewModel.importAudioUri(uri) }
+                streamUri?.let { uri ->
+                    if (isMelodyScoreProjectUri(uri, intent.type)) {
+                        viewModel.importMelodyProjectFromUri(uri)
+                    } else {
+                        viewModel.importAudioUri(uri)
+                    }
+                }
             }
         }
     }

@@ -14,8 +14,8 @@ android {
         applicationId = "com.soundtracker.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 100
-        versionName = "1.0.0"
+        versionCode = 110
+        versionName = "1.1.0"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a")
@@ -60,7 +60,7 @@ android {
     }
 
     androidResources {
-        noCompress += listOf("onnx")
+        noCompress += listOf("onnx", "sf2")
     }
 
     externalNativeBuild {

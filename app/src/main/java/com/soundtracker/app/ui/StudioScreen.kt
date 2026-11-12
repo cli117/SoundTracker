@@ -27,6 +27,7 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -67,6 +68,7 @@ import androidx.compose.material.icons.rounded.LibraryMusic
 import androidx.compose.material.icons.rounded.MusicNote
 import androidx.compose.material.icons.rounded.OpenInBrowser
 import androidx.compose.material.icons.rounded.Pause
+import androidx.compose.material.icons.rounded.Piano
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.RadioButtonUnchecked
 import androidx.compose.material.icons.rounded.Refresh
@@ -221,6 +223,7 @@ fun StudioScreen(
     onStartOrInstallUpdate: () -> Unit,
     onCancelUpdateDownload: () -> Unit,
     onOpenReleaseBrowser: () -> Unit,
+    melodyContent: @Composable (bottomPadding: Dp) -> Unit,
     arrangerContent: @Composable (bottomPadding: Dp, onOpenNetEaseSheet: () -> Unit) -> Unit
 ) {
     var renameTargetTrack by remember { mutableStateOf<SessionTrack?>(null) }
@@ -229,7 +232,7 @@ fun StudioScreen(
     var showNetEaseSheet by rememberSaveable { mutableStateOf(false) }
     var showUpdateSheet by rememberSaveable { mutableStateOf(false) }
 
-    BackHandler(enabled = uiState.workspaceMode == AppWorkspaceMode.MULTI_TRACK_ARRANGER) {
+    BackHandler(enabled = uiState.workspaceMode != AppWorkspaceMode.SINGLE_TRACK) {
         onWorkspaceModeChange(AppWorkspaceMode.SINGLE_TRACK)
     }
 
@@ -266,138 +269,301 @@ fun StudioScreen(
             bottomBar = {
                 StudioWorkspaceBottomBar(
                     currentMode = uiState.workspaceMode,
+                    melodyNoteCount = uiState.melody.notes.size,
                     arrangerClipCount = uiState.arranger.totalClipCount,
                     onSelectMode = onWorkspaceModeChange
                 )
             }
         ) { innerPadding ->
-            if (uiState.workspaceMode == AppWorkspaceMode.MULTI_TRACK_ARRANGER) {
-                arrangerContent(innerPadding.calculateBottomPadding()) {
-                    onScanNetEaseClick()
-                    showNetEaseSheet = true
-                }
-            } else {
-                val activeTrack = uiState.selectedTrack
-
-                LazyColumn(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(innerPadding),
-                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
-                    verticalArrangement = Arrangement.spacedBy(14.dp)
-                ) {
-                    if (activeTrack == null) {
-                        item {
-                            EmptyStudioHeroCard(
-                                onNetEaseImportClick = {
-                                    onScanNetEaseClick()
-                                    showNetEaseSheet = true
-                                },
-                                onImportClick = onPickAudioClick,
-                                onOpenArrangerClick = {
-                                    onWorkspaceModeChange(AppWorkspaceMode.MULTI_TRACK_ARRANGER)
-                                }
-                            )
-                        }
-                    } else {
-                        // 1. Active Waveform Player + A/B Audition + Delivery Actions
-                        item {
-                            ActiveTrackDeckCard(
-                                track = activeTrack,
-                                hasOriginForAb = uiState.originComparisonTrack != null,
-                                isComparingOriginal = uiState.isComparingOriginal,
-                                livePreviewBadgeText = uiState.livePreviewSummaryLabel,
-                                isPlaying = uiState.isPlaying,
-                                positionMs = uiState.playbackPositionMs,
-                                durationMs = uiState.playbackDurationMs.takeIf { it > 0 }
-                                    ?: (activeTrack.metrics.durationSec * 1000f).toLong(),
-                                exportFormat = uiState.exportFormat,
-                                onExportFormatChange = onExportFormatChange,
-                                onTogglePlayPause = onTogglePlayPause,
-                                onSeekFraction = onSeekFraction,
-                                onSkipMs = onSkipMs,
-                                onToggleAbCompare = onToggleAbCompare,
-                                onRenameClick = { renameTargetTrack = activeTrack },
-                                onSendToArrangerClick = { onSendTrackToArranger(activeTrack.id) },
-                                onShareWeChatClick = { onShareWeChat(activeTrack.id) },
-                                onShareMoreClick = { onShareSystemMore(activeTrack.id) },
-                                onSaveAsClick = { saveTargetTrack = activeTrack }
-                            )
-                        }
-
-                        // 2. Three Studio DSP Modules
-                        item {
-                            StudioDspWorkbenchCard(
-                                uiState = uiState,
-                                activeTrack = activeTrack,
-                                onSelectTab = onSelectTab,
-                                onTogglePlayPause = onTogglePlayPause,
-                                onVocalEngineModeChange = onVocalEngineModeChange,
-                                onEnableDeepDenoiseChange = onEnableDeepDenoiseChange,
-                                onKeepVocalChange = onKeepVocalChange,
-                                onRunVocalSeparation = onRunVocalSeparation,
-                                onPitchSemitonesChange = onPitchSemitonesChange,
-                                onPitchCentsChange = onPitchCentsChange,
-                                onTargetBpmChange = onTargetBpmChange,
-                                onAdjustTargetBpmBy = onAdjustTargetBpmBy,
-                                onCalibrateSourceBpm = onCalibrateSourceBpm,
-                                onPreserveTimbreChange = onPreserveTimbreChange,
-                                onLivePitchPreviewChange = onLivePitchPreviewChange,
-                                onRunPitchShift = onRunPitchShift,
-                                onVolumeGainChange = onVolumeGainChange,
-                                onLiveVolumePreviewChange = onLiveVolumePreviewChange,
-                                onRunVolumeBoost = onRunVolumeBoost
-                            )
-                        }
+            when (uiState.workspaceMode) {
+                AppWorkspaceMode.MULTI_TRACK_ARRANGER -> {
+                    arrangerContent(innerPadding.calculateBottomPadding()) {
+                        onScanNetEaseClick()
+                        showNetEaseSheet = true
                     }
+                }
+                AppWorkspaceMode.MELODY_STUDIO -> {
+                    melodyContent(innerPadding.calculateBottomPadding())
+                }
+                AppWorkspaceMode.SINGLE_TRACK -> {
+                    val activeTrack = uiState.selectedTrack
 
-                    // 3. Persistent Workspace Track Tray
-                    if (uiState.tracks.isNotEmpty()) {
-                        item {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(top = 4.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
+                    BoxWithConstraints(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(innerPadding)
+                    ) {
+                        val isWideTablet = maxWidth >= 840.dp && maxHeight >= 500.dp
+                        val isMediumTablet = maxWidth >= 600.dp && !isWideTablet
+
+                        if (isWideTablet && activeTrack != null) {
+                            // Two-Pane Studio Workbench for Wide Android Tablets (Landscape / Large Foldable):
+                            // Left Pane: Active Track Player + Workspace Track Tray
+                            // Right Pane: Studio DSP Workbench (Vocal Separation / Pitch & Tempo / Maximizer)
+                            Box(
+                                modifier = Modifier.fillMaxSize(),
+                                contentAlignment = Alignment.TopCenter
                             ) {
-                                Column {
-                                    Text(
-                                        text = "工作台音轨 (${uiState.tracks.size})",
-                                        style = MaterialTheme.typography.titleMedium,
-                                        color = TextPrimary
-                                    )
-                                    Text(
-                                        text = "点音轨试听处理 · 点剪刀图标可直接送入多轨剪辑",
-                                        fontSize = 11.sp,
-                                        color = TextMuted
-                                    )
+                                Row(
+                                    modifier = Modifier
+                                        .widthIn(max = 1360.dp)
+                                        .fillMaxSize()
+                                        .padding(horizontal = 20.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(18.dp)
+                                ) {
+                                    LazyColumn(
+                                        modifier = Modifier
+                                            .weight(0.46f)
+                                            .fillMaxHeight(),
+                                        contentPadding = PaddingValues(vertical = 14.dp),
+                                        verticalArrangement = Arrangement.spacedBy(14.dp)
+                                    ) {
+                                        item {
+                                            ActiveTrackDeckCard(
+                                                track = activeTrack,
+                                                hasOriginForAb = uiState.originComparisonTrack != null,
+                                                isComparingOriginal = uiState.isComparingOriginal,
+                                                livePreviewBadgeText = uiState.livePreviewSummaryLabel,
+                                                isPlaying = uiState.isPlaying,
+                                                positionMs = uiState.playbackPositionMs,
+                                                durationMs = uiState.playbackDurationMs.takeIf { it > 0 }
+                                                    ?: (activeTrack.metrics.durationSec * 1000f).toLong(),
+                                                exportFormat = uiState.exportFormat,
+                                                onExportFormatChange = onExportFormatChange,
+                                                onTogglePlayPause = onTogglePlayPause,
+                                                onSeekFraction = onSeekFraction,
+                                                onSkipMs = onSkipMs,
+                                                onToggleAbCompare = onToggleAbCompare,
+                                                onRenameClick = { renameTargetTrack = activeTrack },
+                                                onSendToArrangerClick = { onSendTrackToArranger(activeTrack.id) },
+                                                onShareWeChatClick = { onShareWeChat(activeTrack.id) },
+                                                onShareMoreClick = { onShareSystemMore(activeTrack.id) },
+                                                onSaveAsClick = { saveTargetTrack = activeTrack }
+                                            )
+                                        }
+
+                                        if (uiState.tracks.isNotEmpty()) {
+                                            item {
+                                                Row(
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .padding(top = 4.dp),
+                                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                                    verticalAlignment = Alignment.CenterVertically
+                                                ) {
+                                                    Column {
+                                                        Text(
+                                                            text = "工作台音轨 (${uiState.tracks.size})",
+                                                            style = MaterialTheme.typography.titleMedium,
+                                                            color = TextPrimary
+                                                        )
+                                                        Text(
+                                                            text = "点音轨试听处理 · 点剪刀图标可直接送入多轨剪辑",
+                                                            fontSize = 11.sp,
+                                                            color = TextMuted
+                                                        )
+                                                    }
+                                                    TextButton(onClick = {
+                                                        onRefreshStorage()
+                                                        showStorageSheet = true
+                                                    }) {
+                                                        Text("资源管理", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = CyanPrimary)
+                                                    }
+                                                }
+                                            }
+
+                                            items(items = uiState.tracks, key = { it.id }) { item ->
+                                                SessionTrackItemCard(
+                                                    track = item,
+                                                    isSelected = item.id == activeTrack.id,
+                                                    onClick = { onSelectTrack(item.id) },
+                                                    onSendToArrangerClick = { onSendTrackToArranger(item.id) },
+                                                    onRenameClick = { renameTargetTrack = item },
+                                                    onShareWeChatClick = { onShareWeChat(item.id) },
+                                                    onSaveAsClick = { saveTargetTrack = item },
+                                                    onDeleteClick = { onDeleteTrack(item.id) }
+                                                )
+                                            }
+                                        }
+
+                                        item {
+                                            Spacer(modifier = Modifier.height(16.dp))
+                                        }
+                                    }
+
+                                    LazyColumn(
+                                        modifier = Modifier
+                                            .weight(0.54f)
+                                            .fillMaxHeight(),
+                                        contentPadding = PaddingValues(vertical = 14.dp),
+                                        verticalArrangement = Arrangement.spacedBy(14.dp)
+                                    ) {
+                                        item {
+                                            StudioDspWorkbenchCard(
+                                                uiState = uiState,
+                                                activeTrack = activeTrack,
+                                                onSelectTab = onSelectTab,
+                                                onTogglePlayPause = onTogglePlayPause,
+                                                onVocalEngineModeChange = onVocalEngineModeChange,
+                                                onEnableDeepDenoiseChange = onEnableDeepDenoiseChange,
+                                                onKeepVocalChange = onKeepVocalChange,
+                                                onRunVocalSeparation = onRunVocalSeparation,
+                                                onPitchSemitonesChange = onPitchSemitonesChange,
+                                                onPitchCentsChange = onPitchCentsChange,
+                                                onTargetBpmChange = onTargetBpmChange,
+                                                onAdjustTargetBpmBy = onAdjustTargetBpmBy,
+                                                onCalibrateSourceBpm = onCalibrateSourceBpm,
+                                                onPreserveTimbreChange = onPreserveTimbreChange,
+                                                onLivePitchPreviewChange = onLivePitchPreviewChange,
+                                                onRunPitchShift = onRunPitchShift,
+                                                onVolumeGainChange = onVolumeGainChange,
+                                                onLiveVolumePreviewChange = onLiveVolumePreviewChange,
+                                                onRunVolumeBoost = onRunVolumeBoost
+                                            )
+                                        }
+
+                                        item {
+                                            Spacer(modifier = Modifier.height(16.dp))
+                                        }
+                                    }
                                 }
-                                TextButton(onClick = {
-                                    onRefreshStorage()
-                                    showStorageSheet = true
-                                }) {
-                                    Text("资源管理", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = CyanPrimary)
+                            }
+                        } else {
+                            // Single-column layout for Phones, Portrait Tablets, or Empty Hero State on Tablets
+                            val columnMaxW = when {
+                                isWideTablet -> 680.dp
+                                isMediumTablet -> 700.dp
+                                else -> Dp.Unspecified
+                            }
+                            Box(
+                                modifier = Modifier.fillMaxSize(),
+                                contentAlignment = Alignment.TopCenter
+                            ) {
+                                LazyColumn(
+                                    modifier = (if (columnMaxW != Dp.Unspecified) Modifier.widthIn(max = columnMaxW) else Modifier)
+                                        .fillMaxSize(),
+                                    contentPadding = PaddingValues(
+                                        horizontal = if (isWideTablet || isMediumTablet) 20.dp else 16.dp,
+                                        vertical = 12.dp
+                                    ),
+                                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                                ) {
+                                    if (activeTrack == null) {
+                                        item {
+                                            EmptyStudioHeroCard(
+                                                onNetEaseImportClick = {
+                                                    onScanNetEaseClick()
+                                                    showNetEaseSheet = true
+                                                },
+                                                onImportClick = onPickAudioClick,
+                                                onOpenMelodyClick = {
+                                                    onWorkspaceModeChange(AppWorkspaceMode.MELODY_STUDIO)
+                                                },
+                                                onOpenArrangerClick = {
+                                                    onWorkspaceModeChange(AppWorkspaceMode.MULTI_TRACK_ARRANGER)
+                                                }
+                                            )
+                                        }
+                                    } else {
+                                        item {
+                                            ActiveTrackDeckCard(
+                                                track = activeTrack,
+                                                hasOriginForAb = uiState.originComparisonTrack != null,
+                                                isComparingOriginal = uiState.isComparingOriginal,
+                                                livePreviewBadgeText = uiState.livePreviewSummaryLabel,
+                                                isPlaying = uiState.isPlaying,
+                                                positionMs = uiState.playbackPositionMs,
+                                                durationMs = uiState.playbackDurationMs.takeIf { it > 0 }
+                                                    ?: (activeTrack.metrics.durationSec * 1000f).toLong(),
+                                                exportFormat = uiState.exportFormat,
+                                                onExportFormatChange = onExportFormatChange,
+                                                onTogglePlayPause = onTogglePlayPause,
+                                                onSeekFraction = onSeekFraction,
+                                                onSkipMs = onSkipMs,
+                                                onToggleAbCompare = onToggleAbCompare,
+                                                onRenameClick = { renameTargetTrack = activeTrack },
+                                                onSendToArrangerClick = { onSendTrackToArranger(activeTrack.id) },
+                                                onShareWeChatClick = { onShareWeChat(activeTrack.id) },
+                                                onShareMoreClick = { onShareSystemMore(activeTrack.id) },
+                                                onSaveAsClick = { saveTargetTrack = activeTrack }
+                                            )
+                                        }
+
+                                        item {
+                                            StudioDspWorkbenchCard(
+                                                uiState = uiState,
+                                                activeTrack = activeTrack,
+                                                onSelectTab = onSelectTab,
+                                                onTogglePlayPause = onTogglePlayPause,
+                                                onVocalEngineModeChange = onVocalEngineModeChange,
+                                                onEnableDeepDenoiseChange = onEnableDeepDenoiseChange,
+                                                onKeepVocalChange = onKeepVocalChange,
+                                                onRunVocalSeparation = onRunVocalSeparation,
+                                                onPitchSemitonesChange = onPitchSemitonesChange,
+                                                onPitchCentsChange = onPitchCentsChange,
+                                                onTargetBpmChange = onTargetBpmChange,
+                                                onAdjustTargetBpmBy = onAdjustTargetBpmBy,
+                                                onCalibrateSourceBpm = onCalibrateSourceBpm,
+                                                onPreserveTimbreChange = onPreserveTimbreChange,
+                                                onLivePitchPreviewChange = onLivePitchPreviewChange,
+                                                onRunPitchShift = onRunPitchShift,
+                                                onVolumeGainChange = onVolumeGainChange,
+                                                onLiveVolumePreviewChange = onLiveVolumePreviewChange,
+                                                onRunVolumeBoost = onRunVolumeBoost
+                                            )
+                                        }
+                                    }
+
+                                    if (uiState.tracks.isNotEmpty()) {
+                                        item {
+                                            Row(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .padding(top = 4.dp),
+                                                horizontalArrangement = Arrangement.SpaceBetween,
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Column {
+                                                    Text(
+                                                        text = "工作台音轨 (${uiState.tracks.size})",
+                                                        style = MaterialTheme.typography.titleMedium,
+                                                        color = TextPrimary
+                                                    )
+                                                    Text(
+                                                        text = "点音轨试听处理 · 点剪刀图标可直接送入多轨剪辑",
+                                                        fontSize = 11.sp,
+                                                        color = TextMuted
+                                                    )
+                                                }
+                                                TextButton(onClick = {
+                                                    onRefreshStorage()
+                                                    showStorageSheet = true
+                                                }) {
+                                                    Text("资源管理", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = CyanPrimary)
+                                                }
+                                            }
+                                        }
+
+                                        items(items = uiState.tracks, key = { it.id }) { item ->
+                                            SessionTrackItemCard(
+                                                track = item,
+                                                isSelected = item.id == activeTrack?.id,
+                                                onClick = { onSelectTrack(item.id) },
+                                                onSendToArrangerClick = { onSendTrackToArranger(item.id) },
+                                                onRenameClick = { renameTargetTrack = item },
+                                                onShareWeChatClick = { onShareWeChat(item.id) },
+                                                onSaveAsClick = { saveTargetTrack = item },
+                                                onDeleteClick = { onDeleteTrack(item.id) }
+                                            )
+                                        }
+                                    }
+
+                                    item {
+                                        Spacer(modifier = Modifier.height(16.dp))
+                                    }
                                 }
                             }
                         }
-
-                        items(items = uiState.tracks, key = { it.id }) { item ->
-                            SessionTrackItemCard(
-                                track = item,
-                                isSelected = item.id == activeTrack?.id,
-                                onClick = { onSelectTrack(item.id) },
-                                onSendToArrangerClick = { onSendTrackToArranger(item.id) },
-                                onRenameClick = { renameTargetTrack = item },
-                                onShareWeChatClick = { onShareWeChat(item.id) },
-                                onSaveAsClick = { saveTargetTrack = item },
-                                onDeleteClick = { onDeleteTrack(item.id) }
-                            )
-                        }
-                    }
-
-                    item {
-                        Spacer(modifier = Modifier.height(16.dp))
                     }
                 }
             }
@@ -495,6 +661,7 @@ fun StudioScreen(
 @Composable
 private fun StudioWorkspaceBottomBar(
     currentMode: AppWorkspaceMode,
+    melodyNoteCount: Int,
     arrangerClipCount: Int,
     onSelectMode: (AppWorkspaceMode) -> Unit
 ) {
@@ -508,30 +675,44 @@ private fun StudioWorkspaceBottomBar(
                 .navigationBarsPadding()
         ) {
             HorizontalDivider(color = StudioBorder)
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(54.dp)
-                    .padding(horizontal = 16.dp, vertical = 7.dp),
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                verticalAlignment = Alignment.CenterVertically
+            Box(
+                modifier = Modifier.fillMaxWidth(),
+                contentAlignment = Alignment.Center
             ) {
-                WorkspaceModeTabItem(
-                    label = "单曲处理",
-                    icon = Icons.Rounded.Tune,
-                    badgeText = null,
-                    selected = currentMode == AppWorkspaceMode.SINGLE_TRACK,
-                    onClick = { onSelectMode(AppWorkspaceMode.SINGLE_TRACK) },
-                    modifier = Modifier.weight(1f)
-                )
-                WorkspaceModeTabItem(
-                    label = "多轨剪辑",
-                    icon = Icons.Rounded.ContentCut,
-                    badgeText = arrangerClipCount.takeIf { it > 0 }?.let { "${it}段" },
-                    selected = currentMode == AppWorkspaceMode.MULTI_TRACK_ARRANGER,
-                    onClick = { onSelectMode(AppWorkspaceMode.MULTI_TRACK_ARRANGER) },
-                    modifier = Modifier.weight(1f)
-                )
+                Row(
+                    modifier = Modifier
+                        .widthIn(max = 580.dp)
+                        .fillMaxWidth()
+                        .height(54.dp)
+                        .padding(horizontal = 12.dp, vertical = 7.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    WorkspaceModeTabItem(
+                        label = "单曲处理",
+                        icon = Icons.Rounded.Tune,
+                        badgeText = null,
+                        selected = currentMode == AppWorkspaceMode.SINGLE_TRACK,
+                        onClick = { onSelectMode(AppWorkspaceMode.SINGLE_TRACK) },
+                        modifier = Modifier.weight(1f)
+                    )
+                    WorkspaceModeTabItem(
+                        label = "乐器打谱",
+                        icon = Icons.Rounded.Piano,
+                        badgeText = melodyNoteCount.takeIf { it > 0 }?.toString(),
+                        selected = currentMode == AppWorkspaceMode.MELODY_STUDIO,
+                        onClick = { onSelectMode(AppWorkspaceMode.MELODY_STUDIO) },
+                        modifier = Modifier.weight(1f)
+                    )
+                    WorkspaceModeTabItem(
+                        label = "多轨剪辑",
+                        icon = Icons.Rounded.ContentCut,
+                        badgeText = arrangerClipCount.takeIf { it > 0 }?.toString(),
+                        selected = currentMode == AppWorkspaceMode.MULTI_TRACK_ARRANGER,
+                        onClick = { onSelectMode(AppWorkspaceMode.MULTI_TRACK_ARRANGER) },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
             }
         }
     }
@@ -559,35 +740,36 @@ private fun WorkspaceModeTabItem(
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.Center,
-            modifier = Modifier.padding(horizontal = 10.dp)
+            modifier = Modifier.padding(horizontal = 6.dp)
         ) {
             Icon(
                 imageVector = icon,
                 contentDescription = null,
                 tint = if (selected) OnAccentLight else TextSecondary,
-                modifier = Modifier.size(16.dp)
+                modifier = Modifier.size(15.dp)
             )
-            Spacer(modifier = Modifier.width(6.dp))
+            Spacer(modifier = Modifier.width(4.dp))
             Text(
                 text = label,
-                fontSize = 13.sp,
+                fontSize = 12.sp,
                 fontWeight = if (selected) FontWeight.Bold else FontWeight.SemiBold,
                 color = if (selected) OnAccentLight else TextSecondary,
                 maxLines = 1
             )
             if (badgeText != null) {
-                Spacer(modifier = Modifier.width(6.dp))
+                Spacer(modifier = Modifier.width(4.dp))
                 Surface(
-                    shape = RoundedCornerShape(6.dp),
+                    shape = RoundedCornerShape(5.dp),
                     color = if (selected) OnAccentLight.copy(alpha = 0.22f) else CyanPrimary.copy(alpha = 0.14f)
                 ) {
                     Text(
                         text = badgeText,
-                        fontSize = 10.sp,
+                        fontSize = 9.sp,
+                        fontFamily = FontFamily.Monospace,
                         fontWeight = FontWeight.Bold,
                         color = if (selected) OnAccentLight else CyanPrimary,
                         maxLines = 1,
-                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
                     )
                 }
             }
@@ -609,224 +791,287 @@ private fun StudioTopBar(
         color = StudioBg,
         modifier = Modifier.fillMaxWidth()
     ) {
-        Column(
+        BoxWithConstraints(
             modifier = Modifier
                 .fillMaxWidth()
                 .statusBarsPadding()
         ) {
-            // Row 1: App Title (full width, never squeezed) + Update Pill + Storage Resource Pill on right
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier
-                        .weight(1f)
-                        .padding(end = 6.dp)
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size(36.dp)
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(CyanPrimary.copy(alpha = 0.14f))
-                            .border(1.dp, CyanPrimary.copy(alpha = 0.35f), RoundedCornerShape(10.dp)),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.GraphicEq,
-                            contentDescription = null,
-                            tint = CyanPrimary,
-                            modifier = Modifier.size(20.dp)
-                        )
-                    }
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Column {
-                        Text(
-                            text = "SoundTracker",
-                            style = MaterialTheme.typography.headlineSmall,
-                            color = TextPrimary,
-                            maxLines = 1
-                        )
-                        Text(
-                            text = "伴奏 · 移调 · 放大 · 多轨剪辑",
-                            fontSize = 11.sp,
-                            color = TextSecondary,
-                            maxLines = 1
-                        )
-                    }
-                }
+            val inlineTabletImports = maxWidth >= 740.dp && trackCount > 0
+            val horizontalPad = if (maxWidth >= 600.dp) 20.dp else 16.dp
 
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    // Version / GitHub Release Update Pill (fixed 30.dp height, zero layout shift)
-                    val updShape = RoundedCornerShape(16.dp)
-                    val hasNew = appUpdate.hasUpdate
-                    val dlPct = if (appUpdate.isDownloading && appUpdate.totalBytes > 0L) {
-                        ((appUpdate.downloadedBytes * 100L) / appUpdate.totalBytes).toInt().coerceIn(0, 99)
-                    } else {
-                        null
-                    }
-                    Surface(
-                        shape = updShape,
-                        color = when {
-                            appUpdate.isDownloading -> CyanPrimary.copy(alpha = 0.15f)
-                            hasNew -> CyanPrimary
-                            else -> StudioSurface
-                        },
-                        border = BorderStroke(
-                            1.dp,
-                            if (hasNew || appUpdate.isDownloading) CyanPrimary else StudioBorder
-                        ),
-                        modifier = Modifier
-                            .height(30.dp)
-                            .clip(updShape)
-                            .clickable(onClick = onUpdatePillClick)
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 8.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(
-                                imageVector = Icons.Rounded.SystemUpdateAlt,
-                                contentDescription = "检查版本更新",
-                                tint = when {
-                                    appUpdate.isDownloading -> CyanPrimary
-                                    hasNew -> OnAccentLight
-                                    else -> TextSecondary
-                                },
-                                modifier = Modifier.size(13.dp)
-                            )
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text(
-                                text = when {
-                                    dlPct != null -> "$dlPct%"
-                                    hasNew -> "新版"
-                                    else -> "v${appUpdate.currentVersionName}"
-                                },
-                                fontSize = 11.sp,
-                                fontFamily = if (hasNew) FontFamily.Default else FontFamily.Monospace,
-                                fontWeight = FontWeight.SemiBold,
-                                color = when {
-                                    appUpdate.isDownloading -> CyanPrimary
-                                    hasNew -> OnAccentLight
-                                    else -> TextPrimary
-                                },
-                                maxLines = 1
-                            )
-                        }
-                    }
-
-                    // Broom + Storage Size Button -> Opens Resource Manager List
-                    val broomShape = RoundedCornerShape(16.dp)
-                    Surface(
-                        shape = broomShape,
-                        color = StudioSurface,
-                        border = BorderStroke(1.dp, StudioBorder),
-                        modifier = Modifier
-                            .height(30.dp)
-                            .clip(broomShape)
-                            .clickable(onClick = onStoragePillClick)
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 9.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(
-                                imageVector = Icons.Rounded.CleaningServices,
-                                contentDescription = "存储资源管理",
-                                tint = CyanPrimary,
-                                modifier = Modifier.size(14.dp)
-                            )
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text(
-                                text = formatBytesShort(ephemeralBytes),
-                                fontSize = 11.sp,
-                                fontFamily = FontFamily.Monospace,
-                                fontWeight = FontWeight.SemiBold,
-                                color = TextPrimary,
-                                maxLines = 1
-                            )
-                        }
-                    }
-                }
-            }
-
-            // Row 2: Quick Import Action Bar when tracks are loaded
-            if (trackCount > 0) {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                // Row 1: App Title + (Inline Import Buttons on Wide Tablets) + Update Pill + Storage Pill
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(start = 16.dp, end = 16.dp, bottom = 10.dp),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    verticalAlignment = Alignment.CenterVertically
+                        .padding(horizontal = horizontalPad, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Surface(
-                        onClick = onNetEaseClick,
-                        shape = RoundedCornerShape(10.dp),
-                        color = CyanPrimary.copy(alpha = 0.12f),
-                        border = BorderStroke(1.dp, CyanPrimary.copy(alpha = 0.40f)),
-                        modifier = Modifier.weight(1f)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(end = 6.dp)
                     ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.Center
+                        Box(
+                            modifier = Modifier
+                                .size(36.dp)
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(CyanPrimary.copy(alpha = 0.14f))
+                                .border(1.dp, CyanPrimary.copy(alpha = 0.35f), RoundedCornerShape(10.dp)),
+                            contentAlignment = Alignment.Center
                         ) {
                             Icon(
-                                imageVector = Icons.Rounded.CloudDownload,
-                                contentDescription = "从网易云音乐导入",
+                                imageVector = Icons.Rounded.GraphicEq,
+                                contentDescription = null,
                                 tint = CyanPrimary,
-                                modifier = Modifier.size(16.dp)
+                                modifier = Modifier.size(20.dp)
                             )
-                            Spacer(modifier = Modifier.width(6.dp))
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Column {
                             Text(
-                                text = "从网易云导入",
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = CyanPrimary,
+                                text = "SoundTracker",
+                                style = MaterialTheme.typography.headlineSmall,
+                                color = TextPrimary,
+                                maxLines = 1
+                            )
+                            Text(
+                                text = "伴奏 · 移调 · 打谱 · 多轨剪辑",
+                                fontSize = 11.sp,
+                                color = TextSecondary,
                                 maxLines = 1
                             )
                         }
                     }
 
-                    Surface(
-                        onClick = onImportClick,
-                        shape = RoundedCornerShape(10.dp),
-                        color = VioletAccent,
-                        border = BorderStroke(1.dp, VioletAccent),
-                        modifier = Modifier.weight(1f)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.Center
+                        if (inlineTabletImports) {
+                            Surface(
+                                onClick = onNetEaseClick,
+                                shape = RoundedCornerShape(10.dp),
+                                color = CyanPrimary.copy(alpha = 0.12f),
+                                border = BorderStroke(1.dp, CyanPrimary.copy(alpha = 0.40f)),
+                                modifier = Modifier.height(32.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 12.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.CloudDownload,
+                                        contentDescription = "从网易云音乐导入",
+                                        tint = CyanPrimary,
+                                        modifier = Modifier.size(15.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(5.dp))
+                                    Text(
+                                        text = "从网易云导入",
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = CyanPrimary,
+                                        maxLines = 1
+                                    )
+                                }
+                            }
+
+                            Surface(
+                                onClick = onImportClick,
+                                shape = RoundedCornerShape(10.dp),
+                                color = VioletAccent,
+                                border = BorderStroke(1.dp, VioletAccent),
+                                modifier = Modifier.height(32.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 12.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.Add,
+                                        contentDescription = null,
+                                        tint = OnAccentLight,
+                                        modifier = Modifier.size(15.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text(
+                                        text = "导入本地音频",
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = OnAccentLight,
+                                        maxLines = 1
+                                    )
+                                }
+                            }
+                        }
+
+                        // Version / GitHub Release Update Pill (fixed 30.dp height, zero layout shift)
+                        val updShape = RoundedCornerShape(16.dp)
+                        val hasNew = appUpdate.hasUpdate
+                        val dlPct = if (appUpdate.isDownloading && appUpdate.totalBytes > 0L) {
+                            ((appUpdate.downloadedBytes * 100L) / appUpdate.totalBytes).toInt().coerceIn(0, 99)
+                        } else {
+                            null
+                        }
+                        Surface(
+                            shape = updShape,
+                            color = when {
+                                appUpdate.isDownloading -> CyanPrimary.copy(alpha = 0.15f)
+                                hasNew -> CyanPrimary
+                                else -> StudioSurface
+                            },
+                            border = BorderStroke(
+                                1.dp,
+                                if (hasNew || appUpdate.isDownloading) CyanPrimary else StudioBorder
+                            ),
+                            modifier = Modifier
+                                .height(30.dp)
+                                .clip(updShape)
+                                .clickable(onClick = onUpdatePillClick)
                         ) {
-                            Icon(
-                                imageVector = Icons.Rounded.Add,
-                                contentDescription = null,
-                                tint = OnAccentLight,
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(modifier = Modifier.width(5.dp))
-                            Text(
-                                text = "导入本地音频",
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = OnAccentLight,
-                                maxLines = 1
-                            )
+                            Row(
+                                modifier = Modifier.padding(horizontal = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.SystemUpdateAlt,
+                                    contentDescription = "检查版本更新",
+                                    tint = when {
+                                        appUpdate.isDownloading -> CyanPrimary
+                                        hasNew -> OnAccentLight
+                                        else -> TextSecondary
+                                    },
+                                    modifier = Modifier.size(13.dp)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    text = when {
+                                        dlPct != null -> "$dlPct%"
+                                        hasNew -> "新版"
+                                        else -> "v${appUpdate.currentVersionName}"
+                                    },
+                                    fontSize = 11.sp,
+                                    fontFamily = if (hasNew) FontFamily.Default else FontFamily.Monospace,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = when {
+                                        appUpdate.isDownloading -> CyanPrimary
+                                        hasNew -> OnAccentLight
+                                        else -> TextPrimary
+                                    },
+                                    maxLines = 1
+                                )
+                            }
+                        }
+
+                        // Broom + Storage Size Button -> Opens Resource Manager List
+                        val broomShape = RoundedCornerShape(16.dp)
+                        Surface(
+                            shape = broomShape,
+                            color = StudioSurface,
+                            border = BorderStroke(1.dp, StudioBorder),
+                            modifier = Modifier
+                                .height(30.dp)
+                                .clip(broomShape)
+                                .clickable(onClick = onStoragePillClick)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 9.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.CleaningServices,
+                                    contentDescription = "存储资源管理",
+                                    tint = CyanPrimary,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    text = formatBytesShort(ephemeralBytes),
+                                    fontSize = 11.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = TextPrimary,
+                                    maxLines = 1
+                                )
+                            }
                         }
                     }
                 }
-            }
 
-            HorizontalDivider(color = StudioBorder.copy(alpha = 0.7f), thickness = 0.75.dp)
+                // Row 2: Quick Import Action Bar on Phones / Portrait Narrow Screens when tracks are loaded
+                if (trackCount > 0 && !inlineTabletImports) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = horizontalPad, end = horizontalPad, bottom = 10.dp),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Surface(
+                            onClick = onNetEaseClick,
+                            shape = RoundedCornerShape(10.dp),
+                            color = CyanPrimary.copy(alpha = 0.12f),
+                            border = BorderStroke(1.dp, CyanPrimary.copy(alpha = 0.40f)),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.CloudDownload,
+                                    contentDescription = "从网易云音乐导入",
+                                    tint = CyanPrimary,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "从网易云导入",
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = CyanPrimary,
+                                    maxLines = 1
+                                )
+                            }
+                        }
+
+                        Surface(
+                            onClick = onImportClick,
+                            shape = RoundedCornerShape(10.dp),
+                            color = VioletAccent,
+                            border = BorderStroke(1.dp, VioletAccent),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Add,
+                                    contentDescription = null,
+                                    tint = OnAccentLight,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(5.dp))
+                                Text(
+                                    text = "导入本地音频",
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = OnAccentLight,
+                                    maxLines = 1
+                                )
+                            }
+                        }
+                    }
+                }
+
+                HorizontalDivider(color = StudioBorder.copy(alpha = 0.7f), thickness = 0.75.dp)
+            }
         }
     }
 }
@@ -835,6 +1080,7 @@ private fun StudioTopBar(
 private fun EmptyStudioHeroCard(
     onNetEaseImportClick: () -> Unit,
     onImportClick: () -> Unit,
+    onOpenMelodyClick: () -> Unit,
     onOpenArrangerClick: () -> Unit
 ) {
     Card(
@@ -923,7 +1169,7 @@ private fun EmptyStudioHeroCard(
             ) {
                 FeaturePillBadge("提取伴奏", CyanPrimary)
                 FeaturePillBadge("移调变速", WarmUmber)
-                FeaturePillBadge("音量放大", EmeraldLossless)
+                FeaturePillBadge("乐器打谱", AmberMastering, onClick = onOpenMelodyClick)
                 FeaturePillBadge("多轨剪辑", VioletAccent, onClick = onOpenArrangerClick)
             }
         }
@@ -4837,7 +5083,9 @@ private fun ProcessingProgressDialog(
             shape = RoundedCornerShape(18.dp),
             colors = CardDefaults.cardColors(containerColor = StudioSurface),
             border = BorderStroke(1.dp, StudioBorder),
-            modifier = Modifier.fillMaxWidth()
+            modifier = Modifier
+                .widthIn(max = 460.dp)
+                .fillMaxWidth()
         ) {
             Column(
                 modifier = Modifier.padding(22.dp),

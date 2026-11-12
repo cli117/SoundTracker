@@ -117,6 +117,9 @@ object SessionWorkspaceManager {
                         put("sampleRate", m.sampleRate)
                         put("channels", m.channels)
                         put("detectedBpm", m.detectedBpm.toDouble())
+                        put("detectedKeyFifths", m.detectedKeyFifths)
+                        put("detectedKeyMinor", m.detectedKeyMinor)
+                        put("detectedKeyConfidence", m.detectedKeyConfidence.toDouble())
                         val peaksArr = JSONArray()
                         for (p in m.waveformPeaks) {
                             peaksArr.put(((p * 1000f).toInt() / 1000.0))
@@ -162,7 +165,10 @@ object SessionWorkspaceManager {
                     sampleRate = mObj?.optInt("sampleRate", 44100) ?: 44100,
                     channels = mObj?.optInt("channels", 2) ?: 2,
                     detectedBpm = mObj?.optDouble("detectedBpm", 120.0)?.toFloat() ?: 120.0f,
-                    waveformPeaks = peaks
+                    waveformPeaks = peaks,
+                    detectedKeyFifths = (mObj?.optInt("detectedKeyFifths", 0) ?: 0).coerceIn(-7, 7),
+                    detectedKeyMinor = mObj?.optBoolean("detectedKeyMinor", false) ?: false,
+                    detectedKeyConfidence = (mObj?.optDouble("detectedKeyConfidence", 0.0)?.toFloat() ?: 0f).coerceIn(0f, 1f)
                 )
                 val originRaw = obj.optString("originTrackId")
                 val savedRaw = obj.optString("savedLocalPath")
@@ -631,5 +637,138 @@ object SessionWorkspaceManager {
             idx++
         }
         return candidate
+    }
+
+    // ========================================================================
+    // PDF Sheet Music Share (WeChat / System) & Local Save Helpers
+    // ========================================================================
+
+    private const val PDF_MIME_TYPE = "application/pdf"
+
+    suspend fun preparePdfShareIntent(
+        context: Context,
+        sourcePdfFile: File,
+        customTitle: String,
+        targetWeChatDirectly: Boolean
+    ): Result<Intent> = withContext(Dispatchers.IO) {
+        runCatching {
+            check(sourcePdfFile.exists() && sourcePdfFile.length() > 0L) {
+                "五线谱 PDF 生成失败"
+            }
+            val safeName = AudioCodecHelper.sanitizeFileName(customTitle.ifBlank { "未命名乐谱" })
+            val fileName = "$safeName.pdf"
+            val slotDir = File(shareStagingRoot(context), "share_${System.currentTimeMillis()}")
+            slotDir.mkdirs()
+            val stagedFile = File(slotDir, fileName)
+            sourcePdfFile.copyTo(stagedFile, overwrite = true)
+            slotDir.setLastModified(System.currentTimeMillis())
+
+            val authority = "${context.packageName}.fileprovider"
+            val contentUri = FileProvider.getUriForFile(context, authority, stagedFile)
+
+            val baseIntent = Intent(Intent.ACTION_SEND).apply {
+                type = PDF_MIME_TYPE
+                putExtra(Intent.EXTRA_STREAM, contentUri)
+                putExtra(Intent.EXTRA_TITLE, fileName)
+                putExtra(Intent.EXTRA_SUBJECT, fileName)
+                clipData = ClipData.newRawUri(fileName, contentUri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+
+            if (targetWeChatDirectly && isWeChatInstalled(context)) {
+                context.grantUriPermission(
+                    WECHAT_PACKAGE,
+                    contentUri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+                val weChatDirect = Intent(baseIntent).apply {
+                    setClassName(WECHAT_PACKAGE, WECHAT_SHARE_UI)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                val canResolveDirect = context.packageManager
+                    .queryIntentActivities(weChatDirect, PackageManager.MATCH_DEFAULT_ONLY)
+                    .isNotEmpty()
+
+                if (canResolveDirect) {
+                    weChatDirect
+                } else {
+                    Intent(baseIntent).apply {
+                        setPackage(WECHAT_PACKAGE)
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                }
+            } else {
+                Intent.createChooser(baseIntent, "分享五线谱「$fileName」").apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            }
+        }
+    }
+
+    suspend fun savePdfToPublicDownloads(
+        context: Context,
+        sourcePdfFile: File,
+        customTitle: String
+    ): Result<String> = withContext(Dispatchers.IO) {
+        runCatching {
+            check(sourcePdfFile.exists() && sourcePdfFile.length() > 0L) {
+                "五线谱 PDF 文件为空"
+            }
+            val safeName = AudioCodecHelper.sanitizeFileName(customTitle.ifBlank { "未命名乐谱" })
+            val fileName = "$safeName.pdf"
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val resolver = context.contentResolver
+                val values = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                    put(MediaStore.Downloads.MIME_TYPE, PDF_MIME_TYPE)
+                    put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/SoundTracker")
+                    put(MediaStore.Downloads.IS_PENDING, 1)
+                }
+                val itemUri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                    ?: error("无法创建下载目录条目")
+                try {
+                    resolver.openOutputStream(itemUri)?.buffered(128 * 1024)?.use { outs ->
+                        sourcePdfFile.inputStream().buffered(128 * 1024).use { ins ->
+                            ins.copyTo(outs, 128 * 1024)
+                        }
+                    } ?: error("无法写入 PDF 文件")
+                    val doneValues = ContentValues().apply {
+                        put(MediaStore.Downloads.IS_PENDING, 0)
+                    }
+                    resolver.update(itemUri, doneValues, null, null)
+                } catch (e: Exception) {
+                    resolver.delete(itemUri, null, null)
+                    throw e
+                }
+                "Download/SoundTracker/$fileName"
+            } else {
+                @Suppress("DEPRECATION")
+                val dlRoot = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                val appDlDir = File(dlRoot, "SoundTracker").apply { mkdirs() }
+                val finalFile = resolveUniqueFile(appDlDir, safeName, "pdf")
+                sourcePdfFile.copyTo(finalFile, overwrite = true)
+                "Download/SoundTracker/${finalFile.name}"
+            }
+        }
+    }
+
+    suspend fun savePdfToCustomUri(
+        context: Context,
+        sourcePdfFile: File,
+        targetUri: Uri
+    ): Result<String> = withContext(Dispatchers.IO) {
+        runCatching {
+            check(sourcePdfFile.exists() && sourcePdfFile.length() > 0L) {
+                "五线谱 PDF 文件为空"
+            }
+            context.contentResolver.openOutputStream(targetUri, "wt")?.buffered(128 * 1024)?.use { outs ->
+                sourcePdfFile.inputStream().buffered(128 * 1024).use { ins ->
+                    ins.copyTo(outs, 128 * 1024)
+                }
+            } ?: error("无法写入所选文件夹")
+            val resolved = AudioCodecHelper.resolveDisplayName(context, targetUri)
+            if (resolved.endsWith(".pdf", ignoreCase = true)) resolved else "$resolved.pdf"
+        }
     }
 }

@@ -76,6 +76,7 @@ add_library(soundtracker_dsp SHARED
     vocal_separator.cpp
     mp3_encoder.cpp
     multi_track_mixer.cpp
+    melody_synth.cpp
     soundtracker_jni.cpp
 )
 

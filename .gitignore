@@ -17,8 +17,9 @@ captures/
 # Local Toolchains & SDK/NDK
 .tools/
 
-# Prebuilt Large Model Weights & Native Runtime Binaries (>100MB)
+# Prebuilt Large Model Weights, SoundFonts & Native Runtime Binaries (>100MB)
 app/src/main/assets/models/
+app/src/main/assets/soundfonts/
 app/src/main/jniLibs/
 models/
 

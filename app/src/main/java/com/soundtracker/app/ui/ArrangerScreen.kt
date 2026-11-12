@@ -15,6 +15,7 @@ import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -100,6 +101,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.soundtracker.app.arranger.ArrangerClip
@@ -197,27 +199,38 @@ fun MultiTrackArrangerScreen(
 
     val canClear = arranger.totalClipCount > 0 || arranger.tracks.size > 1
 
-    Column(
+    BoxWithConstraints(
         modifier = modifier
             .fillMaxSize()
             .background(StudioBg)
             .statusBarsPadding()
     ) {
-        // ====================================================================
-        // 1. Fixed Top Header Bar (52.dp)
-        // ====================================================================
-        Surface(
-            color = StudioSurface,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(52.dp)
-                    .padding(horizontal = 12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
+        val isTablet = maxWidth >= 720.dp
+        val isShortLandscape = maxHeight < 480.dp
+        val trackHeaderWidth = if (isTablet) 126.dp else TRACK_HEADER_WIDTH
+        val trackRowHeight = when {
+            isShortLandscape -> 62.dp
+            isTablet -> 84.dp
+            else -> TRACK_ROW_HEIGHT
+        }
+        val dockHeight = if (isShortLandscape) 136.dp else 154.dp
+
+        Column(modifier = Modifier.fillMaxSize()) {
+            // ================================================================
+            // 1. Fixed Top Header Bar (52.dp / 46.dp on short landscape)
+            // ================================================================
+            Surface(
+                color = StudioSurface,
+                modifier = Modifier.fillMaxWidth()
             ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(if (isShortLandscape) 46.dp else 52.dp)
+                        .padding(horizontal = if (isTablet) 18.dp else 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -422,6 +435,8 @@ fun MultiTrackArrangerScreen(
         // ====================================================================
         MultiTrackTimelineStage(
             arranger = arranger,
+            trackHeaderWidth = trackHeaderWidth,
+            trackRowHeight = trackRowHeight,
             onSeekToMs = onSeekToMs,
             onZoomChange = onZoomChange,
             onAddTrack = onAddTrack,
@@ -442,7 +457,7 @@ fun MultiTrackArrangerScreen(
         HorizontalDivider(color = StudioBorder)
 
         // ====================================================================
-        // 4. Constant-Height Bottom Context Dock (Strictly Locked 154.dp)
+        // 4. Constant-Height Bottom Context Dock (Responsive 154.dp / 136.dp)
         // ====================================================================
         ArrangerConstantBottomDock(
             arranger = arranger,
@@ -467,8 +482,9 @@ fun MultiTrackArrangerScreen(
             onSelectedClipFadesChange = onSelectedClipFadesChange,
             modifier = Modifier
                 .fillMaxWidth()
-                .height(154.dp)
+                .height(dockHeight)
         )
+        }
     }
 
     if (showClearConfirm) {
@@ -528,6 +544,8 @@ fun MultiTrackArrangerScreen(
 @Composable
 private fun MultiTrackTimelineStage(
     arranger: ArrangerUiState,
+    trackHeaderWidth: Dp = TRACK_HEADER_WIDTH,
+    trackRowHeight: Dp = TRACK_ROW_HEIGHT,
     onSeekToMs: (Long) -> Unit,
     onZoomChange: (Float) -> Unit,
     onAddTrack: () -> Unit,
@@ -547,7 +565,7 @@ private fun MultiTrackTimelineStage(
     val scope = rememberCoroutineScope()
     val vScroll = rememberScrollState()
 
-    val rowHeightPx = with(density) { TRACK_ROW_HEIGHT.toPx() }
+    val rowHeightPx = with(density) { trackRowHeight.toPx() }
     val addRowHeightPx = with(density) { ADD_TRACK_ROW_HEIGHT.toPx() }
     val pxPerSec = with(density) { arranger.zoomDpPerSec.dp.toPx() }.coerceAtLeast(1f)
     val pxPerMs = pxPerSec / 1000f
@@ -557,6 +575,7 @@ private fun MultiTrackTimelineStage(
     var flingJob by remember { mutableStateOf<Job?>(null) }
 
     val currentArranger by rememberUpdatedState(arranger)
+    val currentRowHeightPx by rememberUpdatedState(rowHeightPx)
     val currentPxPerMs by rememberUpdatedState(pxPerMs)
     val currentLaneWidthPx by rememberUpdatedState(laneWidthPx)
     val currentOnSeek by rememberUpdatedState(onSeekToMs)
@@ -571,7 +590,7 @@ private fun MultiTrackTimelineStage(
 
     Column(modifier = modifier.background(StudioSurfaceElevated.copy(alpha = 0.55f))) {
         // ====================================================================
-        // Top Row: Track Counter Cell (94.dp) + Synchronized Time Ruler
+        // Top Row: Track Counter Cell + Synchronized Time Ruler
         // ====================================================================
         Row(
             modifier = Modifier
@@ -581,7 +600,7 @@ private fun MultiTrackTimelineStage(
         ) {
             Box(
                 modifier = Modifier
-                    .width(TRACK_HEADER_WIDTH)
+                    .width(trackHeaderWidth)
                     .fillMaxHeight()
                     .border(width = 0.5.dp, color = StudioBorder),
                 contentAlignment = Alignment.Center
@@ -685,7 +704,7 @@ private fun MultiTrackTimelineStage(
                 // LEFT STICKY TRACK HEADERS COLUMN (Synced vertically via vScroll)
                 Column(
                     modifier = Modifier
-                        .width(TRACK_HEADER_WIDTH)
+                        .width(trackHeaderWidth)
                         .fillMaxHeight()
                         .background(StudioSurface)
                         .verticalScroll(vScroll)
@@ -699,7 +718,7 @@ private fun MultiTrackTimelineStage(
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .height(TRACK_ROW_HEIGHT)
+                                .height(trackRowHeight)
                                 .background(
                                     if (isTrackSelected) accent.copy(alpha = 0.10f) else StudioSurface
                                 )
@@ -832,7 +851,7 @@ private fun MultiTrackTimelineStage(
                                 val downY = down.position.y + vScroll.value
                                 val centerX = currentLaneWidthPx / 2f
                                 val initArr = currentArranger
-                                val downRow = floor(downY / rowHeightPx).toInt()
+                                val downRow = floor(downY / currentRowHeightPx).toInt()
 
                                 // Check if user touched a clip or selected clip's left/right trim handle
                                 var hitClip: ArrangerClip? = null
@@ -983,7 +1002,7 @@ private fun MultiTrackTimelineStage(
                                             snapGuideMs = guideMs
 
                                             val curFingerContentY = change.position.y + vScroll.value
-                                            val dstTrackIdx = floor(curFingerContentY / rowHeightPx).toInt()
+                                            val dstTrackIdx = floor(curFingerContentY / currentRowHeightPx).toInt()
                                                 .coerceIn(0, currentArranger.tracks.lastIndex)
                                             currentOnMoveClip(c.id, snappedStart, dstTrackIdx)
                                         }
@@ -1029,7 +1048,7 @@ private fun MultiTrackTimelineStage(
                                 // Handle clean single tap vs timeline fling release
                                 if (!movedPastSlop && mode == TimelineTouchMode.UNDETERMINED) {
                                     val tracksSize = currentArranger.tracks.size
-                                    val addRowTop = tracksSize * rowHeightPx
+                                    val addRowTop = tracksSize * currentRowHeightPx
                                     val addRowBottom = addRowTop + addRowHeightPx
                                     when {
                                         hitClip != null -> {
@@ -1414,12 +1433,17 @@ private fun ArrangerConstantBottomDock(
         color = StudioSurface,
         modifier = modifier
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(horizontal = 12.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.SpaceBetween
+        Box(
+            modifier = Modifier.fillMaxSize(),
+            contentAlignment = Alignment.Center
         ) {
+            Column(
+                modifier = Modifier
+                    .widthIn(max = 880.dp)
+                    .fillMaxSize()
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalArrangement = Arrangement.SpaceBetween
+            ) {
             if (selectedPair == null) {
                 // ============================================================
                 // STATE A: Track & Global Arranger Dock (Locked 154.dp)
@@ -1772,6 +1796,7 @@ private fun ArrangerConstantBottomDock(
                         modifier = Modifier.weight(1f)
                     )
                 }
+            }
             }
         }
     }

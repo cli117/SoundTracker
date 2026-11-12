@@ -4,6 +4,7 @@
 
 #include "audio_buffer.h"
 #include "loudness_maximizer.h"
+#include "melody_synth.h"
 #include "mp3_encoder.h"
 #include "multi_track_mixer.h"
 #include "pitch_shifter.h"
@@ -97,7 +98,7 @@ Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeAnalyzeWav(
     soundtracker::AudioAnalysis a = soundtracker::analyzeAudio(buf, bins);
 
     std::vector<float> packed;
-    packed.reserve(9 + a.waveformPeaks.size());
+    packed.reserve(12 + a.waveformPeaks.size());
     packed.push_back(a.integratedLufs);
     packed.push_back(a.truePeakDbtp);
     packed.push_back(a.samplePeakDbfs);
@@ -107,6 +108,9 @@ Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeAnalyzeWav(
     packed.push_back(static_cast<float>(a.sampleRate));
     packed.push_back(static_cast<float>(a.channels));
     packed.push_back(a.detectedBpm);
+    packed.push_back(static_cast<float>(a.detectedKeyFifths));
+    packed.push_back(a.detectedKeyMinor ? 1.0f : 0.0f);
+    packed.push_back(a.detectedKeyConfidence);
     packed.insert(packed.end(), a.waveformPeaks.begin(), a.waveformPeaks.end());
 
     jfloatArray out = env->NewFloatArray(static_cast<jsize>(packed.size()));
@@ -776,6 +780,383 @@ Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeRenderMultiTrackMixdown(
     );
     if (ok) return nullptr;
     if (errMsg.empty()) errMsg = "多轨合成失败";
+    return env->NewStringUTF(errMsg.c_str());
+}
+
+// ============================================================================
+// Melody Synthesizer & GarageBand-Style Keyboard Studio (SoundFont2 + Stereo FX)
+// ============================================================================
+
+static std::vector<soundtracker::SynthNoteSpec> unpackSynthNoteSpecs(
+    JNIEnv* env,
+    jlongArray jStarts,
+    jlongArray jDurations,
+    jintArray jMidiNotes,
+    jfloatArray jVelocities,
+    jintArray jSlots,
+    jintArray jFlags
+) {
+    std::vector<soundtracker::SynthNoteSpec> notes;
+    if (!jStarts || !jDurations || !jMidiNotes || !jVelocities) return notes;
+    const jsize n = env->GetArrayLength(jStarts);
+    if (n <= 0) return notes;
+
+    std::vector<jlong> starts(n);
+    std::vector<jlong> durs(n);
+    std::vector<jint> keys(n);
+    std::vector<jfloat> vels(n);
+    std::vector<jint> slots(n, 0);
+    std::vector<jint> flags(n, 0);
+    env->GetLongArrayRegion(jStarts, 0, n, starts.data());
+    env->GetLongArrayRegion(jDurations, 0, n, durs.data());
+    env->GetIntArrayRegion(jMidiNotes, 0, n, keys.data());
+    env->GetFloatArrayRegion(jVelocities, 0, n, vels.data());
+    if (jSlots && env->GetArrayLength(jSlots) >= n) {
+        env->GetIntArrayRegion(jSlots, 0, n, slots.data());
+    }
+    if (jFlags && env->GetArrayLength(jFlags) >= n) {
+        env->GetIntArrayRegion(jFlags, 0, n, flags.data());
+    }
+
+    notes.reserve(static_cast<size_t>(n));
+    for (jsize i = 0; i < n; ++i) {
+        notes.push_back(soundtracker::SynthNoteSpec{
+            static_cast<int64_t>(starts[i]),
+            static_cast<int64_t>(durs[i]),
+            static_cast<int>(keys[i]),
+            vels[i],
+            static_cast<int>(slots[i]),
+            static_cast<int>(flags[i])
+        });
+    }
+    return notes;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeEnsureSoundFontLoaded(
+    JNIEnv* env,
+    jobject,
+    jobject jAssetManager,
+    jstring jAssetPath
+) {
+    if (soundtracker::isSoundFontReady()) return JNI_TRUE;
+    AAssetManager* mgr = AAssetManager_fromJava(env, jAssetManager);
+    std::string relPath = jstringToStd(env, jAssetPath);
+    std::string err;
+    if (!soundtracker::ensureSoundFontLoadedFromAssets(mgr, relPath, &err)) {
+        LOGE("nativeEnsureSoundFontLoaded failed: %s", err.c_str());
+        return JNI_FALSE;
+    }
+    return JNI_TRUE;
+}
+
+JNIEXPORT jlong JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeCreateMelodySynthEngine(
+    JNIEnv*,
+    jobject,
+    jint sampleRate
+) {
+    auto* eng = new soundtracker::RealtimeMelodySynthEngine(static_cast<int>(sampleRate));
+    return reinterpret_cast<jlong>(eng);
+}
+
+JNIEXPORT void JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeDestroyMelodySynthEngine(
+    JNIEnv*,
+    jobject,
+    jlong handle
+) {
+    if (handle == 0) return;
+    auto* eng = reinterpret_cast<soundtracker::RealtimeMelodySynthEngine*>(handle);
+    delete eng;
+}
+
+JNIEXPORT void JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeSynthSetInstrument(
+    JNIEnv*,
+    jobject,
+    jlong handle,
+    jint slot,
+    jint bank,
+    jint presetNumber,
+    jfloat gainDb,
+    jfloat reverbSend,
+    jfloat chorusDepth,
+    jboolean sustainPedal,
+    jfloat sustainDurationSec
+) {
+    if (handle == 0) return;
+    auto* eng = reinterpret_cast<soundtracker::RealtimeMelodySynthEngine*>(handle);
+    soundtracker::InstrumentFxProfile prof;
+    prof.bank = static_cast<int>(bank);
+    prof.presetNumber = static_cast<int>(presetNumber);
+    prof.gainDb = gainDb;
+    prof.reverbSend = reverbSend;
+    prof.chorusDepth = chorusDepth;
+    prof.sustainPedal = (sustainPedal == JNI_TRUE);
+    prof.sustainDurationSec = std::clamp(static_cast<float>(sustainDurationSec), 0.020f, 15.0f);
+    eng->setInstrument(static_cast<int>(slot), prof);
+}
+
+JNIEXPORT void JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeSynthSetReverb(
+    JNIEnv*,
+    jobject,
+    jlong handle,
+    jfloat reverbWet
+) {
+    if (handle == 0) return;
+    auto* eng = reinterpret_cast<soundtracker::RealtimeMelodySynthEngine*>(handle);
+    eng->setReverbLevel(reverbWet);
+}
+
+JNIEXPORT void JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeSynthSetSustain(
+    JNIEnv*,
+    jobject,
+    jlong handle,
+    jint slot,
+    jboolean sustainOn,
+    jfloat sustainDurationSec
+) {
+    if (handle == 0) return;
+    auto* eng = reinterpret_cast<soundtracker::RealtimeMelodySynthEngine*>(handle);
+    eng->setSustainPedal(
+        static_cast<int>(slot),
+        sustainOn == JNI_TRUE,
+        std::clamp(static_cast<float>(sustainDurationSec), 0.020f, 15.0f)
+    );
+}
+
+JNIEXPORT void JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeSynthLiveNoteOn(
+    JNIEnv*,
+    jobject,
+    jlong handle,
+    jint slot,
+    jint midiNote,
+    jfloat velocity
+) {
+    if (handle == 0) return;
+    auto* eng = reinterpret_cast<soundtracker::RealtimeMelodySynthEngine*>(handle);
+    eng->liveNoteOn(static_cast<int>(slot), static_cast<int>(midiNote), velocity);
+}
+
+JNIEXPORT void JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeSynthLiveNoteOff(
+    JNIEnv*,
+    jobject,
+    jlong handle,
+    jint slot,
+    jint midiNote
+) {
+    if (handle == 0) return;
+    auto* eng = reinterpret_cast<soundtracker::RealtimeMelodySynthEngine*>(handle);
+    eng->liveNoteOff(static_cast<int>(slot), static_cast<int>(midiNote));
+}
+
+JNIEXPORT void JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeSynthAllNotesOff(
+    JNIEnv*,
+    jobject,
+    jlong handle
+) {
+    if (handle == 0) return;
+    auto* eng = reinterpret_cast<soundtracker::RealtimeMelodySynthEngine*>(handle);
+    eng->allNotesOff();
+}
+
+JNIEXPORT void JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeSynthSetSequence(
+    JNIEnv* env,
+    jobject,
+    jlong handle,
+    jlongArray jStarts,
+    jlongArray jDurations,
+    jintArray jMidiNotes,
+    jfloatArray jVelocities,
+    jintArray jSlots,
+    jintArray jFlags,
+    jlong totalLengthFrames,
+    jboolean loopEnabled
+) {
+    if (handle == 0) return;
+    auto* eng = reinterpret_cast<soundtracker::RealtimeMelodySynthEngine*>(handle);
+    auto notes = unpackSynthNoteSpecs(env, jStarts, jDurations, jMidiNotes, jVelocities, jSlots, jFlags);
+    eng->setSequence(notes, static_cast<int64_t>(totalLengthFrames), loopEnabled == JNI_TRUE);
+}
+
+JNIEXPORT void JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeSynthSetMetronome(
+    JNIEnv* env,
+    jobject,
+    jlong handle,
+    jboolean enabled,
+    jfloat bpm,
+    jint numerator,
+    jint denominator,
+    jlongArray jPulseFrames,
+    jintArray jPulseAccents
+) {
+    if (handle == 0) return;
+    auto* eng = reinterpret_cast<soundtracker::RealtimeMelodySynthEngine*>(handle);
+    std::vector<int64_t> pulseFrames;
+    std::vector<int> pulseAccents;
+    if (jPulseFrames) {
+        const jsize m = env->GetArrayLength(jPulseFrames);
+        if (m > 0) {
+            std::vector<jlong> rawF(m);
+            env->GetLongArrayRegion(jPulseFrames, 0, m, rawF.data());
+            pulseFrames.resize(static_cast<size_t>(m));
+            for (jsize i = 0; i < m; ++i) {
+                pulseFrames[static_cast<size_t>(i)] = static_cast<int64_t>(rawF[i]);
+            }
+            if (jPulseAccents && env->GetArrayLength(jPulseAccents) >= m) {
+                std::vector<jint> rawA(m);
+                env->GetIntArrayRegion(jPulseAccents, 0, m, rawA.data());
+                pulseAccents.resize(static_cast<size_t>(m));
+                for (jsize i = 0; i < m; ++i) {
+                    pulseAccents[static_cast<size_t>(i)] = static_cast<int>(rawA[i]);
+                }
+            }
+        }
+    }
+    eng->setMetronome(
+        enabled == JNI_TRUE,
+        bpm,
+        static_cast<int>(numerator),
+        static_cast<int>(denominator),
+        pulseFrames,
+        pulseAccents
+    );
+}
+
+JNIEXPORT void JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeSynthSetTransportPlaying(
+    JNIEnv*,
+    jobject,
+    jlong handle,
+    jboolean playing,
+    jlong startFrame
+) {
+    if (handle == 0) return;
+    auto* eng = reinterpret_cast<soundtracker::RealtimeMelodySynthEngine*>(handle);
+    eng->setTransportPlaying(playing == JNI_TRUE, static_cast<int64_t>(startFrame));
+}
+
+JNIEXPORT void JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeSynthSeekTransport(
+    JNIEnv*,
+    jobject,
+    jlong handle,
+    jlong frame
+) {
+    if (handle == 0) return;
+    auto* eng = reinterpret_cast<soundtracker::RealtimeMelodySynthEngine*>(handle);
+    eng->seekTransport(static_cast<int64_t>(frame));
+}
+
+JNIEXPORT jlong JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeSynthGetTransportState(
+    JNIEnv*,
+    jobject,
+    jlong handle
+) {
+    if (handle == 0) return 0;
+    auto* eng = reinterpret_cast<soundtracker::RealtimeMelodySynthEngine*>(handle);
+    int64_t frame = std::max<int64_t>(0, eng->currentTransportFrame());
+    int64_t playingBit = eng->isTransportPlaying() ? (1LL << 62) : 0LL;
+    return static_cast<jlong>(playingBit | (frame & ((1LL << 62) - 1LL)));
+}
+
+JNIEXPORT void JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeSynthRenderBlock(
+    JNIEnv* env,
+    jobject,
+    jlong handle,
+    jshortArray jOutStereoPcm,
+    jint numFrames
+) {
+    if (handle == 0 || !jOutStereoPcm || numFrames <= 0) return;
+    auto* eng = reinterpret_cast<soundtracker::RealtimeMelodySynthEngine*>(handle);
+    const size_t totalSamples = static_cast<size_t>(numFrames) * 2;
+    static thread_local std::vector<float> tlFloat;
+    static thread_local std::vector<int16_t> tlShort;
+    if (tlFloat.size() < totalSamples) {
+        tlFloat.resize(totalSamples);
+        tlShort.resize(totalSamples);
+    }
+    eng->renderInterleavedStereo(tlFloat.data(), static_cast<int>(numFrames));
+    for (size_t i = 0; i < totalSamples; ++i) {
+        float clamped = std::clamp(tlFloat[i], -1.0f, 1.0f);
+        tlShort[i] = static_cast<int16_t>(std::lrintf(clamped * 32767.0f));
+    }
+    env->SetShortArrayRegion(jOutStereoPcm, 0, static_cast<jsize>(totalSamples), tlShort.data());
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_soundtracker_app_dsp_NativeAudioEngine_nativeRenderMelodyToWav(
+    JNIEnv* env,
+    jobject,
+    jint bank0,
+    jint preset0,
+    jfloat gainDb0,
+    jfloat reverbSend,
+    jfloat chorus0,
+    jboolean sustain0,
+    jfloat sustainSec0,
+    jint bank1,
+    jint preset1,
+    jfloat gainDb1,
+    jfloat chorus1,
+    jboolean sustain1,
+    jfloat sustainSec1,
+    jlongArray jStarts,
+    jlongArray jDurations,
+    jintArray jMidiNotes,
+    jfloatArray jVelocities,
+    jintArray jSlots,
+    jintArray jFlags,
+    jlong sequenceDurationFrames,
+    jint outputSampleRate,
+    jstring jOutWavPath,
+    jobject progressListener
+) {
+    soundtracker::InstrumentFxProfile prof0;
+    prof0.bank = static_cast<int>(bank0);
+    prof0.presetNumber = static_cast<int>(preset0);
+    prof0.gainDb = gainDb0;
+    prof0.reverbSend = reverbSend;
+    prof0.chorusDepth = chorus0;
+    prof0.sustainPedal = (sustain0 == JNI_TRUE);
+    prof0.sustainDurationSec = std::clamp(static_cast<float>(sustainSec0), 0.020f, 15.0f);
+
+    soundtracker::InstrumentFxProfile prof1;
+    prof1.bank = static_cast<int>(bank1);
+    prof1.presetNumber = static_cast<int>(preset1);
+    prof1.gainDb = gainDb1;
+    prof1.reverbSend = reverbSend;
+    prof1.chorusDepth = chorus1;
+    prof1.sustainPedal = (sustain1 == JNI_TRUE);
+    prof1.sustainDurationSec = std::clamp(static_cast<float>(sustainSec1), 0.020f, 15.0f);
+
+    auto notes = unpackSynthNoteSpecs(env, jStarts, jDurations, jMidiNotes, jVelocities, jSlots, jFlags);
+    std::string outPath = jstringToStd(env, jOutWavPath);
+    auto cb = makeJniProgress(env, progressListener);
+    std::string errMsg;
+
+    bool ok = soundtracker::renderMelodySequenceToWav(
+        prof0,
+        prof1,
+        notes,
+        static_cast<int64_t>(sequenceDurationFrames),
+        static_cast<int>(outputSampleRate),
+        outPath,
+        cb,
+        &errMsg
+    );
+    if (ok) return nullptr;
+    if (errMsg.empty()) errMsg = "乐器旋律渲染失败";
     return env->NewStringUTF(errMsg.c_str());
 }
 

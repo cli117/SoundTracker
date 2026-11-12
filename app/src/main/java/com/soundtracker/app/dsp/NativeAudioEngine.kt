@@ -68,7 +68,10 @@ data class AudioMetrics(
     val sampleRate: Int,
     val channels: Int,
     val detectedBpm: Float,
-    val waveformPeaks: List<Float>
+    val waveformPeaks: List<Float>,
+    val detectedKeyFifths: Int = 0,
+    val detectedKeyMinor: Boolean = false,
+    val detectedKeyConfidence: Float = 0f
 )
 
 data class BoostReport(
@@ -94,6 +97,15 @@ data class NativeMixClip(
     val fadeOutFrames: Long
 )
 
+data class NativeSynthNote(
+    val startFrame: Long,
+    val durationFrames: Long,
+    val midiNote: Int,
+    val velocity: Float,
+    val slot: Int = 0,
+    val flags: Int = 0
+)
+
 fun interface NativeProgressListener {
     fun onProgress(progress: Float)
 }
@@ -102,6 +114,7 @@ object NativeAudioEngine {
 
     private const val INST_HQ5_ASSET_PATH = "models/inst_hq5_fp16weights.onnx"
     private const val HTDEMUCS_FT_ASSET_PATH = "models/htdemucs_ft_vocals_fp16weights.onnx"
+    const val STUDIO_SOUNDFONT_ASSET_PATH = "soundfonts/studio_instruments.sf2"
 
     init {
         System.loadLibrary("onnxruntime")
@@ -223,6 +236,84 @@ object NativeAudioEngine {
         progressListener: NativeProgressListener?
     ): String?
 
+    // Melody Synthesizer & GarageBand-Style Keyboard Studio (SoundFont2 + Stereo Reverb/Chorus)
+    external fun nativeEnsureSoundFontLoaded(
+        assetManager: AssetManager,
+        assetPath: String
+    ): Boolean
+    external fun nativeCreateMelodySynthEngine(sampleRate: Int): Long
+    external fun nativeDestroyMelodySynthEngine(handle: Long)
+    external fun nativeSynthSetInstrument(
+        handle: Long,
+        slot: Int,
+        bank: Int,
+        presetNumber: Int,
+        gainDb: Float,
+        reverbSend: Float,
+        chorusDepth: Float,
+        sustainPedal: Boolean,
+        sustainDurationSec: Float
+    )
+    external fun nativeSynthSetReverb(handle: Long, reverbWet: Float)
+    external fun nativeSynthSetSustain(
+        handle: Long,
+        slot: Int,
+        sustainOn: Boolean,
+        sustainDurationSec: Float
+    )
+    external fun nativeSynthLiveNoteOn(handle: Long, slot: Int, midiNote: Int, velocity: Float)
+    external fun nativeSynthLiveNoteOff(handle: Long, slot: Int, midiNote: Int)
+    external fun nativeSynthAllNotesOff(handle: Long)
+    external fun nativeSynthSetSequence(
+        handle: Long,
+        starts: LongArray,
+        durations: LongArray,
+        midiNotes: IntArray,
+        velocities: FloatArray,
+        slots: IntArray,
+        flags: IntArray,
+        totalLengthFrames: Long,
+        loopEnabled: Boolean
+    )
+    external fun nativeSynthSetMetronome(
+        handle: Long,
+        enabled: Boolean,
+        bpm: Float,
+        numerator: Int,
+        denominator: Int,
+        pulseFrames: LongArray?,
+        pulseAccents: IntArray?
+    )
+    external fun nativeSynthSetTransportPlaying(handle: Long, playing: Boolean, startFrame: Long)
+    external fun nativeSynthSeekTransport(handle: Long, frame: Long)
+    external fun nativeSynthGetTransportState(handle: Long): Long
+    external fun nativeSynthRenderBlock(handle: Long, outStereoPcm: ShortArray, numFrames: Int)
+    private external fun nativeRenderMelodyToWav(
+        bank0: Int,
+        preset0: Int,
+        gainDb0: Float,
+        reverbSend: Float,
+        chorus0: Float,
+        sustain0: Boolean,
+        sustainSec0: Float,
+        bank1: Int,
+        preset1: Int,
+        gainDb1: Float,
+        chorus1: Float,
+        sustain1: Boolean,
+        sustainSec1: Float,
+        starts: LongArray,
+        durations: LongArray,
+        midiNotes: IntArray,
+        velocities: FloatArray,
+        slots: IntArray,
+        flags: IntArray,
+        sequenceDurationFrames: Long,
+        outputSampleRate: Int,
+        outWavPath: String,
+        progressListener: NativeProgressListener?
+    ): String?
+
     /**
      * Reclaims any legacy extracted `.onnx` files from `noBackupFilesDir/engine_models/`.
      * Models are now zero-copy mmap'd directly from APK `assets/models/` via `AAssetManager`,
@@ -240,9 +331,9 @@ object NativeAudioEngine {
     suspend fun analyzeWav(wavFile: File, waveformBins: Int = 180): AudioMetrics? =
         withContext(Dispatchers.Default) {
             val raw = nativeAnalyzeWav(wavFile.absolutePath, waveformBins) ?: return@withContext null
-            if (raw.size < 9) return@withContext null
-            val peaks = if (raw.size > 9) {
-                raw.slice(9 until raw.size)
+            if (raw.size < 12) return@withContext null
+            val peaks = if (raw.size > 12) {
+                raw.slice(12 until raw.size)
             } else {
                 emptyList()
             }
@@ -256,7 +347,10 @@ object NativeAudioEngine {
                 sampleRate = raw[6].toInt(),
                 channels = raw[7].toInt(),
                 detectedBpm = raw[8].coerceIn(40f, 240f),
-                waveformPeaks = peaks
+                waveformPeaks = peaks,
+                detectedKeyFifths = raw[9].toInt().coerceIn(-7, 7),
+                detectedKeyMinor = raw[10] >= 0.5f,
+                detectedKeyConfidence = raw[11].coerceIn(0f, 1f)
             )
         }
 
@@ -407,6 +501,101 @@ object NativeAudioEngine {
             fadeIns = fadeIns,
             fadeOuts = fadeOuts,
             totalDurationFrames = totalDurationFrames,
+            outputSampleRate = outputSampleRate,
+            outWavPath = outputWav.absolutePath,
+            progressListener = { p -> onProgress(p.coerceIn(0f, 1f)) }
+        )
+        when {
+            err == null -> VocalSeparationOutcome.Success
+            err == "Cancelled" -> VocalSeparationOutcome.Cancelled
+            else -> VocalSeparationOutcome.Error(err)
+        }
+    }
+
+    suspend fun ensureStudioSoundFontLoaded(context: Context): Boolean =
+        withContext(Dispatchers.IO) {
+            nativeEnsureSoundFontLoaded(context.assets, STUDIO_SOUNDFONT_ASSET_PATH)
+        }
+
+    fun updateMelodySynthSequence(
+        handle: Long,
+        notes: List<NativeSynthNote>,
+        totalLengthFrames: Long,
+        loopEnabled: Boolean
+    ) {
+        if (handle == 0L) return
+        val n = notes.size
+        val starts = LongArray(n) { notes[it].startFrame }
+        val durs = LongArray(n) { notes[it].durationFrames }
+        val keys = IntArray(n) { notes[it].midiNote }
+        val vels = FloatArray(n) { notes[it].velocity }
+        val slots = IntArray(n) { notes[it].slot }
+        val flags = IntArray(n) { notes[it].flags }
+        nativeSynthSetSequence(
+            handle = handle,
+            starts = starts,
+            durations = durs,
+            midiNotes = keys,
+            velocities = vels,
+            slots = slots,
+            flags = flags,
+            totalLengthFrames = totalLengthFrames,
+            loopEnabled = loopEnabled
+        )
+    }
+
+    suspend fun renderMelodyToWav(
+        context: Context,
+        bank0: Int,
+        preset0: Int,
+        gainDb0: Float,
+        reverbSend: Float,
+        chorus0: Float,
+        sustain0: Boolean,
+        sustainSec0: Float,
+        bank1: Int,
+        preset1: Int,
+        gainDb1: Float,
+        chorus1: Float,
+        sustain1: Boolean,
+        sustainSec1: Float,
+        notes: List<NativeSynthNote>,
+        sequenceDurationFrames: Long,
+        outputSampleRate: Int = 44100,
+        outputWav: File,
+        onProgress: (Float) -> Unit
+    ): VocalSeparationOutcome = withContext(Dispatchers.Default) {
+        if (!nativeEnsureSoundFontLoaded(context.assets, STUDIO_SOUNDFONT_ASSET_PATH)) {
+            return@withContext VocalSeparationOutcome.Error("乐器采样音源加载失败")
+        }
+        val n = notes.size
+        val starts = LongArray(n) { notes[it].startFrame }
+        val durs = LongArray(n) { notes[it].durationFrames }
+        val keys = IntArray(n) { notes[it].midiNote }
+        val vels = FloatArray(n) { notes[it].velocity }
+        val slots = IntArray(n) { notes[it].slot }
+        val flags = IntArray(n) { notes[it].flags }
+        val err = nativeRenderMelodyToWav(
+            bank0 = bank0,
+            preset0 = preset0,
+            gainDb0 = gainDb0,
+            reverbSend = reverbSend,
+            chorus0 = chorus0,
+            sustain0 = sustain0,
+            sustainSec0 = sustainSec0,
+            bank1 = bank1,
+            preset1 = preset1,
+            gainDb1 = gainDb1,
+            chorus1 = chorus1,
+            sustain1 = sustain1,
+            sustainSec1 = sustainSec1,
+            starts = starts,
+            durations = durs,
+            midiNotes = keys,
+            velocities = vels,
+            slots = slots,
+            flags = flags,
+            sequenceDurationFrames = sequenceDurationFrames,
             outputSampleRate = outputSampleRate,
             outWavPath = outputWav.absolutePath,
             progressListener = { p -> onProgress(p.coerceIn(0f, 1f)) }

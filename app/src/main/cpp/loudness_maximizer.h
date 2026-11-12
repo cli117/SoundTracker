@@ -18,6 +18,9 @@ struct AudioAnalysis {
     int sampleRate = 44100;
     int channels = 2;
     float detectedBpm = 120.0f;
+    int detectedKeyFifths = 0;
+    bool detectedKeyMinor = false;
+    float detectedKeyConfidence = 0.0f;
     std::vector<float> waveformPeaks; // normalized [0..1] envelope bins for UI
 };
 

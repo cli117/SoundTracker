@@ -3,6 +3,7 @@ package com.soundtracker.app.ui
 import android.app.Application
 import android.content.Intent
 import android.net.Uri
+import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.media3.common.MediaItem
@@ -28,6 +29,47 @@ import com.soundtracker.app.dsp.ExportFormat
 import com.soundtracker.app.dsp.NativeAudioEngine
 import com.soundtracker.app.dsp.VocalEngineMode
 import com.soundtracker.app.dsp.VocalSeparationOutcome
+import com.soundtracker.app.melody.DEFAULT_REST_MIDI
+import com.soundtracker.app.melody.DynamicLevel
+import com.soundtracker.app.melody.HairpinType
+import com.soundtracker.app.melody.KeySignature
+import com.soundtracker.app.melody.KeyboardLayoutPreferences
+import com.soundtracker.app.melody.MAX_MELODY_BARS
+import com.soundtracker.app.melody.MELODY_SAMPLE_RATE
+import com.soundtracker.app.melody.MelodyInputMode
+import com.soundtracker.app.melody.MelodyProjectRepository
+import com.soundtracker.app.melody.MelodyRealtimePlayer
+import com.soundtracker.app.melody.MelodyScoreNote
+import com.soundtracker.app.melody.MelodySnapshot
+import com.soundtracker.app.melody.MelodyStudioUiState
+import com.soundtracker.app.melody.MusicalNotationHelper
+import com.soundtracker.app.melody.NoteAccent
+import com.soundtracker.app.melody.NoteArticulation
+import com.soundtracker.app.melody.NoteDurationPreset
+import com.soundtracker.app.melody.NoteTupletTag
+import com.soundtracker.app.melody.PIANO_MAX_MIDI
+import com.soundtracker.app.melody.PIANO_MIN_MIDI
+import com.soundtracker.app.melody.PianoTouchGuardConfig
+import com.soundtracker.app.melody.ReverbPreset
+import com.soundtracker.app.melody.STEPS_PER_BEAT
+import com.soundtracker.app.melody.ScoreDynamicMark
+import com.soundtracker.app.melody.ScoreExpressionCompiler
+import com.soundtracker.app.melody.ScoreHairpin
+import com.soundtracker.app.melody.ScoreKeySignatureEvent
+import com.soundtracker.app.melody.ScoreTempoEvent
+import com.soundtracker.app.melody.ScoreTempoMap
+import com.soundtracker.app.melody.SelectedScoreAnnotation
+import com.soundtracker.app.melody.StaffScoreEngraver
+import com.soundtracker.app.melody.StudioInstrument
+import com.soundtracker.app.melody.SwingPreset
+import com.soundtracker.app.melody.TICKS_PER_BEAT
+import com.soundtracker.app.melody.TICKS_PER_STEP
+import com.soundtracker.app.melody.TOTAL_VIRTUAL_WHITE_KEYS
+import com.soundtracker.app.melody.TempoEventKind
+import com.soundtracker.app.melody.TempoTerm
+import com.soundtracker.app.melody.TimeSignature
+import com.soundtracker.app.melody.TouchGuardMode
+import com.soundtracker.app.melody.TupletPreset
 import com.soundtracker.app.storage.EphemeralStorageInfo
 import com.soundtracker.app.storage.SessionWorkspaceManager
 import com.soundtracker.app.update.AppUpdateManager
@@ -35,6 +77,7 @@ import com.soundtracker.app.update.AppUpdateUiState
 import com.soundtracker.app.update.UpdateCheckStatus
 import com.soundtracker.app.update.UpdateDownloadChannel
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
@@ -45,13 +88,16 @@ import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
 import kotlin.math.roundToInt
+import kotlin.math.roundToLong
 
 enum class StudioToolTab(val title: String, val subtitle: String) {
     VOCAL_REMOVE("去人声提伴奏", "提取伴奏或人声"),
@@ -81,6 +127,7 @@ data class ProcessingTaskState(
 
 data class StudioUiState(
     val workspaceMode: AppWorkspaceMode = AppWorkspaceMode.SINGLE_TRACK,
+    val melody: MelodyStudioUiState = MelodyStudioUiState(),
     val arranger: ArrangerUiState = run {
         val defaultTrack = ArrangerTrack(name = "音轨 1", colorIndex = 0)
         ArrangerUiState(tracks = listOf(defaultTrack), selectedTrackId = defaultTrack.id)
@@ -127,6 +174,23 @@ data class StudioUiState(
             val rootId = cur.originTrackId ?: return null
             if (rootId == cur.id) return null
             return tracks.firstOrNull { it.id == rootId && it.audioFile.exists() }
+        }
+
+    /**
+     * Detected musical tonality (`调号`) of the selected workspace reference song (combining explicit title hint
+     * and C++ HPCP chroma key detection).
+     */
+    val referenceTrackKeySignature: KeySignature?
+        get() {
+            val cur = selectedTrack ?: return null
+            KeySignature.parseTrackTitleHint(cur.displayName)?.let { return it }
+            if (cur.metrics.detectedKeyConfidence >= 0.12f) {
+                return KeySignature(
+                    fifths = cur.metrics.detectedKeyFifths,
+                    isMinor = cur.metrics.detectedKeyMinor
+                ).sanitized()
+            }
+            return null
         }
 
     val isLivePitchTempoPreviewActive: Boolean
@@ -203,15 +267,119 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     private val arrangerRedoStack = ArrayDeque<ArrangerSnapshot>()
     private val highResPeaksCache = HashMap<String, List<Float>>()
     private var mashupExportCounter = 1
+
+    @Volatile
+    private var latestMelodyTempoMap: ScoreTempoMap? = null
+
+    private fun currentMelodyTempoMap(mel: MelodyStudioUiState = _uiState.value.melody): ScoreTempoMap {
+        return latestMelodyTempoMap ?: ScoreExpressionCompiler.buildTempoMap(mel, MELODY_SAMPLE_RATE)
+    }
+
+    private val melodyPlayer = MelodyRealtimePlayer(
+        sampleRate = MELODY_SAMPLE_RATE,
+        onTransportState = { curFrame, playing ->
+            val curMel = _uiState.value.melody
+            val tempoMap = currentMelodyTempoMap(curMel)
+            val curTick = tempoMap.frameToTick(curFrame)
+            val beat = (curTick / TICKS_PER_BEAT.toDouble()).toFloat().coerceAtLeast(0f)
+            if (curMel.isRecording && !playing) {
+                finalizeAllActiveRecordedNotes(endBeatOverride = curMel.totalQuarterBeats)
+            }
+            _uiState.update { st ->
+                st.copy(
+                    melody = st.melody.copy(
+                        playheadBeat = beat,
+                        isPlaying = playing,
+                        isRecording = if (!playing) false else st.melody.isRecording
+                    )
+                )
+            }
+        }
+    )
+    private data class ActiveRecordedNote(
+        val startBeat: Float,
+        val velocity: Float,
+        val downWallMs: Long,
+        val isGlissando: Boolean
+    )
+
+    private data class RecentLiveStrike(
+        val midi: Int,
+        val downWallMs: Long,
+        val isGlissando: Boolean
+    )
+
+    private val melodyUndoStack = ArrayDeque<MelodySnapshot>()
+    private val melodyRedoStack = ArrayDeque<MelodySnapshot>()
+    private val activeRecordedNotes = ConcurrentHashMap<Pair<Int, Int>, ActiveRecordedNote>()
+    private val recentSlotStrikes = ConcurrentHashMap<Int, RecentLiveStrike>()
+    private var melodyExportCounter = 1
+    private var lastStepKeyDownWallMs = 0L
+    private var lastStepPlacedTick = 0
+    private var lastStepSlot = 0
+    private var lastStepMidi = -1
+    private var previewNoteJob: Job? = null
+
     private var loadedPlayerFilePath: String? = null
     private var activeProcessingJob: Job? = null
     private var updateCheckJob: Job? = null
     private var updateDownloadJob: Job? = null
 
+    private var lastSavedMelodyFingerprint: Int =
+        MelodyProjectRepository.computeContentFingerprint(MelodyStudioUiState())
+    private var lastObservedMelodyFingerprint: Int = lastSavedMelodyFingerprint
+    private var autoSaveDebounceJob: Job? = null
+
     init {
+        // Restore saved Melody Studio projects, touch-guard config & latest auto-save draft on cold start
+        runCatching {
+            val savedTouchGuard = KeyboardLayoutPreferences.loadTouchGuardConfig(appContext)
+            val savedProjects = MelodyProjectRepository.listProjects(appContext)
+            val autoDraft = MelodyProjectRepository.readAutoSaveDraft(appContext)
+            val autoSummary = MelodyProjectRepository.readAutoSaveSummary(appContext)
+            if (autoDraft != null && MelodyProjectRepository.hasMeaningfulContent(autoDraft.state)) {
+                val linkedId = autoDraft.projectId
+                val baselineProject = linkedId?.let { MelodyProjectRepository.loadProject(appContext, it) }
+                val draftFp = MelodyProjectRepository.computeContentFingerprint(autoDraft.state)
+                lastSavedMelodyFingerprint = if (baselineProject != null) {
+                    MelodyProjectRepository.computeContentFingerprint(baselineProject.state)
+                } else {
+                    MelodyProjectRepository.computeContentFingerprint(MelodyStudioUiState())
+                }
+                lastObservedMelodyFingerprint = draftFp
+                val isDirty = if (baselineProject != null) {
+                    draftFp != lastSavedMelodyFingerprint
+                } else {
+                    MelodyProjectRepository.hasMeaningfulContent(autoDraft.state)
+                }
+                _uiState.update { st ->
+                    st.copy(
+                        melody = autoDraft.state.copy(
+                            touchGuardConfig = savedTouchGuard,
+                            currentProjectId = linkedId,
+                            isProjectDirty = isDirty,
+                            savedProjects = savedProjects,
+                            autoSaveDraftSummary = autoSummary
+                        )
+                    )
+                }
+            } else {
+                _uiState.update { st ->
+                    st.copy(
+                        melody = st.melody.copy(
+                            touchGuardConfig = savedTouchGuard,
+                            savedProjects = savedProjects,
+                            autoSaveDraftSummary = autoSummary
+                        )
+                    )
+                }
+            }
+        }
+
         viewModelScope.launch {
             _uiState.collect { state ->
                 syncRealtimePreviewProcessor(state)
+                onMelodyStateObservedForAutoSave(state.melody)
             }
         }
 
@@ -265,6 +433,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 )
             }
             preparePlayerForTrack(first, seekMs = 0L, playImmediately = false)
+            backfillMissingTrackKeySignatures(restored)
         }
         refreshStorageInfo()
 
@@ -342,6 +511,53 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             exoPlayer.pause()
         }
         arrangerPlayer.pause()
+        stopMelodyPlaybackAndEngine()
+    }
+
+    fun onAppForegrounded() {
+        if (_uiState.value.workspaceMode == AppWorkspaceMode.MELODY_STUDIO) {
+            ensureMelodyStudioReady()
+        }
+    }
+
+    fun onAppBackgrounded() {
+        flushMelodyAutoSaveNow()
+    }
+
+    private fun backfillMissingTrackKeySignatures(tracksToCheck: List<SessionTrack>) {
+        val candidates = tracksToCheck.filter {
+            it.metrics.detectedKeyConfidence <= 0.001f && it.audioFile.exists()
+        }
+        if (candidates.isEmpty()) return
+        viewModelScope.launch(Dispatchers.IO) {
+            var anyUpdated = false
+            for (cand in candidates) {
+                val analyzed = NativeAudioEngine.analyzeWav(cand.audioFile, waveformBins = 80) ?: continue
+                if (analyzed.detectedKeyConfidence > 0.001f) {
+                    anyUpdated = true
+                    _uiState.update { st ->
+                        st.copy(
+                            tracks = st.tracks.map { t ->
+                                if (t.id == cand.id) {
+                                    t.copy(
+                                        metrics = t.metrics.copy(
+                                            detectedKeyFifths = analyzed.detectedKeyFifths,
+                                            detectedKeyMinor = analyzed.detectedKeyMinor,
+                                            detectedKeyConfidence = analyzed.detectedKeyConfidence
+                                        )
+                                    )
+                                } else {
+                                    t
+                                }
+                            }
+                        )
+                    }
+                }
+            }
+            if (anyUpdated) {
+                SessionWorkspaceManager.saveTracksIndex(appContext, _uiState.value.tracks)
+            }
+        }
     }
 
     fun seekToFraction(fraction: Float) {
@@ -1592,11 +1808,26 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     fun setWorkspaceMode(mode: AppWorkspaceMode) {
         if (_uiState.value.workspaceMode == mode) return
-        if (mode == AppWorkspaceMode.MULTI_TRACK_ARRANGER) {
-            if (exoPlayer.isPlaying) exoPlayer.pause()
-            syncArrangerPlayerSchedule()
-        } else {
-            arrangerPlayer.pause()
+        if (_uiState.value.workspaceMode == AppWorkspaceMode.MELODY_STUDIO) {
+            flushMelodyAutoSaveNow()
+        }
+        when (mode) {
+            AppWorkspaceMode.SINGLE_TRACK -> {
+                arrangerPlayer.pause()
+                stopMelodyPlaybackAndEngine()
+            }
+            AppWorkspaceMode.MELODY_STUDIO -> {
+                if (exoPlayer.isPlaying) exoPlayer.pause()
+                arrangerPlayer.pause()
+                _uiState.update { it.copy(workspaceMode = mode) }
+                ensureMelodyStudioReady()
+                return
+            }
+            AppWorkspaceMode.MULTI_TRACK_ARRANGER -> {
+                if (exoPlayer.isPlaying) exoPlayer.pause()
+                stopMelodyPlaybackAndEngine()
+                syncArrangerPlayerSchedule()
+            }
         }
         _uiState.update { it.copy(workspaceMode = mode) }
     }
@@ -2681,10 +2912,2602 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         _events.trySend(StudioUiEvent.OpenExternalUrl(url))
     }
 
+    // ========================================================================
+    // Feature 6: GarageBand-Style Instrument Keyboard & Melody Score Studio
+    // ========================================================================
+
+    private fun ensureMelodyStudioReady() {
+        viewModelScope.launch {
+            val loaded = if (_uiState.value.melody.soundFontLoaded) {
+                true
+            } else {
+                val ok = NativeAudioEngine.ensureStudioSoundFontLoaded(appContext)
+                _uiState.update { st -> st.copy(melody = st.melody.copy(soundFontLoaded = ok)) }
+                if (!ok) {
+                    sendMessage("乐器采样音源加载失败")
+                }
+                ok
+            }
+            if (loaded && _uiState.value.workspaceMode == AppWorkspaceMode.MELODY_STUDIO) {
+                syncMelodyInstrumentToEngine()
+                syncMelodySequenceToEngine()
+                melodyPlayer.startAudioEngine()
+            }
+        }
+    }
+
+    private fun stopMelodyPlaybackAndEngine() {
+        previewNoteJob?.cancel()
+        if (_uiState.value.melody.isRecording) {
+            finalizeAllActiveRecordedNotes()
+        } else {
+            activeRecordedNotes.clear()
+        }
+        melodyPlayer.stopAudioEngine()
+        _uiState.update { st ->
+            if (st.melody.isPlaying || st.melody.isRecording) {
+                st.copy(
+                    melody = st.melody.copy(
+                        isPlaying = false,
+                        isRecording = false
+                    )
+                )
+            } else {
+                st
+            }
+        }
+    }
+
+    private fun syncMelodyInstrumentToEngine(mel: MelodyStudioUiState = _uiState.value.melody) {
+        melodyPlayer.applyInstrument(
+            slot = 0,
+            instrument = mel.instrument,
+            reverbWet = mel.effectiveReverbSend,
+            sustainPedal = mel.sustainPedal,
+            sustainDurationSec = mel.sustainDurationSec
+        )
+        melodyPlayer.applyInstrument(
+            slot = 1,
+            instrument = mel.secondaryInstrument,
+            reverbWet = mel.effectiveReverbSend,
+            sustainPedal = mel.secondarySustainPedal,
+            sustainDurationSec = mel.secondarySustainDurationSec
+        )
+    }
+
+    private fun syncMelodySequenceToEngine(mel: MelodyStudioUiState = _uiState.value.melody) {
+        val compiled = mel.compileSchedule(MELODY_SAMPLE_RATE)
+        latestMelodyTempoMap = compiled.tempoMap
+        melodyPlayer.setMetronome(
+            enabled = mel.metronomeEnabled && (mel.isPlaying || mel.isRecording),
+            bpm = compiled.tempoMap.tailBpm,
+            numerator = mel.timeSignature.safeNumerator,
+            denominator = mel.timeSignature.safeDenominator,
+            pulseFrames = compiled.metronomePulseFrames,
+            pulseAccents = compiled.metronomePulseAccents
+        )
+        melodyPlayer.updateSequence(
+            notes = compiled.notes,
+            totalLengthFrames = compiled.totalFrames,
+            loopEnabled = mel.loopPlayback
+        )
+    }
+
+    private fun captureMelodySnapshot(mel: MelodyStudioUiState): MelodySnapshot = MelodySnapshot(
+        notes = mel.notes,
+        cursorTick = mel.cursorTick,
+        totalBars = mel.totalBars,
+        scoreTitle = mel.scoreTitle,
+        timeSignature = mel.timeSignature,
+        initialKeySignature = mel.initialKeySignature,
+        keySignatureEvents = mel.keySignatureEvents,
+        bpm = mel.bpm,
+        swingPreset = mel.swingPreset,
+        instrument = mel.instrument,
+        secondaryInstrument = mel.secondaryInstrument,
+        dualKeyboardEnabled = mel.dualKeyboardEnabled,
+        reverbPreset = mel.reverbPreset,
+        sustainPedal = mel.sustainPedal,
+        secondarySustainPedal = mel.secondarySustainPedal,
+        sustainDurationSec = mel.sustainDurationSec,
+        secondarySustainDurationSec = mel.secondarySustainDurationSec,
+        dynamicMarks = mel.dynamicMarks,
+        hairpins = mel.hairpins,
+        tempoEvents = mel.tempoEvents
+    )
+
+    private fun sanitizeOrphanSlurGroups(
+        notes: List<MelodyScoreNote>,
+        activeSlurGroupId: String?
+    ): List<MelodyScoreNote> {
+        val onsetCounts = HashMap<String, MutableSet<Int>>()
+        for (n in notes) {
+            val gid = n.slurGroupId ?: continue
+            if (n.isRest) continue
+            onsetCounts.getOrPut(gid) { HashSet() }.add(n.resolvedStartTick)
+        }
+        val orphanIds = onsetCounts.entries
+            .filter { (gid, onsets) -> gid != activeSlurGroupId && onsets.size < 2 }
+            .map { it.key }
+            .toSet()
+        if (orphanIds.isEmpty()) return notes
+        return notes.map { n ->
+            if (n.slurGroupId != null && n.slurGroupId in orphanIds) n.copy(slurGroupId = null) else n
+        }
+    }
+
+    private fun pushMelodyUndoSnapshot() {
+        val mel = _uiState.value.melody
+        melodyUndoStack.addLast(captureMelodySnapshot(mel))
+        while (melodyUndoStack.size > 40) {
+            melodyUndoStack.removeFirst()
+        }
+        melodyRedoStack.clear()
+        _uiState.update { st ->
+            st.copy(
+                melody = st.melody.copy(
+                    canUndo = melodyUndoStack.isNotEmpty(),
+                    canRedo = false
+                )
+            )
+        }
+    }
+
+    fun undoMelody() {
+        val snap = melodyUndoStack.removeLastOrNull() ?: return
+        val cur = _uiState.value.melody
+        melodyRedoStack.addLast(captureMelodySnapshot(cur))
+        val keptActiveSlur = cur.activeSlurGroupId?.takeIf { gid ->
+            snap.notes.any { it.slurGroupId == gid }
+        }
+        _uiState.update { st ->
+            st.copy(
+                melody = st.melody.copy(
+                    notes = snap.notes,
+                    cursorTick = snap.cursorTick,
+                    totalBars = snap.totalBars,
+                    scoreTitle = snap.scoreTitle,
+                    timeSignature = snap.timeSignature,
+                    initialKeySignature = snap.initialKeySignature,
+                    keySignatureEvents = snap.keySignatureEvents,
+                    bpm = snap.bpm,
+                    swingPreset = snap.swingPreset,
+                    instrument = snap.instrument,
+                    secondaryInstrument = snap.secondaryInstrument,
+                    dualKeyboardEnabled = snap.dualKeyboardEnabled,
+                    reverbPreset = snap.reverbPreset,
+                    sustainPedal = snap.sustainPedal,
+                    secondarySustainPedal = snap.secondarySustainPedal,
+                    sustainDurationSec = snap.sustainDurationSec,
+                    secondarySustainDurationSec = snap.secondarySustainDurationSec,
+                    dynamicMarks = snap.dynamicMarks,
+                    hairpins = snap.hairpins,
+                    tempoEvents = snap.tempoEvents,
+                    activeSlurGroupId = keptActiveSlur,
+                    selectedNoteId = null,
+                    selectedAnnotation = null,
+                    canUndo = melodyUndoStack.isNotEmpty(),
+                    canRedo = melodyRedoStack.isNotEmpty()
+                )
+            )
+        }
+        syncMelodyInstrumentToEngine()
+        syncMelodySequenceToEngine()
+    }
+
+    fun redoMelody() {
+        val snap = melodyRedoStack.removeLastOrNull() ?: return
+        val cur = _uiState.value.melody
+        melodyUndoStack.addLast(captureMelodySnapshot(cur))
+        val keptActiveSlur = cur.activeSlurGroupId?.takeIf { gid ->
+            snap.notes.any { it.slurGroupId == gid }
+        }
+        _uiState.update { st ->
+            st.copy(
+                melody = st.melody.copy(
+                    notes = snap.notes,
+                    cursorTick = snap.cursorTick,
+                    totalBars = snap.totalBars,
+                    scoreTitle = snap.scoreTitle,
+                    timeSignature = snap.timeSignature,
+                    initialKeySignature = snap.initialKeySignature,
+                    keySignatureEvents = snap.keySignatureEvents,
+                    bpm = snap.bpm,
+                    swingPreset = snap.swingPreset,
+                    instrument = snap.instrument,
+                    secondaryInstrument = snap.secondaryInstrument,
+                    dualKeyboardEnabled = snap.dualKeyboardEnabled,
+                    reverbPreset = snap.reverbPreset,
+                    sustainPedal = snap.sustainPedal,
+                    secondarySustainPedal = snap.secondarySustainPedal,
+                    sustainDurationSec = snap.sustainDurationSec,
+                    secondarySustainDurationSec = snap.secondarySustainDurationSec,
+                    dynamicMarks = snap.dynamicMarks,
+                    hairpins = snap.hairpins,
+                    tempoEvents = snap.tempoEvents,
+                    activeSlurGroupId = keptActiveSlur,
+                    selectedNoteId = null,
+                    selectedAnnotation = null,
+                    canUndo = melodyUndoStack.isNotEmpty(),
+                    canRedo = melodyRedoStack.isNotEmpty()
+                )
+            )
+        }
+        syncMelodyInstrumentToEngine()
+        syncMelodySequenceToEngine()
+    }
+
+    fun setMelodyScoreTitle(title: String) {
+        val trimmed = title.replace('\n', ' ').take(60)
+        _uiState.update { st ->
+            st.copy(melody = st.melody.copy(scoreTitle = trimmed))
+        }
+    }
+
+    fun clearMelodyScore() {
+        val cur = _uiState.value.melody
+        if (cur.notes.isEmpty() &&
+            cur.dynamicMarks.isEmpty() &&
+            cur.hairpins.isEmpty() &&
+            cur.tempoEvents.isEmpty() &&
+            cur.keySignatureEvents.isEmpty() &&
+            cur.cursorTick == 0
+        ) return
+        if (cur.isPlaying || cur.isRecording) {
+            finalizeAllActiveRecordedNotes()
+            melodyPlayer.setTransportPlaying(false, 0L)
+            melodyPlayer.allNotesOff()
+        }
+        pushMelodyUndoSnapshot()
+        _uiState.update { st ->
+            st.copy(
+                melody = st.melody.copy(
+                    notes = emptyList(),
+                    dynamicMarks = emptyList(),
+                    hairpins = emptyList(),
+                    tempoEvents = emptyList(),
+                    keySignatureEvents = emptyList(),
+                    activeSlurGroupId = null,
+                    pendingArticulation = null,
+                    pendingAccent = null,
+                    pendingFermata = false,
+                    selectedNoteId = null,
+                    selectedAnnotation = null,
+                    cursorTick = 0,
+                    tupletAnchorTick = 0,
+                    totalBars = 4,
+                    playheadBeat = 0f,
+                    isPlaying = false,
+                    isRecording = false
+                )
+            )
+        }
+        syncMelodySequenceToEngine()
+    }
+
+    fun loadMelodyDemoShowcase() {
+        if (_uiState.value.melody.isRecording) {
+            finalizeAllActiveRecordedNotes()
+        }
+        pushMelodyUndoSnapshot()
+        val demo = MusicalNotationHelper.buildDemoShowcaseBundle()
+        _uiState.update { st ->
+            val nextTitle = if (st.melody.scoreTitle.isBlank() || st.melody.scoreTitle == "未命名乐谱") {
+                "晨光序曲"
+            } else {
+                st.melody.scoreTitle
+            }
+            st.copy(
+                melody = st.melody.copy(
+                    scoreTitle = nextTitle,
+                    timeSignature = TimeSignature.FOUR_FOUR,
+                    initialKeySignature = KeySignature.C_MAJOR,
+                    keySignatureEvents = emptyList(),
+                    bpm = 112,
+                    totalBars = 4,
+                    cursorTick = 14 * TICKS_PER_BEAT,
+                    tupletAnchorTick = 14 * TICKS_PER_BEAT,
+                    notes = demo.notes,
+                    dynamicMarks = demo.dynamicMarks,
+                    hairpins = demo.hairpins,
+                    tempoEvents = demo.tempoEvents,
+                    activeSlurGroupId = null,
+                    pendingArticulation = null,
+                    pendingAccent = null,
+                    pendingFermata = false,
+                    selectedNoteId = null,
+                    selectedAnnotation = null,
+                    isRecording = false,
+                    isPlaying = true,
+                    playheadBeat = 0f
+                )
+            )
+        }
+        val updated = _uiState.value.melody
+        if (updated.soundFontLoaded) {
+            melodyPlayer.startAudioEngine()
+        }
+        syncMelodyInstrumentToEngine(updated)
+        syncMelodySequenceToEngine(updated)
+        melodyPlayer.setTransportPlaying(true, 0L)
+    }
+
+    /**
+     * Switches primary keyboard instrument WITHOUT altering user's sustain ON/OFF state,
+     * sustain duration, or saved keyboard layout/scroll position.
+     */
+    fun selectPrimaryMelodyInstrument(instrument: StudioInstrument) {
+        val cur = _uiState.value.melody
+        if (cur.instrument == instrument) return
+        _uiState.update { st ->
+            st.copy(melody = st.melody.copy(instrument = instrument))
+        }
+        val updated = _uiState.value.melody
+        if (updated.soundFontLoaded) {
+            melodyPlayer.startAudioEngine()
+        }
+        syncMelodyInstrumentToEngine(updated)
+
+        if (!updated.isPlaying && !updated.isRecording && updated.soundFontLoaded) {
+            previewNoteJob?.cancel()
+            val previewMidi = ((instrument.defaultOctave + 1) * 12).coerceIn(PIANO_MIN_MIDI, 96)
+            previewNoteJob = viewModelScope.launch {
+                melodyPlayer.noteOn(0, previewMidi, 0.78f)
+                delay(320L)
+                melodyPlayer.noteOff(0, previewMidi)
+            }
+        }
+    }
+
+    /**
+     * Switches secondary keyboard instrument WITHOUT altering user's sustain ON/OFF state,
+     * sustain duration, or saved keyboard layout/scroll position.
+     */
+    fun selectSecondaryMelodyInstrument(instrument: StudioInstrument) {
+        val cur = _uiState.value.melody
+        if (cur.secondaryInstrument == instrument) return
+        _uiState.update { st ->
+            st.copy(melody = st.melody.copy(secondaryInstrument = instrument))
+        }
+        val updated = _uiState.value.melody
+        if (updated.soundFontLoaded) {
+            melodyPlayer.startAudioEngine()
+        }
+        syncMelodyInstrumentToEngine(updated)
+
+        if (!updated.isPlaying && !updated.isRecording && updated.soundFontLoaded) {
+            previewNoteJob?.cancel()
+            val previewMidi = MusicalNotationHelper
+                .whiteKeyIndexToMidi(updated.secondaryScrollWhiteKey.roundToInt())
+                .coerceIn(PIANO_MIN_MIDI, 96)
+            previewNoteJob = viewModelScope.launch {
+                melodyPlayer.noteOn(1, previewMidi, 0.78f)
+                delay(320L)
+                melodyPlayer.noteOff(1, previewMidi)
+            }
+        }
+    }
+
+    fun toggleDualKeyboard() {
+        val next = !_uiState.value.melody.dualKeyboardEnabled
+        if (!next) {
+            val slot1Active = activeRecordedNotes.keys.filter { it.first == 1 }
+            for (key in slot1Active) {
+                onMelodyPianoKeyUp(key.first, key.second)
+            }
+            for (midi in PIANO_MIN_MIDI..PIANO_MAX_MIDI) {
+                melodyPlayer.noteOff(1, midi)
+            }
+        }
+        _uiState.update { st ->
+            st.copy(
+                melody = st.melody.copy(
+                    dualKeyboardEnabled = next,
+                    collapseScoreInDualMode = if (!next) false else st.melody.collapseScoreInDualMode
+                )
+            )
+        }
+        syncMelodyInstrumentToEngine()
+    }
+
+    fun toggleCollapseScoreInDual() {
+        _uiState.update { st ->
+            st.copy(
+                melody = st.melody.copy(
+                    collapseScoreInDualMode = !st.melody.collapseScoreInDualMode
+                )
+            )
+        }
+    }
+
+    fun setCollapseScoreInDual(collapsed: Boolean) {
+        _uiState.update { st ->
+            if (st.melody.collapseScoreInDualMode == collapsed) {
+                st
+            } else {
+                st.copy(melody = st.melody.copy(collapseScoreInDualMode = collapsed))
+            }
+        }
+    }
+
+    fun setPrimaryKeyboardScroll(whiteKey: Float, snapFinished: Boolean) {
+        val clamped = whiteKey.coerceIn(0f, (TOTAL_VIRTUAL_WHITE_KEYS - 1).toFloat())
+        val target = if (snapFinished) clamped.roundToInt().toFloat() else clamped
+        _uiState.update { st ->
+            st.copy(melody = st.melody.copy(primaryScrollWhiteKey = target))
+        }
+    }
+
+    fun setSecondaryKeyboardScroll(whiteKey: Float, snapFinished: Boolean) {
+        val clamped = whiteKey.coerceIn(0f, (TOTAL_VIRTUAL_WHITE_KEYS - 1).toFloat())
+        val target = if (snapFinished) clamped.roundToInt().toFloat() else clamped
+        _uiState.update { st ->
+            st.copy(melody = st.melody.copy(secondaryScrollWhiteKey = target))
+        }
+    }
+
+    fun setMelodyBpm(bpm: Int) {
+        val clamped = bpm.coerceIn(40, 220)
+        _uiState.update { st ->
+            val updatedTempoEvents = st.melody.tempoEvents.map { ev ->
+                if (ev.kind == TempoEventKind.STEADY_BPM && ev.safeStartTick == 0) {
+                    val keptTerm = ev.term?.takeIf { abs(it.defaultBpm - clamped) <= 16 }
+                    ev.copy(bpm = clamped, term = keptTerm)
+                } else {
+                    ev
+                }
+            }
+            st.copy(
+                melody = st.melody.copy(
+                    bpm = clamped,
+                    tempoEvents = updatedTempoEvents
+                )
+            )
+        }
+        syncMelodySequenceToEngine()
+    }
+
+    /**
+     * Updates the score's musical Time Signature (`拍号`, e.g. `4/4`, `3/4`, `2/4`, `6/8`, `12/8`, `5/4`, `7/8`, or custom `N/D`),
+     * automatically adjusting measure count & metronome accents while preserving all recorded/written notes.
+     */
+    fun setMelodyTimeSignature(rawTimeSignature: TimeSignature) {
+        val nextSig = rawTimeSignature.sanitized()
+        val cur = _uiState.value.melody
+        if (cur.timeSignature == nextSig) return
+
+        pushMelodyUndoSnapshot()
+        val newTicksPerBar = nextSig.ticksPerBar
+        val maxEndTick = cur.notes.maxOfOrNull { it.resolvedEndTick } ?: 0
+        val neededBars = if (maxEndTick > 0) {
+            ((maxEndTick + newTicksPerBar - 1) / newTicksPerBar).coerceAtLeast(1)
+        } else {
+            cur.totalBars
+        }
+        val nextBars = maxOf(cur.totalBars, neededBars).coerceIn(1, MAX_MELODY_BARS)
+
+        val keptTuplet = cur.activeTuplet?.takeIf { it.spanTicks <= newTicksPerBar }
+        val rawCursor = if (cur.activeTuplet != null && keptTuplet == null) {
+            snapCursorOutOfActiveTuplet(cur).first
+        } else {
+            cur.cursorTick
+        }
+        val minUnit = keptTuplet?.noteTicks ?: TICKS_PER_STEP
+        val maxTick = (nextBars * newTicksPerBar - minUnit).coerceAtLeast(0)
+        val clampedCursor = rawCursor.coerceIn(0, maxTick)
+
+        _uiState.update { st ->
+            st.copy(
+                melody = st.melody.copy(
+                    timeSignature = nextSig,
+                    totalBars = nextBars,
+                    activeTuplet = keptTuplet,
+                    cursorTick = clampedCursor,
+                    tupletAnchorTick = if (keptTuplet == null) clampedCursor else st.melody.tupletAnchorTick.coerceIn(0, maxTick)
+                )
+            )
+        }
+        syncMelodySequenceToEngine()
+    }
+
+    /**
+     * Updates global Swing (`摇摆律动`) preset and immediately syncs the real-time synthesis sequence
+     * so live audition (`试听`) and offline `.wav` export (`生成音轨`) reflect the Swing feel immediately.
+     */
+    fun setMelodySwingPreset(preset: SwingPreset) {
+        if (_uiState.value.melody.swingPreset == preset) return
+        _uiState.update { st ->
+            st.copy(melody = st.melody.copy(swingPreset = preset))
+        }
+        syncMelodySequenceToEngine()
+    }
+
+    fun cycleMelodyReverb() {
+        val presets = ReverbPreset.entries
+        val cur = _uiState.value.melody.reverbPreset
+        val next = presets[(presets.indexOf(cur) + 1) % presets.size]
+        _uiState.update { st ->
+            st.copy(melody = st.melody.copy(reverbPreset = next))
+        }
+        melodyPlayer.setReverbWet(_uiState.value.melody.effectiveReverbSend)
+    }
+
+    fun togglePrimaryMelodySustain() {
+        val next = !_uiState.value.melody.sustainPedal
+        _uiState.update { st ->
+            st.copy(melody = st.melody.copy(sustainPedal = next))
+        }
+        melodyPlayer.setSustainPedal(0, next, _uiState.value.melody.sustainDurationSec)
+    }
+
+    fun toggleSecondaryMelodySustain() {
+        val next = !_uiState.value.melody.secondarySustainPedal
+        _uiState.update { st ->
+            st.copy(melody = st.melody.copy(secondarySustainPedal = next))
+        }
+        melodyPlayer.setSustainPedal(1, next, _uiState.value.melody.secondarySustainDurationSec)
+    }
+
+    fun setPrimaryMelodySustainDuration(seconds: Float) {
+        val clamped = ((seconds.coerceIn(0.030f, 10.000f) * 1000f).roundToInt()) / 1000f
+        _uiState.update { st ->
+            st.copy(melody = st.melody.copy(sustainDurationSec = clamped))
+        }
+        val mel = _uiState.value.melody
+        melodyPlayer.setSustainPedal(0, mel.sustainPedal, mel.sustainDurationSec)
+    }
+
+    fun setSecondaryMelodySustainDuration(seconds: Float) {
+        val clamped = ((seconds.coerceIn(0.030f, 10.000f) * 1000f).roundToInt()) / 1000f
+        _uiState.update { st ->
+            st.copy(melody = st.melody.copy(secondarySustainDurationSec = clamped))
+        }
+        val mel = _uiState.value.melody
+        melodyPlayer.setSustainPedal(1, mel.secondarySustainPedal, mel.secondarySustainDurationSec)
+    }
+
+    fun setMelodyInputMode(mode: MelodyInputMode) {
+        val cur = _uiState.value.melody
+        if (cur.inputMode == mode) return
+        if (cur.isRecording && mode != MelodyInputMode.LIVE_RECORD) {
+            finalizeAllActiveRecordedNotes()
+            melodyPlayer.setTransportPlaying(false, 0L)
+            _uiState.update { st ->
+                st.copy(
+                    melody = st.melody.copy(
+                        inputMode = mode,
+                        isRecording = false,
+                        isPlaying = false
+                    )
+                )
+            }
+            syncMelodySequenceToEngine()
+        } else {
+            _uiState.update { st ->
+                st.copy(melody = st.melody.copy(inputMode = mode))
+            }
+        }
+    }
+
+    /**
+     * If the step cursor is currently partway inside an incomplete tuplet group,
+     * snaps it cleanly to the end of that tuplet span (a regular 1/16th or beat boundary)
+     * so subsequent regular notes or new tuplets never drift off-grid.
+     */
+    private fun snapCursorOutOfActiveTuplet(mel: MelodyStudioUiState): Pair<Int, Int> {
+        val prevTup = mel.activeTuplet
+        val ticksPerBar = mel.ticksPerBar
+        var snappedTick = mel.cursorTick.coerceAtLeast(0)
+        if (prevTup != null) {
+            val rel = (snappedTick - mel.tupletAnchorTick).mod(prevTup.spanTicks)
+            if (rel > 0) {
+                snappedTick += (prevTup.spanTicks - rel)
+            }
+        }
+        if (snappedTick % TICKS_PER_STEP != 0) {
+            snappedTick = ((snappedTick + TICKS_PER_STEP - 1) / TICKS_PER_STEP) * TICKS_PER_STEP
+        }
+        var nextBars = mel.totalBars
+        if (snappedTick >= mel.totalTicks && mel.totalBars < MAX_MELODY_BARS) {
+            nextBars = (mel.totalBars + 2).coerceAtMost(MAX_MELODY_BARS)
+        }
+        val maxTick = (nextBars * ticksPerBar - TICKS_PER_STEP).coerceAtLeast(0)
+        return snappedTick.coerceIn(0, maxTick) to nextBars
+    }
+
+    fun setMelodyNoteDuration(preset: NoteDurationPreset) {
+        _uiState.update { st ->
+            val (nextTick, nextBars) = if (st.melody.activeTuplet != null) {
+                snapCursorOutOfActiveTuplet(st.melody)
+            } else {
+                st.melody.cursorTick to st.melody.totalBars
+            }
+            st.copy(
+                melody = st.melody.copy(
+                    noteDuration = preset,
+                    activeTuplet = null,
+                    cursorTick = nextTick,
+                    tupletAnchorTick = nextTick,
+                    totalBars = nextBars
+                )
+            )
+        }
+    }
+
+    fun setMelodyActiveTuplet(tuplet: TupletPreset?) {
+        val curMel = _uiState.value.melody
+        if (tuplet != null && tuplet.spanTicks > curMel.ticksPerBar) {
+            sendMessage("当前 ${curMel.timeSignature.label} 拍单小节时值不足以容纳「${tuplet.label}」，请选更短连音或切换拍号")
+            return
+        }
+        _uiState.update { st ->
+            val cur = st.melody
+            if (cur.activeTuplet == tuplet) return@update st
+            val ticksPerBar = cur.ticksPerBar
+            val (snappedTick, grownBars) = snapCursorOutOfActiveTuplet(cur)
+            var anchorTick = snappedTick
+            var finalBars = grownBars
+            if (tuplet != null && tuplet.spanTicks <= ticksPerBar) {
+                val remInBar = ticksPerBar - (anchorTick % ticksPerBar)
+                if (remInBar < tuplet.spanTicks) {
+                    anchorTick = ((anchorTick / ticksPerBar) + 1) * ticksPerBar
+                    if (anchorTick >= finalBars * ticksPerBar && finalBars < MAX_MELODY_BARS) {
+                        finalBars = (finalBars + 2).coerceAtMost(MAX_MELODY_BARS)
+                    }
+                }
+            }
+            val maxTick = (finalBars * ticksPerBar - (tuplet?.noteTicks ?: TICKS_PER_STEP)).coerceAtLeast(0)
+            val clampedTick = anchorTick.coerceIn(0, maxTick)
+            st.copy(
+                melody = cur.copy(
+                    activeTuplet = tuplet,
+                    cursorTick = clampedTick,
+                    tupletAnchorTick = clampedTick,
+                    totalBars = finalBars
+                )
+            )
+        }
+    }
+
+    fun toggleMelodyChordMode() {
+        _uiState.update { st ->
+            st.copy(melody = st.melody.copy(chordStepMode = !st.melody.chordStepMode))
+        }
+    }
+
+    private fun resolveStepPlacement(
+        cur: MelodyStudioUiState,
+        rawTargetTick: Int,
+        activeTuplet: TupletPreset?,
+        advanceCursor: Boolean
+    ): Triple<Int, Int, NoteTupletTag?> {
+        if (activeTuplet == null) {
+            val snapped = (rawTargetTick / TICKS_PER_STEP) * TICKS_PER_STEP
+            val durTicks = cur.noteDuration.ticks
+            return Triple(snapped, durTicks, null)
+        }
+
+        val ticksPerBar = cur.ticksPerBar
+        var targetTick = rawTargetTick.coerceAtLeast(0)
+        var anchor = cur.tupletAnchorTick
+        if (targetTick < anchor || (targetTick - anchor) % activeTuplet.noteTicks != 0) {
+            anchor = targetTick
+        }
+        val groupIdx = (targetTick - anchor) / activeTuplet.spanTicks
+        var groupStartTick = anchor + groupIdx * activeTuplet.spanTicks
+
+        // Ensure a newly started tuplet group never straddles a measure barline
+        if (activeTuplet.spanTicks <= ticksPerBar) {
+            if (targetTick == groupStartTick) {
+                val remInBar = ticksPerBar - (groupStartTick % ticksPerBar)
+                if (remInBar < activeTuplet.spanTicks) {
+                    groupStartTick = ((groupStartTick / ticksPerBar) + 1) * ticksPerBar
+                    targetTick = groupStartTick
+                }
+            } else if ((targetTick / ticksPerBar) != (groupStartTick / ticksPerBar)) {
+                groupStartTick = (targetTick / ticksPerBar) * ticksPerBar
+                targetTick = groupStartTick
+            }
+        }
+
+        val tag = NoteTupletTag(
+            count = activeTuplet.count,
+            normalCount = activeTuplet.normalCount,
+            writtenBaseDenom = activeTuplet.writtenBaseDenom,
+            groupStartTick = groupStartTick,
+            spanTicks = activeTuplet.spanTicks
+        )
+        return Triple(targetTick, activeTuplet.noteTicks, tag)
+    }
+
+    fun setMelodyTouchGuardConfig(config: PianoTouchGuardConfig) {
+        KeyboardLayoutPreferences.saveTouchGuardConfig(appContext, config)
+        _uiState.update { st ->
+            st.copy(melody = st.melody.copy(touchGuardConfig = config))
+        }
+    }
+
+    fun onMelodyPianoKeyDown(
+        slot: Int,
+        midiNote: Int,
+        velocity: Float,
+        isGlissando: Boolean = false
+    ) {
+        val safeSlot = slot.coerceIn(0, 1)
+        val safeMidi = midiNote.coerceIn(12, 108)
+        val safeVel = velocity.coerceIn(0.15f, 1.0f)
+        val cur = _uiState.value.melody
+        val guard = cur.touchGuardConfig
+        val nowMs = SystemClock.uptimeMillis()
+
+        // Suppress simultaneous fat-finger 1-semitone seam split when chord mode is off
+        if (guard.isEnabled && !isGlissando && !cur.chordStepMode) {
+            val prevStrike = recentSlotStrikes[safeSlot]
+            val clashWindowMs = if (guard.mode == TouchGuardMode.STRICT) 46L else 28L
+            if (prevStrike != null &&
+                !prevStrike.isGlissando &&
+                (nowMs - prevStrike.downWallMs) in 0L..clashWindowMs &&
+                abs(safeMidi - prevStrike.midi) == 1
+            ) {
+                return
+            }
+        }
+        recentSlotStrikes[safeSlot] = RecentLiveStrike(
+            midi = safeMidi,
+            downWallMs = nowMs,
+            isGlissando = isGlissando
+        )
+
+        if (cur.soundFontLoaded) {
+            melodyPlayer.startAudioEngine()
+        }
+        melodyPlayer.noteOn(safeSlot, safeMidi, safeVel)
+
+        if (cur.isRecording) {
+            val curTick = currentMelodyTempoMap(cur).frameToTick(melodyPlayer.currentTransportFrame())
+            val curBeat = (curTick / TICKS_PER_BEAT.toDouble()).toFloat().coerceAtLeast(0f)
+            activeRecordedNotes[safeSlot to safeMidi] = ActiveRecordedNote(
+                startBeat = curBeat,
+                velocity = safeVel,
+                downWallMs = nowMs,
+                isGlissando = isGlissando
+            )
+            return
+        }
+
+        if (cur.inputMode == MelodyInputMode.STEP_INPUT && !cur.isPlaying) {
+            val intervalOkForAutoChord = !guard.isEnabled ||
+                safeSlot != lastStepSlot ||
+                abs(safeMidi - lastStepMidi) >= 3
+            val autoChord = !cur.chordStepMode &&
+                !isGlissando &&
+                intervalOkForAutoChord &&
+                (nowMs - lastStepKeyDownWallMs) in 0L..65L &&
+                cur.notes.any { !it.isRest }
+
+            if (!autoChord) {
+                pushMelodyUndoSnapshot()
+            }
+
+            val baseTargetTick = when {
+                cur.chordStepMode -> cur.cursorTick
+                autoChord -> lastStepPlacedTick
+                else -> cur.cursorTick
+            }
+            val (targetTick, durTicks, tupletTag) = resolveStepPlacement(
+                cur = cur,
+                rawTargetTick = baseTargetTick,
+                activeTuplet = cur.activeTuplet,
+                advanceCursor = !cur.chordStepMode && !autoChord
+            )
+
+            val startBeat = targetTick.toFloat() / TICKS_PER_BEAT.toFloat()
+            val durBeats = durTicks.toFloat() / TICKS_PER_BEAT.toFloat()
+            val chordMate = cur.notes.firstOrNull { !it.isRest && abs(it.resolvedStartTick - targetTick) <= 6 }
+
+            val newNote = MelodyScoreNote(
+                midiNote = safeMidi,
+                startBeat = startBeat,
+                durationBeats = durBeats,
+                velocity = safeVel,
+                keyboardSlot = safeSlot,
+                isRest = false,
+                startTickExact = targetTick,
+                durationTicksExact = durTicks,
+                tuplet = tupletTag,
+                slurGroupId = cur.activeSlurGroupId ?: chordMate?.slurGroupId,
+                articulation = cur.pendingArticulation ?: chordMate?.articulation,
+                accent = cur.pendingAccent ?: chordMate?.accent,
+                hasFermata = cur.pendingFermata || (chordMate?.hasFermata == true)
+            )
+
+            val rawNextTick = when {
+                cur.chordStepMode -> targetTick
+                autoChord -> cur.cursorTick
+                else -> targetTick + durTicks
+            }
+
+            val ticksPerBar = cur.ticksPerBar
+            var nextBars = cur.totalBars
+            if (rawNextTick >= nextBars * ticksPerBar && nextBars < MAX_MELODY_BARS) {
+                nextBars = (nextBars + 2).coerceAtMost(MAX_MELODY_BARS)
+            }
+            val minStepUnit = cur.activeTuplet?.noteTicks ?: TICKS_PER_STEP
+            val maxTickAllowed = (nextBars * ticksPerBar - minStepUnit).coerceAtLeast(0)
+            val clampedNextTick = rawNextTick.coerceIn(0, maxTickAllowed)
+            val nextAnchor = tupletTag?.groupStartTick ?: clampedNextTick
+            val cursorAdvances = !cur.chordStepMode && !autoChord
+
+            if (cursorAdvances) {
+                lastStepKeyDownWallMs = nowMs
+                lastStepPlacedTick = targetTick
+                lastStepSlot = safeSlot
+                lastStepMidi = safeMidi
+            }
+
+            _uiState.update { st ->
+                val filtered = st.melody.notes.filterNot { existing ->
+                    val exStart = existing.resolvedStartTick
+                    val exEnd = existing.resolvedEndTick
+                    if (existing.isRest) {
+                        exStart < (targetTick + durTicks) && exEnd > targetTick
+                    } else {
+                        abs(exStart - targetTick) <= 6 &&
+                            existing.midiNote == safeMidi &&
+                            existing.keyboardSlot == safeSlot
+                    }
+                }
+                val updatedNotes = (filtered + newNote).sortedWith(
+                    compareBy<MelodyScoreNote> { it.resolvedStartTick }
+                        .thenBy { it.isRest }
+                        .thenBy { it.keyboardSlot }
+                        .thenBy { it.midiNote }
+                )
+                st.copy(
+                    melody = st.melody.copy(
+                        notes = updatedNotes,
+                        selectedNoteId = newNote.id,
+                        selectedAnnotation = null,
+                        pendingArticulation = if (cursorAdvances) null else st.melody.pendingArticulation,
+                        pendingAccent = if (cursorAdvances) null else st.melody.pendingAccent,
+                        pendingFermata = if (cursorAdvances) false else st.melody.pendingFermata,
+                        cursorTick = clampedNextTick,
+                        tupletAnchorTick = nextAnchor,
+                        totalBars = nextBars
+                    )
+                )
+            }
+            syncMelodySequenceToEngine()
+        }
+    }
+
+    fun onMelodyPianoKeyUp(slot: Int, midiNote: Int) {
+        val safeSlot = slot.coerceIn(0, 1)
+        val safeMidi = midiNote.coerceIn(12, 108)
+        melodyPlayer.noteOff(safeSlot, safeMidi)
+
+        val recordedStart = activeRecordedNotes.remove(safeSlot to safeMidi) ?: return
+        val cur = _uiState.value.melody
+        val guard = cur.touchGuardConfig
+        val nowMs = SystemClock.uptimeMillis()
+        val heldWallMs = (nowMs - recordedStart.downWallMs).coerceAtLeast(0L)
+
+        // Live-Record ultra-short neighbor-key graze filter (preserves 100% of glissandos & fast scales!)
+        if (guard.isEnabled && !recordedStart.isGlissando) {
+            val ghostMaxMs = if (guard.mode == TouchGuardMode.STRICT) 46L else 30L
+            if (heldWallMs <= ghostMaxMs) {
+                val hasConcurrentNeighbor = activeRecordedNotes.entries.any { (key, other) ->
+                    key.first == safeSlot &&
+                        abs(key.second - safeMidi) in 1..2 &&
+                        !other.isGlissando
+                } || recentSlotStrikes[safeSlot]?.let { recent ->
+                    recent.midi != safeMidi &&
+                        abs(recent.midi - safeMidi) in 1..2 &&
+                        !recent.isGlissando &&
+                        (nowMs - recent.downWallMs) <= 50L
+                } == true
+                if (hasConcurrentNeighbor) {
+                    return
+                }
+            }
+        }
+
+        val rawEndTick = currentMelodyTempoMap(cur).frameToTick(melodyPlayer.currentTransportFrame())
+        val rawEndBeat = (rawEndTick / TICKS_PER_BEAT.toDouble()).toFloat()
+        val startBeat = recordedStart.startBeat
+        val vel = recordedStart.velocity
+        val endBeat = if (rawEndBeat < startBeat) cur.totalQuarterBeats else rawEndBeat
+        val minDurBeats = when {
+            recordedStart.isGlissando -> 0.08f
+            guard.isEnabled -> 0.16f
+            else -> 0.20f
+        }
+        val durBeats = (endBeat - startBeat).coerceAtLeast(minDurBeats)
+
+        val recordedNote = MelodyScoreNote(
+            midiNote = safeMidi,
+            startBeat = startBeat,
+            durationBeats = durBeats,
+            velocity = vel,
+            keyboardSlot = safeSlot,
+            isRest = false,
+            slurGroupId = cur.activeSlurGroupId
+        )
+
+        _uiState.update { st ->
+            val updated = (st.melody.notes + recordedNote).sortedWith(
+                compareBy<MelodyScoreNote> { it.resolvedStartTick }
+                    .thenBy { it.isRest }
+                    .thenBy { it.keyboardSlot }
+                    .thenBy { it.midiNote }
+            )
+            st.copy(
+                melody = st.melody.copy(
+                    notes = updated,
+                    selectedNoteId = recordedNote.id,
+                    selectedAnnotation = null
+                )
+            )
+        }
+        syncMelodySequenceToEngine()
+    }
+
+    private fun finalizeAllActiveRecordedNotes(endBeatOverride: Float? = null) {
+        if (activeRecordedNotes.isEmpty()) return
+        val cur = _uiState.value.melody
+        val nowBeat = endBeatOverride
+            ?: (currentMelodyTempoMap(cur).frameToTick(melodyPlayer.currentTransportFrame()) / TICKS_PER_BEAT.toDouble()).toFloat()
+
+        val finalized = mutableListOf<MelodyScoreNote>()
+        val entries = activeRecordedNotes.entries.toList()
+        activeRecordedNotes.clear()
+        for ((key, rec) in entries) {
+            val (slot, midi) = key
+            melodyPlayer.noteOff(slot, midi)
+            val startBeat = rec.startBeat
+            val vel = rec.velocity
+            val endB = if (nowBeat <= startBeat) cur.totalQuarterBeats else nowBeat
+            val minDur = if (rec.isGlissando) 0.08f else 0.16f
+            val dur = (endB - startBeat).coerceAtLeast(minDur)
+            finalized.add(
+                MelodyScoreNote(
+                    midiNote = midi,
+                    startBeat = startBeat,
+                    durationBeats = dur,
+                    velocity = vel,
+                    keyboardSlot = slot,
+                    isRest = false,
+                    slurGroupId = cur.activeSlurGroupId
+                )
+            )
+        }
+        if (finalized.isNotEmpty()) {
+            _uiState.update { st ->
+                val updated = (st.melody.notes + finalized).sortedWith(
+                    compareBy<MelodyScoreNote> { it.resolvedStartTick }
+                        .thenBy { it.isRest }
+                        .thenBy { it.keyboardSlot }
+                        .thenBy { it.midiNote }
+                )
+                st.copy(melody = st.melody.copy(notes = updated))
+            }
+        }
+    }
+
+    /**
+     * Inserts an explicit silent musical Rest (`休止符`) directly onto the 5-line staff:
+     * - When [presetOverride] is null and [MelodyStudioUiState.activeTuplet] is active, inserts a Tuplet Rest
+     *   inside the current tuplet group (e.g. Triplet Rest) and advances by one tuplet slot!
+     * - Otherwise inserts a standard/dotted rest of [presetOverride] or `noteDuration`.
+     */
+    fun insertMelodyRest(presetOverride: NoteDurationPreset? = null) {
+        val cur = _uiState.value.melody
+        pushMelodyUndoSnapshot()
+
+        val useTuplet = if (presetOverride != null) null else cur.activeTuplet
+        val baseTick = if (presetOverride != null && cur.activeTuplet != null) {
+            snapCursorOutOfActiveTuplet(cur).first
+        } else {
+            cur.cursorTick
+        }
+
+        val targetTick: Int
+        val durTicks: Int
+        val tupletTag: NoteTupletTag?
+        if (useTuplet != null) {
+            val resolved = resolveStepPlacement(
+                cur = cur,
+                rawTargetTick = baseTick,
+                activeTuplet = useTuplet,
+                advanceCursor = true
+            )
+            targetTick = resolved.first
+            durTicks = resolved.second
+            tupletTag = resolved.third
+        } else {
+            val preset = presetOverride ?: cur.noteDuration
+            targetTick = (baseTick / TICKS_PER_STEP) * TICKS_PER_STEP
+            durTicks = preset.ticks
+            tupletTag = null
+        }
+
+        val startBeat = targetTick.toFloat() / TICKS_PER_BEAT.toFloat()
+        val durBeats = durTicks.toFloat() / TICKS_PER_BEAT.toFloat()
+
+        val restNote = MelodyScoreNote(
+            midiNote = DEFAULT_REST_MIDI,
+            startBeat = startBeat,
+            durationBeats = durBeats,
+            velocity = 0f,
+            keyboardSlot = 0,
+            isRest = true,
+            startTickExact = targetTick,
+            durationTicksExact = durTicks,
+            tuplet = tupletTag,
+            hasFermata = cur.pendingFermata
+        )
+
+        val ticksPerBar = cur.ticksPerBar
+        val rawNextTick = targetTick + durTicks
+        var nextBars = cur.totalBars
+        if (rawNextTick >= nextBars * ticksPerBar && nextBars < MAX_MELODY_BARS) {
+            nextBars = (nextBars + 2).coerceAtMost(MAX_MELODY_BARS)
+        }
+        val minStepUnit = useTuplet?.noteTicks ?: TICKS_PER_STEP
+        val maxTick = (nextBars * ticksPerBar - minStepUnit).coerceAtLeast(0)
+        val clampedNext = rawNextTick.coerceIn(0, maxTick)
+
+        _uiState.update { st ->
+            val filtered = st.melody.notes.filterNot { existing ->
+                existing.isRest && abs(existing.resolvedStartTick - targetTick) <= 6
+            }
+            val updated = (filtered + restNote).sortedWith(
+                compareBy<MelodyScoreNote> { it.resolvedStartTick }
+                    .thenBy { it.isRest }
+                    .thenBy { it.keyboardSlot }
+                    .thenBy { it.midiNote }
+            )
+            st.copy(
+                melody = st.melody.copy(
+                    noteDuration = presetOverride ?: st.melody.noteDuration,
+                    activeTuplet = useTuplet,
+                    notes = updated,
+                    selectedNoteId = restNote.id,
+                    selectedAnnotation = null,
+                    pendingFermata = false,
+                    cursorTick = clampedNext,
+                    tupletAnchorTick = tupletTag?.groupStartTick ?: clampedNext,
+                    totalBars = nextBars
+                )
+            )
+        }
+        syncMelodySequenceToEngine()
+    }
+
+    fun extendPreviousMelodyNote() {
+        val cur = _uiState.value.melody
+        if (cur.notes.isEmpty()) {
+            sendMessage("请先弹入一个音符或休止符，再点「延音连线」拉长时值")
+            return
+        }
+        val endingAtCursor = cur.notes.filter { abs(it.resolvedEndTick - cur.cursorTick) <= 12 }
+        val targetIds: Set<String> = when {
+            endingAtCursor.isNotEmpty() -> endingAtCursor.map { it.id }.toSet()
+            cur.selectedNoteId != null && cur.notes.any { it.id == cur.selectedNoteId } -> setOf(cur.selectedNoteId)
+            else -> setOf(cur.notes.last().id)
+        }
+
+        pushMelodyUndoSnapshot()
+        val addTicks = cur.activeTuplet?.noteTicks ?: cur.noteDuration.ticks
+        val addBeats = addTicks.toFloat() / TICKS_PER_BEAT.toFloat()
+
+        val rawNextTick = if (endingAtCursor.isNotEmpty()) {
+            cur.cursorTick + addTicks
+        } else {
+            cur.notes.filter { it.id in targetIds }.maxOf { it.resolvedEndTick + addTicks }
+        }
+
+        val ticksPerBar = cur.ticksPerBar
+        var nextBars = cur.totalBars
+        if (rawNextTick >= nextBars * ticksPerBar && nextBars < MAX_MELODY_BARS) {
+            nextBars = (nextBars + 2).coerceAtMost(MAX_MELODY_BARS)
+        }
+        val minStepUnit = cur.activeTuplet?.noteTicks ?: TICKS_PER_STEP
+        val maxTick = (nextBars * ticksPerBar - minStepUnit).coerceAtLeast(0)
+
+        _uiState.update { st ->
+            val updatedNotes = st.melody.notes.map { n ->
+                if (n.id in targetIds) {
+                    val newDurTicks = n.resolvedDurationTicks + addTicks
+                    n.copy(
+                        durationBeats = n.durationBeats + addBeats,
+                        durationTicksExact = newDurTicks,
+                        // Extending across standard beats turns a tuplet note into a sustained note
+                        tuplet = if (n.tuplet != null && newDurTicks > n.tuplet.noteTicks) null else n.tuplet
+                    )
+                } else {
+                    n
+                }
+            }
+            st.copy(
+                melody = st.melody.copy(
+                    notes = updatedNotes,
+                    cursorTick = rawNextTick.coerceIn(0, maxTick),
+                    totalBars = nextBars
+                )
+            )
+        }
+        syncMelodySequenceToEngine()
+    }
+
+    fun backspaceMelodyNote() {
+        val cur = _uiState.value.melody
+        if (cur.notes.isEmpty()) {
+            if (cur.cursorTick > 0) {
+                val stepBack = cur.activeTuplet?.noteTicks ?: cur.noteDuration.ticks
+                val prev = (cur.cursorTick - stepBack).coerceAtLeast(0)
+                _uiState.update { st -> st.copy(melody = st.melody.copy(cursorTick = prev)) }
+            }
+            return
+        }
+
+        pushMelodyUndoSnapshot()
+        val candidates = cur.notes.filter { it.resolvedStartTick <= cur.cursorTick + 6 }
+        val targetStartTick = (if (candidates.isNotEmpty()) candidates else cur.notes)
+            .maxOf { it.resolvedStartTick }
+
+        val deletedNotes = cur.notes.filter { abs(it.resolvedStartTick - targetStartTick) <= 6 }
+        val rawRemaining = cur.notes.filterNot { abs(it.resolvedStartTick - targetStartTick) <= 6 }
+        val remaining = sanitizeOrphanSlurGroups(rawRemaining, cur.activeSlurGroupId)
+        val deletedTupletGroupAnchor = deletedNotes.firstNotNullOfOrNull { it.tuplet?.groupStartTick }
+
+        _uiState.update { st ->
+            st.copy(
+                melody = st.melody.copy(
+                    notes = remaining,
+                    selectedNoteId = null,
+                    selectedAnnotation = null,
+                    cursorTick = targetStartTick.coerceAtLeast(0),
+                    tupletAnchorTick = deletedTupletGroupAnchor ?: st.melody.tupletAnchorTick
+                )
+            )
+        }
+        syncMelodySequenceToEngine()
+    }
+
+    fun deleteSelectedMelodyNote() {
+        val cur = _uiState.value.melody
+        val targetId = cur.selectedNoteId ?: return
+        val target = cur.notes.firstOrNull { it.id == targetId } ?: return
+        pushMelodyUndoSnapshot()
+        val backTick = target.resolvedStartTick.coerceAtLeast(0)
+        _uiState.update { st ->
+            val rawRemaining = st.melody.notes.filterNot { it.id == targetId }
+            val remaining = sanitizeOrphanSlurGroups(rawRemaining, st.melody.activeSlurGroupId)
+            st.copy(
+                melody = st.melody.copy(
+                    notes = remaining,
+                    selectedNoteId = null,
+                    cursorTick = backTick,
+                    tupletAnchorTick = target.tuplet?.groupStartTick ?: st.melody.tupletAnchorTick
+                )
+            )
+        }
+        syncMelodySequenceToEngine()
+    }
+
+    fun deleteSelectedMelodyItem() {
+        val cur = _uiState.value.melody
+        if (cur.selectedNoteId != null) {
+            deleteSelectedMelodyNote()
+            return
+        }
+        when (val ann = cur.selectedAnnotation) {
+            is SelectedScoreAnnotation.Dynamic -> deleteMelodyDynamicMark(ann.id)
+            is SelectedScoreAnnotation.Hairpin -> deleteMelodyHairpin(ann.id)
+            is SelectedScoreAnnotation.Tempo -> deleteMelodyTempoEvent(ann.id)
+            is SelectedScoreAnnotation.KeyChange -> deleteMelodyKeySignatureEvent(ann.id)
+            null -> Unit
+        }
+    }
+
+    fun quantizeMelodyNotes() {
+        val cur = _uiState.value.melody
+        if (cur.notes.isEmpty()) {
+            sendMessage("当前还没有音符可对齐")
+            return
+        }
+        pushMelodyUndoSnapshot()
+        val quantized = cur.notes.map { n ->
+            if (n.tuplet != null) {
+                n
+            } else {
+                val qStepStart = ((n.startBeat * STEPS_PER_BEAT).roundToInt().coerceAtLeast(0))
+                val qStepDur = ((n.durationBeats * STEPS_PER_BEAT).roundToInt().coerceAtLeast(1))
+                n.copy(
+                    startBeat = qStepStart / STEPS_PER_BEAT.toFloat(),
+                    durationBeats = qStepDur / STEPS_PER_BEAT.toFloat(),
+                    startTickExact = qStepStart * TICKS_PER_STEP,
+                    durationTicksExact = qStepDur * TICKS_PER_STEP
+                )
+            }
+        }
+        val deduped = quantized
+            .groupBy {
+                listOf(
+                    it.isRest,
+                    it.keyboardSlot,
+                    it.midiNote,
+                    it.resolvedStartTick
+                )
+            }
+            .values
+            .map { group -> group.maxBy { it.resolvedDurationTicks } }
+            .sortedWith(
+                compareBy<MelodyScoreNote> { it.resolvedStartTick }
+                    .thenBy { it.isRest }
+                    .thenBy { it.keyboardSlot }
+                    .thenBy { it.midiNote }
+            )
+
+        _uiState.update { st ->
+            st.copy(melody = st.melody.copy(notes = deduped))
+        }
+        syncMelodySequenceToEngine()
+        sendMessage("已自动对齐 ${deduped.size} 个符号（保留连音时值）")
+    }
+
+    fun addMelodyBars() {
+        val cur = _uiState.value.melody
+        if (cur.totalBars >= MAX_MELODY_BARS) {
+            sendMessage("单段打谱最多支持 $MAX_MELODY_BARS 小节（导出后可在多轨剪辑中无限拼接）")
+            return
+        }
+        pushMelodyUndoSnapshot()
+        val nextBars = (cur.totalBars + 4).coerceAtMost(MAX_MELODY_BARS)
+        _uiState.update { st ->
+            st.copy(melody = st.melody.copy(totalBars = nextBars))
+        }
+        syncMelodySequenceToEngine()
+    }
+
+    fun toggleMelodyMetronome() {
+        val next = !_uiState.value.melody.metronomeEnabled
+        _uiState.update { st ->
+            st.copy(melody = st.melody.copy(metronomeEnabled = next))
+        }
+        syncMelodySequenceToEngine()
+    }
+
+    fun toggleMelodyLoop() {
+        val next = !_uiState.value.melody.loopPlayback
+        _uiState.update { st ->
+            st.copy(melody = st.melody.copy(loopPlayback = next))
+        }
+        syncMelodySequenceToEngine()
+    }
+
+    fun toggleMelodyPlayStop() {
+        val cur = _uiState.value.melody
+        if (cur.isPlaying || cur.isRecording) {
+            if (cur.isRecording) {
+                finalizeAllActiveRecordedNotes()
+            }
+            melodyPlayer.setTransportPlaying(false, 0L)
+            melodyPlayer.allNotesOff()
+            _uiState.update { st ->
+                st.copy(
+                    melody = st.melody.copy(
+                        isPlaying = false,
+                        isRecording = false,
+                        playheadBeat = 0f
+                    )
+                )
+            }
+            syncMelodySequenceToEngine()
+        } else {
+            if (!cur.hasPlayableNotes && !cur.metronomeEnabled) {
+                sendMessage("请先在下方键盘弹入音符，或点右上角「示例曲」试听")
+                return
+            }
+            if (cur.soundFontLoaded) {
+                melodyPlayer.startAudioEngine()
+            }
+            _uiState.update { st ->
+                st.copy(
+                    melody = st.melody.copy(
+                        isPlaying = true,
+                        isRecording = false,
+                        playheadBeat = 0f
+                    )
+                )
+            }
+            val updated = _uiState.value.melody
+            syncMelodyInstrumentToEngine(updated)
+            syncMelodySequenceToEngine(updated)
+            melodyPlayer.setTransportPlaying(true, 0L)
+        }
+    }
+
+    fun toggleMelodyRecordStop() {
+        val cur = _uiState.value.melody
+        if (cur.isRecording) {
+            finalizeAllActiveRecordedNotes()
+            melodyPlayer.setTransportPlaying(false, 0L)
+            melodyPlayer.allNotesOff()
+            _uiState.update { st ->
+                st.copy(
+                    melody = st.melody.copy(
+                        isRecording = false,
+                        isPlaying = false
+                    )
+                )
+            }
+            syncMelodySequenceToEngine()
+        } else {
+            pushMelodyUndoSnapshot()
+            activeRecordedNotes.clear()
+            if (cur.soundFontLoaded) {
+                melodyPlayer.startAudioEngine()
+            }
+            _uiState.update { st ->
+                st.copy(
+                    melody = st.melody.copy(
+                        inputMode = MelodyInputMode.LIVE_RECORD,
+                        isRecording = true,
+                        isPlaying = true,
+                        playheadBeat = 0f,
+                        selectedNoteId = null,
+                        selectedAnnotation = null
+                    )
+                )
+            }
+            val updated = _uiState.value.melody
+            syncMelodyInstrumentToEngine(updated)
+            syncMelodySequenceToEngine(updated)
+            melodyPlayer.setTransportPlaying(true, 0L)
+        }
+    }
+
+    fun setMelodyCursorTick(tick: Int) {
+        val cur = _uiState.value.melody
+        val minStepUnit = cur.activeTuplet?.noteTicks ?: TICKS_PER_STEP
+        val clamped = tick.coerceIn(0, (cur.totalTicks - minStepUnit).coerceAtLeast(0))
+        _uiState.update { st ->
+            st.copy(
+                melody = st.melody.copy(
+                    cursorTick = clamped,
+                    tupletAnchorTick = clamped
+                )
+            )
+        }
+        if (cur.isPlaying && !cur.isRecording) {
+            val targetFrame = currentMelodyTempoMap(cur).tickToFrame(clamped.toDouble())
+            melodyPlayer.seekTransport(targetFrame)
+        }
+    }
+
+    fun selectMelodyNote(noteId: String?) {
+        _uiState.update { st ->
+            val note = noteId?.let { id -> st.melody.notes.firstOrNull { it.id == id } }
+            val nextTick = note?.resolvedStartTick ?: st.melody.cursorTick
+            val minStepUnit = st.melody.activeTuplet?.noteTicks ?: TICKS_PER_STEP
+            val clampedTick = nextTick.coerceIn(0, (st.melody.totalTicks - minStepUnit).coerceAtLeast(0))
+            val nextAnchor = note?.tuplet?.groupStartTick ?: st.melody.tupletAnchorTick
+            st.copy(
+                melody = st.melody.copy(
+                    selectedNoteId = noteId,
+                    selectedAnnotation = if (noteId != null) null else st.melody.selectedAnnotation,
+                    cursorTick = clampedTick,
+                    tupletAnchorTick = nextAnchor
+                )
+            )
+        }
+        val selected = noteId?.let { id -> _uiState.value.melody.notes.firstOrNull { it.id == id } }
+        if (selected != null && !selected.isRest && !_uiState.value.melody.isPlaying && !_uiState.value.melody.isRecording) {
+            previewNoteJob?.cancel()
+            val slot = selected.keyboardSlot.coerceIn(0, 1)
+            previewNoteJob = viewModelScope.launch {
+                melodyPlayer.noteOn(slot, selected.midiNote, selected.velocity)
+                delay(240L)
+                melodyPlayer.noteOff(slot, selected.midiNote)
+            }
+        }
+    }
+
+    fun selectMelodyAnnotation(annotation: SelectedScoreAnnotation?) {
+        _uiState.update { st ->
+            val cur = st.melody
+            val jumpTick = when (annotation) {
+                is SelectedScoreAnnotation.Dynamic ->
+                    cur.dynamicMarks.firstOrNull { it.id == annotation.id }?.tick
+                is SelectedScoreAnnotation.Hairpin ->
+                    cur.hairpins.firstOrNull { it.id == annotation.id }?.safeStartTick
+                is SelectedScoreAnnotation.Tempo ->
+                    cur.tempoEvents.firstOrNull { it.id == annotation.id }?.safeStartTick
+                is SelectedScoreAnnotation.KeyChange ->
+                    cur.keySignatureEvents.firstOrNull { it.id == annotation.id }?.let {
+                        it.safeBarIndex * cur.ticksPerBar
+                    }
+                null -> null
+            }
+            val minStepUnit = cur.activeTuplet?.noteTicks ?: TICKS_PER_STEP
+            val nextTick = (jumpTick ?: cur.cursorTick)
+                .coerceIn(0, (cur.totalTicks - minStepUnit).coerceAtLeast(0))
+            st.copy(
+                melody = cur.copy(
+                    selectedAnnotation = annotation,
+                    selectedNoteId = if (annotation != null) null else cur.selectedNoteId,
+                    cursorTick = nextTick,
+                    tupletAnchorTick = if (jumpTick != null) nextTick else cur.tupletAnchorTick
+                )
+            )
+        }
+    }
+
+    // ========================================================================
+    // Phrase Slur (`乐句连线 / 圆滑线`), Articulations, Accents, Fermata,
+    // Dynamics (`pp..ff`, `sfz`, `fp`), Hairpins (`<` / `>`), & Tempo Map
+    // ========================================================================
+
+    fun toggleMelodyPhraseSlurMode() {
+        val cur = _uiState.value.melody
+        if (cur.activeSlurGroupId != null) {
+            val cleaned = sanitizeOrphanSlurGroups(cur.notes, activeSlurGroupId = null)
+            val notesChanged = cleaned != cur.notes
+            _uiState.update { st ->
+                st.copy(
+                    melody = st.melody.copy(
+                        activeSlurGroupId = null,
+                        notes = cleaned
+                    )
+                )
+            }
+            if (notesChanged) {
+                syncMelodySequenceToEngine()
+            }
+        } else {
+            val freshGroupId = UUID.randomUUID().toString()
+            _uiState.update { st ->
+                st.copy(melody = st.melody.copy(activeSlurGroupId = freshGroupId))
+            }
+        }
+    }
+
+    /**
+     * Retroactively links the selected pitched note (or note at cursor) with the next pitched note
+     * into a Phrase Slur (`乐句连线`), or extends an existing slur by one more subsequent note onset!
+     * If the selected note is currently the very last note on the score, connects it into live slur mode
+     * so the next piano note played automatically joins this slur!
+     */
+    fun slurSelectedOrExtendNext() {
+        val cur = _uiState.value.melody
+        val pitchedNotes = cur.notes
+            .filterNot { it.isRest }
+            .sortedBy { it.resolvedStartTick }
+        if (pitchedNotes.isEmpty()) {
+            toggleMelodyPhraseSlurMode()
+            return
+        }
+
+        val anchorNote = cur.selectedNote?.takeIf { !it.isRest }
+            ?: pitchedNotes.firstOrNull { abs(it.resolvedStartTick - cur.cursorTick) <= 6 }
+            ?: pitchedNotes.lastOrNull { it.resolvedStartTick <= cur.cursorTick + 6 }
+            ?: pitchedNotes.first()
+
+        val existingGid = anchorNote.slurGroupId
+        if (existingGid != null) {
+            val currentMaxOnset = pitchedNotes
+                .filter { it.slurGroupId == existingGid }
+                .maxOfOrNull { it.resolvedStartTick } ?: anchorNote.resolvedStartTick
+            val nextOnset = pitchedNotes
+                .firstOrNull { it.resolvedStartTick > currentMaxOnset + 6 }
+                ?.resolvedStartTick
+            if (nextOnset == null) {
+                _uiState.update { st ->
+                    st.copy(melody = st.melody.copy(activeSlurGroupId = existingGid))
+                }
+                sendMessage("已激活当前乐句连线，继续弹奏下一个音符将自动连入本乐句")
+                return
+            }
+            pushMelodyUndoSnapshot()
+            val absorbIds = pitchedNotes
+                .filter { abs(it.resolvedStartTick - nextOnset) <= 6 }
+                .map { it.id }
+                .toSet()
+            _uiState.update { st ->
+                val rawUpdated = st.melody.notes.map { n ->
+                    if (n.id in absorbIds) n.copy(slurGroupId = existingGid) else n
+                }
+                val cleaned = sanitizeOrphanSlurGroups(rawUpdated, st.melody.activeSlurGroupId)
+                st.copy(melody = st.melody.copy(notes = cleaned))
+            }
+            syncMelodySequenceToEngine()
+            return
+        }
+
+        val anchorOnset = anchorNote.resolvedStartTick
+        val nextOnset = pitchedNotes
+            .firstOrNull { it.resolvedStartTick > anchorOnset + 6 }
+            ?.resolvedStartTick
+        val newSlurId = UUID.randomUUID().toString()
+        pushMelodyUndoSnapshot()
+
+        if (nextOnset == null) {
+            val anchorIds = pitchedNotes
+                .filter { abs(it.resolvedStartTick - anchorOnset) <= 6 }
+                .map { it.id }
+                .toSet()
+            _uiState.update { st ->
+                val updated = st.melody.notes.map { n ->
+                    if (n.id in anchorIds) n.copy(slurGroupId = newSlurId) else n
+                }
+                st.copy(
+                    melody = st.melody.copy(
+                        notes = updated,
+                        activeSlurGroupId = newSlurId
+                    )
+                )
+            }
+            syncMelodySequenceToEngine()
+            sendMessage("已从当前音符开启乐句连线，请继续弹奏后续音符")
+            return
+        }
+
+        val targetNextExistingGroup = pitchedNotes
+            .firstOrNull { abs(it.resolvedStartTick - nextOnset) <= 6 }
+            ?.slurGroupId
+        val mergedGroupId = targetNextExistingGroup ?: newSlurId
+        val joinIds = pitchedNotes
+            .filter {
+                abs(it.resolvedStartTick - anchorOnset) <= 6 ||
+                    abs(it.resolvedStartTick - nextOnset) <= 6
+            }
+            .map { it.id }
+            .toSet()
+
+        _uiState.update { st ->
+            val rawUpdated = st.melody.notes.map { n ->
+                if (n.id in joinIds) n.copy(slurGroupId = mergedGroupId) else n
+            }
+            val cleaned = sanitizeOrphanSlurGroups(rawUpdated, st.melody.activeSlurGroupId)
+            st.copy(melody = st.melody.copy(notes = cleaned))
+        }
+        syncMelodySequenceToEngine()
+    }
+
+    /**
+     * Wraps all pitched notes starting within `[startTick, endTick]` into a single Phrase Slur (`乐句连线`).
+     */
+    fun applyMelodySlurSpan(startTick: Int, endTick: Int) {
+        val cur = _uiState.value.melody
+        val lo = minOf(startTick, endTick).coerceAtLeast(0)
+        val hi = maxOf(startTick, endTick).coerceAtLeast(lo + TICKS_PER_STEP)
+        val matching = cur.notes.filter { !it.isRest && it.resolvedStartTick >= lo - 6 && it.resolvedStartTick < hi - 4 }
+        val distinctOnsets = matching.map { it.resolvedStartTick }.distinct()
+        if (distinctOnsets.size < 2) {
+            sendMessage("所选区间内至少需要 2 个发声音符才能添加乐句连线")
+            return
+        }
+        pushMelodyUndoSnapshot()
+        val newSlurId = UUID.randomUUID().toString()
+        val targetIds = matching.map { it.id }.toSet()
+        _uiState.update { st ->
+            val rawUpdated = st.melody.notes.map { n ->
+                if (n.id in targetIds) n.copy(slurGroupId = newSlurId) else n
+            }
+            val cleaned = sanitizeOrphanSlurGroups(rawUpdated, st.melody.activeSlurGroupId)
+            st.copy(melody = st.melody.copy(notes = cleaned))
+        }
+        syncMelodySequenceToEngine()
+        sendMessage("已为 ${distinctOnsets.size} 个音符添加乐句连线 (Legato)")
+    }
+
+    fun clearSelectedMelodySlur(slurGroupIdOverride: String? = null) {
+        val cur = _uiState.value.melody
+        val targetGroupId = slurGroupIdOverride
+            ?: cur.selectedNote?.slurGroupId
+            ?: cur.notes.firstOrNull { !it.isRest && abs(it.resolvedStartTick - cur.cursorTick) <= 6 }?.slurGroupId
+        if (targetGroupId == null) {
+            if (cur.activeSlurGroupId != null) {
+                toggleMelodyPhraseSlurMode()
+            } else {
+                sendMessage("当前选中的音符没有乐句连线")
+            }
+            return
+        }
+        pushMelodyUndoSnapshot()
+        _uiState.update { st ->
+            val updated = st.melody.notes.map { n ->
+                if (n.slurGroupId == targetGroupId) n.copy(slurGroupId = null) else n
+            }
+            st.copy(
+                melody = st.melody.copy(
+                    notes = updated,
+                    activeSlurGroupId = if (st.melody.activeSlurGroupId == targetGroupId) null else st.melody.activeSlurGroupId
+                )
+            )
+        }
+        syncMelodySequenceToEngine()
+    }
+
+    fun toggleMelodyArticulation(articulation: NoteArticulation?) {
+        val cur = _uiState.value.melody
+        val sel = cur.selectedNote?.takeIf { !it.isRest }
+        if (sel != null) {
+            pushMelodyUndoSnapshot()
+            val nextArt = if (articulation == null || sel.articulation == articulation) null else articulation
+            val chordIds = cur.notes
+                .filter { !it.isRest && abs(it.resolvedStartTick - sel.resolvedStartTick) <= 6 && it.keyboardSlot == sel.keyboardSlot }
+                .map { it.id }
+                .toSet()
+            _uiState.update { st ->
+                val updated = st.melody.notes.map { n ->
+                    if (n.id in chordIds) n.copy(articulation = nextArt) else n
+                }
+                st.copy(melody = st.melody.copy(notes = updated))
+            }
+            syncMelodySequenceToEngine()
+        } else {
+            _uiState.update { st ->
+                val nextPending = if (articulation == null || st.melody.pendingArticulation == articulation) null else articulation
+                st.copy(melody = st.melody.copy(pendingArticulation = nextPending))
+            }
+        }
+    }
+
+    fun toggleMelodyAccent(accent: NoteAccent?) {
+        val cur = _uiState.value.melody
+        val sel = cur.selectedNote?.takeIf { !it.isRest }
+        if (sel != null) {
+            pushMelodyUndoSnapshot()
+            val nextAcc = if (accent == null || sel.accent == accent) null else accent
+            val chordIds = cur.notes
+                .filter { !it.isRest && abs(it.resolvedStartTick - sel.resolvedStartTick) <= 6 && it.keyboardSlot == sel.keyboardSlot }
+                .map { it.id }
+                .toSet()
+            _uiState.update { st ->
+                val updated = st.melody.notes.map { n ->
+                    if (n.id in chordIds) n.copy(accent = nextAcc) else n
+                }
+                st.copy(melody = st.melody.copy(notes = updated))
+            }
+            syncMelodySequenceToEngine()
+        } else {
+            _uiState.update { st ->
+                val nextPending = if (accent == null || st.melody.pendingAccent == accent) null else accent
+                st.copy(melody = st.melody.copy(pendingAccent = nextPending))
+            }
+        }
+    }
+
+    fun toggleMelodyFermata() {
+        val cur = _uiState.value.melody
+        val sel = cur.selectedNote
+        if (sel != null) {
+            pushMelodyUndoSnapshot()
+            val nextFermata = !sel.hasFermata
+            val onsetIds = cur.notes
+                .filter { abs(it.resolvedStartTick - sel.resolvedStartTick) <= 6 }
+                .map { it.id }
+                .toSet()
+            _uiState.update { st ->
+                val updated = st.melody.notes.map { n ->
+                    if (n.id in onsetIds) n.copy(hasFermata = nextFermata) else n
+                }
+                st.copy(melody = st.melody.copy(notes = updated))
+            }
+            syncMelodySequenceToEngine()
+        } else {
+            _uiState.update { st ->
+                st.copy(melody = st.melody.copy(pendingFermata = !st.melody.pendingFermata))
+            }
+        }
+    }
+
+    fun upsertMelodyDynamicMark(tick: Int, level: DynamicLevel, editingId: String? = null) {
+        val cur = _uiState.value.melody
+        pushMelodyUndoSnapshot()
+        val cleanTick = tick.coerceAtLeast(0)
+        val ticksPerBar = cur.ticksPerBar
+        var nextBars = cur.totalBars
+        if (cleanTick >= nextBars * ticksPerBar && nextBars < MAX_MELODY_BARS) {
+            nextBars = ((cleanTick / ticksPerBar) + 1).coerceIn(cur.totalBars, MAX_MELODY_BARS)
+        }
+        val clampedTick = cleanTick.coerceAtMost((nextBars * ticksPerBar - TICKS_PER_STEP).coerceAtLeast(0))
+        val mark = ScoreDynamicMark(
+            id = editingId ?: UUID.randomUUID().toString(),
+            tick = clampedTick,
+            level = level
+        )
+        _uiState.update { st ->
+            val filtered = st.melody.dynamicMarks.filterNot {
+                it.id == mark.id || abs(it.tick - clampedTick) <= 10
+            }
+            val updated = (filtered + mark).sortedBy { it.tick }
+            st.copy(
+                melody = st.melody.copy(
+                    dynamicMarks = updated,
+                    totalBars = nextBars,
+                    selectedAnnotation = SelectedScoreAnnotation.Dynamic(mark.id),
+                    selectedNoteId = null
+                )
+            )
+        }
+        syncMelodySequenceToEngine()
+    }
+
+    fun deleteMelodyDynamicMark(id: String) {
+        val cur = _uiState.value.melody
+        if (cur.dynamicMarks.none { it.id == id }) return
+        pushMelodyUndoSnapshot()
+        _uiState.update { st ->
+            val clearedSel = if ((st.melody.selectedAnnotation as? SelectedScoreAnnotation.Dynamic)?.id == id) {
+                null
+            } else {
+                st.melody.selectedAnnotation
+            }
+            st.copy(
+                melody = st.melody.copy(
+                    dynamicMarks = st.melody.dynamicMarks.filterNot { it.id == id },
+                    selectedAnnotation = clearedSel
+                )
+            )
+        }
+        syncMelodySequenceToEngine()
+    }
+
+    fun upsertMelodyHairpin(
+        startTick: Int,
+        endTick: Int,
+        type: HairpinType,
+        editingId: String? = null
+    ) {
+        val cur = _uiState.value.melody
+        pushMelodyUndoSnapshot()
+        val safeStart = minOf(startTick, endTick).coerceAtLeast(0)
+        val safeEnd = maxOf(endTick, safeStart + TICKS_PER_STEP * 2)
+        val ticksPerBar = cur.ticksPerBar
+        var nextBars = cur.totalBars
+        if (safeEnd > nextBars * ticksPerBar && nextBars < MAX_MELODY_BARS) {
+            nextBars = ((safeEnd + ticksPerBar - 1) / ticksPerBar).coerceIn(cur.totalBars, MAX_MELODY_BARS)
+        }
+        val maxScoreTick = nextBars * ticksPerBar
+        val clampedStart = safeStart.coerceAtMost((maxScoreTick - TICKS_PER_STEP * 2).coerceAtLeast(0))
+        val clampedEnd = safeEnd.coerceIn(clampedStart + TICKS_PER_STEP, maxScoreTick)
+        val hairpin = ScoreHairpin(
+            id = editingId ?: UUID.randomUUID().toString(),
+            startTick = clampedStart,
+            endTick = clampedEnd,
+            type = type
+        )
+        _uiState.update { st ->
+            val filtered = st.melody.hairpins.filterNot { existing ->
+                existing.id == hairpin.id ||
+                    (existing.safeStartTick < clampedEnd - 6 && existing.safeEndTick > clampedStart + 6)
+            }
+            val updated = (filtered + hairpin).sortedBy { it.safeStartTick }
+            st.copy(
+                melody = st.melody.copy(
+                    hairpins = updated,
+                    totalBars = nextBars,
+                    selectedAnnotation = SelectedScoreAnnotation.Hairpin(hairpin.id),
+                    selectedNoteId = null
+                )
+            )
+        }
+        syncMelodySequenceToEngine()
+    }
+
+    fun deleteMelodyHairpin(id: String) {
+        val cur = _uiState.value.melody
+        if (cur.hairpins.none { it.id == id }) return
+        pushMelodyUndoSnapshot()
+        _uiState.update { st ->
+            val clearedSel = if ((st.melody.selectedAnnotation as? SelectedScoreAnnotation.Hairpin)?.id == id) {
+                null
+            } else {
+                st.melody.selectedAnnotation
+            }
+            st.copy(
+                melody = st.melody.copy(
+                    hairpins = st.melody.hairpins.filterNot { it.id == id },
+                    selectedAnnotation = clearedSel
+                )
+            )
+        }
+        syncMelodySequenceToEngine()
+    }
+
+    fun upsertMelodyTempoEvent(rawEvent: ScoreTempoEvent) {
+        val cur = _uiState.value.melody
+        pushMelodyUndoSnapshot()
+        val ticksPerBar = cur.ticksPerBar
+        val safeStart = rawEvent.safeStartTick
+        val rawEnd = rawEvent.safeEndTick
+        var nextBars = cur.totalBars
+        if (maxOf(safeStart + TICKS_PER_STEP, rawEnd) > nextBars * ticksPerBar && nextBars < MAX_MELODY_BARS) {
+            nextBars = ((maxOf(safeStart + TICKS_PER_STEP, rawEnd) + ticksPerBar - 1) / ticksPerBar)
+                .coerceIn(cur.totalBars, MAX_MELODY_BARS)
+        }
+        val maxScoreTick = nextBars * ticksPerBar
+        val clampedStart = safeStart.coerceAtMost((maxScoreTick - TICKS_PER_STEP).coerceAtLeast(0))
+        val clampedEnd = when (rawEvent.kind) {
+            TempoEventKind.RITARDANDO, TempoEventKind.ACCELERANDO ->
+                rawEnd.coerceIn(clampedStart + TICKS_PER_BEAT, maxScoreTick)
+            else -> clampedStart
+        }
+        val cleanBpm = rawEvent.bpm.coerceIn(36, 240)
+        val cleanTarget = rawEvent.targetBpm?.coerceIn(32, 240)
+        val event = rawEvent.copy(
+            startTick = clampedStart,
+            endTick = clampedEnd,
+            bpm = cleanBpm,
+            targetBpm = cleanTarget
+        )
+        val isRamp = event.kind == TempoEventKind.RITARDANDO || event.kind == TempoEventKind.ACCELERANDO
+
+        _uiState.update { st ->
+            val filtered = st.melody.tempoEvents.filterNot { existing ->
+                if (existing.id == event.id) return@filterNot true
+                val exRamp = existing.kind == TempoEventKind.RITARDANDO || existing.kind == TempoEventKind.ACCELERANDO
+                if (isRamp && exRamp) {
+                    existing.safeStartTick < clampedEnd - 6 && existing.safeEndTick > clampedStart + 6
+                } else if (!isRamp && !exRamp) {
+                    abs(existing.safeStartTick - clampedStart) <= 10
+                } else {
+                    false
+                }
+            }
+            val updated = (filtered + event).sortedBy { it.safeStartTick }
+            val nextTopBpm = if (event.kind == TempoEventKind.STEADY_BPM && clampedStart == 0) {
+                cleanBpm.coerceIn(40, 220)
+            } else {
+                st.melody.bpm
+            }
+            st.copy(
+                melody = st.melody.copy(
+                    bpm = nextTopBpm,
+                    tempoEvents = updated,
+                    totalBars = nextBars,
+                    selectedAnnotation = SelectedScoreAnnotation.Tempo(event.id),
+                    selectedNoteId = null
+                )
+            )
+        }
+        syncMelodySequenceToEngine()
+    }
+
+    fun deleteMelodyTempoEvent(id: String) {
+        val cur = _uiState.value.melody
+        if (cur.tempoEvents.none { it.id == id }) return
+        pushMelodyUndoSnapshot()
+        _uiState.update { st ->
+            val clearedSel = if ((st.melody.selectedAnnotation as? SelectedScoreAnnotation.Tempo)?.id == id) {
+                null
+            } else {
+                st.melody.selectedAnnotation
+            }
+            st.copy(
+                melody = st.melody.copy(
+                    tempoEvents = st.melody.tempoEvents.filterNot { it.id == id },
+                    selectedAnnotation = clearedSel
+                )
+            )
+        }
+        syncMelodySequenceToEngine()
+    }
+
+    // ========================================================================
+    // Key Signature & Mid-Score Modulation (`调号 + 中途变调`, Lossless Pitch)
+    // ========================================================================
+
+    fun setMelodyInitialKeySignature(rawKeySignature: KeySignature) {
+        val nextKey = rawKeySignature.sanitized()
+        val cur = _uiState.value.melody
+        if (cur.initialKeySignature == nextKey) return
+        pushMelodyUndoSnapshot()
+        _uiState.update { st ->
+            st.copy(
+                melody = st.melody.copy(
+                    initialKeySignature = nextKey,
+                    selectedAnnotation = null
+                )
+            )
+        }
+    }
+
+    fun upsertMelodyKeySignatureEvent(
+        barIndex: Int,
+        rawKeySignature: KeySignature,
+        editingId: String? = null
+    ) {
+        val nextKey = rawKeySignature.sanitized()
+        if (barIndex <= 0) {
+            setMelodyInitialKeySignature(nextKey)
+            return
+        }
+        val cleanBar = barIndex.coerceIn(1, MAX_MELODY_BARS - 1)
+        val cur = _uiState.value.melody
+        pushMelodyUndoSnapshot()
+        val nextBars = maxOf(cur.totalBars, cleanBar + 1).coerceIn(1, MAX_MELODY_BARS)
+        val ev = ScoreKeySignatureEvent(
+            id = editingId ?: UUID.randomUUID().toString(),
+            barIndex = cleanBar,
+            keySignature = nextKey
+        )
+        _uiState.update { st ->
+            val filtered = st.melody.keySignatureEvents.filterNot {
+                it.id == ev.id || it.safeBarIndex == cleanBar
+            }
+            val updated = (filtered + ev).sortedBy { it.safeBarIndex }
+            st.copy(
+                melody = st.melody.copy(
+                    keySignatureEvents = updated,
+                    totalBars = nextBars,
+                    selectedAnnotation = SelectedScoreAnnotation.KeyChange(ev.id),
+                    selectedNoteId = null
+                )
+            )
+        }
+        syncMelodySequenceToEngine()
+    }
+
+    fun deleteMelodyKeySignatureEvent(id: String) {
+        val cur = _uiState.value.melody
+        if (cur.keySignatureEvents.none { it.id == id }) return
+        pushMelodyUndoSnapshot()
+        _uiState.update { st ->
+            val clearedSel = if ((st.melody.selectedAnnotation as? SelectedScoreAnnotation.KeyChange)?.id == id) {
+                null
+            } else {
+                st.melody.selectedAnnotation
+            }
+            st.copy(
+                melody = st.melody.copy(
+                    keySignatureEvents = st.melody.keySignatureEvents.filterNot { it.id == id },
+                    selectedAnnotation = clearedSel
+                )
+            )
+        }
+    }
+
+    // ========================================================================
+    // Score Draft Serialization, Multi-Project CRUD, Auto-Save & File I/O
+    // ========================================================================
+
+    private fun onMelodyStateObservedForAutoSave(mel: MelodyStudioUiState) {
+        val fp = MelodyProjectRepository.computeContentFingerprint(mel)
+        val isDirty = (fp != lastSavedMelodyFingerprint) &&
+            (mel.currentProjectId != null || MelodyProjectRepository.hasMeaningfulContent(mel))
+        if (mel.isProjectDirty != isDirty) {
+            _uiState.update { st ->
+                if (st.melody.isProjectDirty == isDirty) st
+                else st.copy(melody = st.melody.copy(isProjectDirty = isDirty))
+            }
+        }
+        if (fp == lastObservedMelodyFingerprint) return
+        lastObservedMelodyFingerprint = fp
+
+        autoSaveDebounceJob?.cancel()
+        autoSaveDebounceJob = viewModelScope.launch {
+            delay(650L)
+            val snapshot = _uiState.value.melody
+            val summary = withContext(Dispatchers.IO) {
+                MelodyProjectRepository.writeAutoSaveDraft(appContext, snapshot)
+                MelodyProjectRepository.readAutoSaveSummary(appContext)
+            }
+            _uiState.update { st ->
+                if (st.melody.autoSaveDraftSummary == summary) st
+                else st.copy(melody = st.melody.copy(autoSaveDraftSummary = summary))
+            }
+        }
+    }
+
+    fun flushMelodyAutoSaveNow() {
+        autoSaveDebounceJob?.cancel()
+        val snapshot = _uiState.value.melody
+        viewModelScope.launch(Dispatchers.IO) {
+            MelodyProjectRepository.writeAutoSaveDraft(appContext, snapshot)
+            val summary = MelodyProjectRepository.readAutoSaveSummary(appContext)
+            _uiState.update { st ->
+                if (st.melody.autoSaveDraftSummary == summary) st
+                else st.copy(melody = st.melody.copy(autoSaveDraftSummary = summary))
+            }
+        }
+    }
+
+    private fun applyLoadedMelodyState(
+        loadedState: MelodyStudioUiState,
+        projectId: String?,
+        markClean: Boolean
+    ) {
+        val cur = _uiState.value.melody
+        if (cur.isPlaying || cur.isRecording) {
+            if (cur.isRecording) finalizeAllActiveRecordedNotes()
+            melodyPlayer.setTransportPlaying(false, 0L)
+            melodyPlayer.allNotesOff()
+        }
+        pushMelodyUndoSnapshot()
+
+        val fp = MelodyProjectRepository.computeContentFingerprint(loadedState)
+        if (markClean) {
+            lastSavedMelodyFingerprint = fp
+        }
+        lastObservedMelodyFingerprint = fp
+
+        _uiState.update { st ->
+            val projects = MelodyProjectRepository.listProjects(appContext)
+            val autoSummary = MelodyProjectRepository.readAutoSaveSummary(appContext)
+            st.copy(
+                melody = loadedState.copy(
+                    touchGuardConfig = st.melody.touchGuardConfig,
+                    currentProjectId = projectId,
+                    isProjectDirty = !markClean && MelodyProjectRepository.hasMeaningfulContent(loadedState),
+                    savedProjects = projects,
+                    autoSaveDraftSummary = autoSummary,
+                    soundFontLoaded = st.melody.soundFontLoaded,
+                    canUndo = melodyUndoStack.isNotEmpty(),
+                    canRedo = melodyRedoStack.isNotEmpty(),
+                    isPlaying = false,
+                    isRecording = false,
+                    playheadBeat = 0f
+                )
+            )
+        }
+
+        val updated = _uiState.value.melody
+        if (updated.soundFontLoaded && _uiState.value.workspaceMode == AppWorkspaceMode.MELODY_STUDIO) {
+            melodyPlayer.startAudioEngine()
+        }
+        syncMelodyInstrumentToEngine(updated)
+        syncMelodySequenceToEngine(updated)
+        flushMelodyAutoSaveNow()
+    }
+
+    fun createNewBlankMelodyProject() {
+        val cur = _uiState.value.melody
+        val blank = MelodyStudioUiState(
+            instrument = cur.instrument,
+            secondaryInstrument = cur.secondaryInstrument,
+            dualKeyboardEnabled = cur.dualKeyboardEnabled,
+            primaryScrollWhiteKey = cur.primaryScrollWhiteKey,
+            secondaryScrollWhiteKey = cur.secondaryScrollWhiteKey,
+            touchGuardConfig = cur.touchGuardConfig,
+            sustainPedal = cur.sustainPedal,
+            secondarySustainPedal = cur.secondarySustainPedal,
+            sustainDurationSec = cur.sustainDurationSec,
+            secondarySustainDurationSec = cur.secondarySustainDurationSec,
+            reverbPreset = cur.reverbPreset,
+            metronomeEnabled = cur.metronomeEnabled
+        )
+        applyLoadedMelodyState(loadedState = blank, projectId = null, markClean = true)
+        sendMessage("已新建空白乐谱（支持随时撤销返回上一份草稿）")
+    }
+
+    fun saveCurrentMelodyProject(
+        overwriteCurrent: Boolean,
+        customTitle: String? = null
+    ) {
+        val cur = _uiState.value.melody
+        val cleanTitle = MelodyProjectRepository.sanitizeDisplayTitle(customTitle ?: cur.scoreTitle)
+        val targetId = if (overwriteCurrent) cur.currentProjectId else null
+        viewModelScope.launch {
+            val savedSummary = withContext(Dispatchers.IO) {
+                MelodyProjectRepository.saveProject(
+                    context = appContext,
+                    state = cur.copy(scoreTitle = cleanTitle),
+                    existingProjectId = targetId,
+                    customTitle = cleanTitle
+                )
+            }
+            if (savedSummary == null) {
+                sendMessage("保存乐谱失败")
+                return@launch
+            }
+            val updatedList = withContext(Dispatchers.IO) {
+                MelodyProjectRepository.listProjects(appContext)
+            }
+            val updatedMel = _uiState.value.melody.copy(
+                scoreTitle = cleanTitle,
+                currentProjectId = savedSummary.id,
+                isProjectDirty = false,
+                savedProjects = updatedList
+            )
+            val fp = MelodyProjectRepository.computeContentFingerprint(updatedMel)
+            lastSavedMelodyFingerprint = fp
+            lastObservedMelodyFingerprint = fp
+            _uiState.update { st -> st.copy(melody = updatedMel) }
+            flushMelodyAutoSaveNow()
+            sendMessage("已保存乐谱「$cleanTitle」")
+        }
+    }
+
+    fun loadMelodyProject(projectId: String) {
+        viewModelScope.launch {
+            val loaded = withContext(Dispatchers.IO) {
+                MelodyProjectRepository.loadProject(appContext, projectId)
+            }
+            if (loaded == null) {
+                sendMessage("读取乐谱失败：文件不存在或已损坏")
+                return@launch
+            }
+            applyLoadedMelodyState(
+                loadedState = loaded.state,
+                projectId = projectId,
+                markClean = true
+            )
+            sendMessage("已读取乐谱「${loaded.state.scoreTitle}」")
+        }
+    }
+
+    fun restoreMelodyAutoSaveDraft() {
+        viewModelScope.launch {
+            val draft = withContext(Dispatchers.IO) {
+                MelodyProjectRepository.readAutoSaveDraft(appContext)
+            }
+            if (draft == null) {
+                sendMessage("暂无可恢复的自动保存草稿")
+                return@launch
+            }
+            applyLoadedMelodyState(
+                loadedState = draft.state,
+                projectId = draft.projectId,
+                markClean = false
+            )
+            sendMessage("已恢复自动保存草稿「${draft.state.scoreTitle}」")
+        }
+    }
+
+    fun renameMelodyProject(projectId: String, newTitle: String) {
+        val clean = MelodyProjectRepository.sanitizeDisplayTitle(newTitle)
+        viewModelScope.launch {
+            val ok = withContext(Dispatchers.IO) {
+                MelodyProjectRepository.renameProject(appContext, projectId, clean)
+            }
+            if (!ok) {
+                sendMessage("重命名乐谱失败")
+                return@launch
+            }
+            val projects = withContext(Dispatchers.IO) {
+                MelodyProjectRepository.listProjects(appContext)
+            }
+            _uiState.update { st ->
+                val isCurrent = st.melody.currentProjectId == projectId
+                val nextMel = st.melody.copy(
+                    scoreTitle = if (isCurrent) clean else st.melody.scoreTitle,
+                    savedProjects = projects
+                )
+                if (isCurrent) {
+                    val fp = MelodyProjectRepository.computeContentFingerprint(nextMel)
+                    lastSavedMelodyFingerprint = fp
+                    lastObservedMelodyFingerprint = fp
+                }
+                st.copy(melody = nextMel)
+            }
+            sendMessage("已重命名为「$clean」")
+        }
+    }
+
+    fun deleteMelodyProject(projectId: String) {
+        viewModelScope.launch {
+            val ok = withContext(Dispatchers.IO) {
+                MelodyProjectRepository.deleteProject(appContext, projectId)
+            }
+            if (!ok) return@launch
+            val projects = withContext(Dispatchers.IO) {
+                MelodyProjectRepository.listProjects(appContext)
+            }
+            _uiState.update { st ->
+                val wasCurrent = st.melody.currentProjectId == projectId
+                st.copy(
+                    melody = st.melody.copy(
+                        currentProjectId = if (wasCurrent) null else st.melody.currentProjectId,
+                        isProjectDirty = if (wasCurrent) {
+                            MelodyProjectRepository.hasMeaningfulContent(st.melody)
+                        } else {
+                            st.melody.isProjectDirty
+                        },
+                        savedProjects = projects
+                    )
+                )
+            }
+            sendMessage("已删除已存乐谱")
+        }
+    }
+
+    private suspend fun resolveProjectJsonForExport(
+        projectId: String?,
+        customTitle: String?
+    ): Pair<String, String>? = withContext(Dispatchers.IO) {
+        if (!projectId.isNullOrBlank()) {
+            val loaded = MelodyProjectRepository.loadProject(appContext, projectId) ?: return@withContext null
+            val title = MelodyProjectRepository.sanitizeDisplayTitle(customTitle ?: loaded.state.scoreTitle)
+            val json = MelodyProjectRepository.serializeToJson(
+                state = loaded.state.copy(scoreTitle = title),
+                projectId = projectId
+            )
+            json to title
+        } else {
+            val cur = _uiState.value.melody
+            val title = MelodyProjectRepository.sanitizeDisplayTitle(customTitle ?: cur.scoreTitle)
+            val json = MelodyProjectRepository.serializeToJson(
+                state = cur.copy(scoreTitle = title),
+                projectId = cur.currentProjectId
+            )
+            json to title
+        }
+    }
+
+    fun shareMelodyProjectFile(
+        projectId: String?,
+        customTitle: String?,
+        targetWeChatDirectly: Boolean
+    ) {
+        viewModelScope.launch {
+            val pair = resolveProjectJsonForExport(projectId, customTitle) ?: run {
+                sendMessage("导出乐谱工程失败")
+                return@launch
+            }
+            val (json, title) = pair
+            val intent = withContext(Dispatchers.IO) {
+                MelodyProjectRepository.prepareProjectShareIntent(
+                    context = appContext,
+                    jsonContent = json,
+                    displayTitle = title,
+                    targetWeChatDirectly = targetWeChatDirectly
+                )
+            }
+            refreshStorageInfo()
+            if (intent != null) {
+                _events.trySend(StudioUiEvent.LaunchShareIntent(intent))
+            } else {
+                sendMessage("创建工程分享失败")
+            }
+        }
+    }
+
+    fun saveMelodyProjectFileToDownloads(projectId: String?, customTitle: String?) {
+        viewModelScope.launch {
+            val pair = resolveProjectJsonForExport(projectId, customTitle) ?: run {
+                sendMessage("导出乐谱工程失败")
+                return@launch
+            }
+            val (json, title) = pair
+            val relPath = withContext(Dispatchers.IO) {
+                MelodyProjectRepository.saveProjectJsonToDownloads(appContext, json, title)
+            }
+            if (relPath != null) {
+                sendMessage("乐谱工程已导出至：$relPath")
+            } else {
+                sendMessage("导出乐谱工程到本地失败")
+            }
+        }
+    }
+
+    fun saveMelodyProjectFileToCustomUri(
+        projectId: String?,
+        customTitle: String?,
+        targetUri: Uri
+    ) {
+        viewModelScope.launch {
+            val pair = resolveProjectJsonForExport(projectId, customTitle) ?: run {
+                sendMessage("导出乐谱工程失败")
+                return@launch
+            }
+            val (json, title) = pair
+            val ok = withContext(Dispatchers.IO) {
+                MelodyProjectRepository.saveProjectJsonToUri(appContext, json, targetUri)
+            }
+            if (ok) {
+                sendMessage("已保存乐谱工程「$title」到所选位置")
+            } else {
+                sendMessage("另存乐谱工程失败")
+            }
+        }
+    }
+
+    fun importMelodyProjectFromUri(srcUri: Uri) {
+        viewModelScope.launch {
+            val imported = withContext(Dispatchers.IO) {
+                MelodyProjectRepository.importProjectFromUri(appContext, srcUri)
+            }
+            if (imported == null) {
+                sendMessage("导入失败：请选择有效的 SoundTracker 乐谱工程文件 (.json)")
+                return@launch
+            }
+            val savedSummary = withContext(Dispatchers.IO) {
+                MelodyProjectRepository.saveProject(
+                    context = appContext,
+                    state = imported.state,
+                    existingProjectId = null,
+                    customTitle = imported.state.scoreTitle
+                )
+            }
+            if (_uiState.value.workspaceMode != AppWorkspaceMode.MELODY_STUDIO) {
+                setWorkspaceMode(AppWorkspaceMode.MELODY_STUDIO)
+            }
+            applyLoadedMelodyState(
+                loadedState = imported.state,
+                projectId = savedSummary?.id,
+                markClean = savedSummary != null
+            )
+            sendMessage("已导入并打开乐谱「${imported.state.scoreTitle}」")
+        }
+    }
+
+    // ========================================================================
+    // Export 5-Line Staff Sheet Music as Vector PDF (WeChat / System / Local)
+    // ========================================================================
+
+    fun shareMelodyScorePdf(customTitle: String, targetWeChatDirectly: Boolean) {
+        val cleanTitle = customTitle.trim().ifBlank { "未命名乐谱" }
+        setMelodyScoreTitle(cleanTitle)
+        val snapshotMel = _uiState.value.melody.copy(scoreTitle = cleanTitle)
+
+        viewModelScope.launch {
+            val tmpPdf = File(SessionWorkspaceManager.tempDir(appContext), "staff_${System.nanoTime()}.pdf")
+            try {
+                val rendered = withContext(Dispatchers.IO) {
+                    StaffScoreEngraver.exportScoreToPdfFile(snapshotMel, tmpPdf)
+                }
+                if (!rendered) {
+                    sendMessage("五线谱 PDF 生成失败")
+                    return@launch
+                }
+                val shareRes = SessionWorkspaceManager.preparePdfShareIntent(
+                    context = appContext,
+                    sourcePdfFile = tmpPdf,
+                    customTitle = cleanTitle,
+                    targetWeChatDirectly = targetWeChatDirectly
+                )
+                refreshStorageInfo()
+                shareRes.fold(
+                    onSuccess = { intent ->
+                        _events.trySend(StudioUiEvent.LaunchShareIntent(intent))
+                    },
+                    onFailure = { err ->
+                        sendMessage("分享五线谱 PDF 失败：${err.message ?: "未知错误"}")
+                    }
+                )
+            } finally {
+                if (tmpPdf.exists()) tmpPdf.delete()
+            }
+        }
+    }
+
+    fun saveMelodyScorePdfToDownloads(customTitle: String) {
+        val cleanTitle = customTitle.trim().ifBlank { "未命名乐谱" }
+        setMelodyScoreTitle(cleanTitle)
+        val snapshotMel = _uiState.value.melody.copy(scoreTitle = cleanTitle)
+
+        viewModelScope.launch {
+            val tmpPdf = File(SessionWorkspaceManager.tempDir(appContext), "staff_dl_${System.nanoTime()}.pdf")
+            try {
+                val rendered = withContext(Dispatchers.IO) {
+                    StaffScoreEngraver.exportScoreToPdfFile(snapshotMel, tmpPdf)
+                }
+                if (!rendered) {
+                    sendMessage("五线谱 PDF 生成失败")
+                    return@launch
+                }
+                val res = SessionWorkspaceManager.savePdfToPublicDownloads(
+                    context = appContext,
+                    sourcePdfFile = tmpPdf,
+                    customTitle = cleanTitle
+                )
+                res.fold(
+                    onSuccess = { relPath ->
+                        sendMessage("五线谱 PDF 已存到本地：$relPath")
+                    },
+                    onFailure = { err ->
+                        sendMessage("保存 PDF 失败：${err.message ?: "未知错误"}")
+                    }
+                )
+            } finally {
+                if (tmpPdf.exists()) tmpPdf.delete()
+            }
+        }
+    }
+
+    fun saveMelodyScorePdfToCustomUri(customTitle: String, targetUri: Uri) {
+        val cleanTitle = customTitle.trim().ifBlank { "未命名乐谱" }
+        setMelodyScoreTitle(cleanTitle)
+        val snapshotMel = _uiState.value.melody.copy(scoreTitle = cleanTitle)
+
+        viewModelScope.launch {
+            val tmpPdf = File(SessionWorkspaceManager.tempDir(appContext), "staff_saf_${System.nanoTime()}.pdf")
+            try {
+                val rendered = withContext(Dispatchers.IO) {
+                    StaffScoreEngraver.exportScoreToPdfFile(snapshotMel, tmpPdf)
+                }
+                if (!rendered) {
+                    sendMessage("五线谱 PDF 生成失败")
+                    return@launch
+                }
+                val res = SessionWorkspaceManager.savePdfToCustomUri(
+                    context = appContext,
+                    sourcePdfFile = tmpPdf,
+                    targetUri = targetUri
+                )
+                res.fold(
+                    onSuccess = { name ->
+                        sendMessage("五线谱 PDF 已保存到所选目录：$name")
+                    },
+                    onFailure = { err ->
+                        sendMessage("另存 PDF 失败：${err.message ?: "未知错误"}")
+                    }
+                )
+            } finally {
+                if (tmpPdf.exists()) tmpPdf.delete()
+            }
+        }
+    }
+
+    /**
+     * Renders the composed melody offline with both independent keyboard SoundFont2 slots + Stereo Reverb/Chorus
+     * into a 44.1kHz lossless `.wav` file and places it directly into `工作台音轨` (same list as imported songs).
+     */
+    fun exportMelodyToWorkspace() {
+        val cur = _uiState.value.melody
+        if (!cur.hasPlayableNotes) {
+            sendMessage("请先在键盘上输入发声音符（或点「示例曲」体验）再生成音轨")
+            return
+        }
+        if (_uiState.value.processingTask != null) return
+
+        if (cur.isPlaying || cur.isRecording) {
+            finalizeAllActiveRecordedNotes()
+            melodyPlayer.setTransportPlaying(false, 0L)
+            melodyPlayer.allNotesOff()
+            _uiState.update { st ->
+                st.copy(melody = st.melody.copy(isPlaying = false, isRecording = false))
+            }
+        }
+
+        val snapshotMel = _uiState.value.melody
+        val inst0 = snapshotMel.instrument
+        val inst1 = snapshotMel.secondaryInstrument
+        val pitchedNotes = snapshotMel.notes.filterNot { it.isRest }
+        val hasSlot0 = pitchedNotes.any { it.keyboardSlot == 0 }
+        val hasSlot1 = pitchedNotes.any { it.keyboardSlot == 1 }
+        val instSummaryTitle = when {
+            hasSlot0 && hasSlot1 && inst0 != inst1 -> "${inst0.displayName}+${inst1.displayName}"
+            !hasSlot0 && hasSlot1 -> inst1.displayName
+            else -> inst0.displayName
+        }
+        val instShortSummary = when {
+            hasSlot0 && hasSlot1 && inst0 != inst1 -> "${inst0.shortName}+${inst1.shortName}"
+            !hasSlot0 && hasSlot1 -> inst1.shortName
+            else -> inst0.shortName
+        }
+        val compiledSchedule = snapshotMel.compileSchedule(MELODY_SAMPLE_RATE)
+        val nativeNotes = compiledSchedule.notes
+        val seqFrames = compiledSchedule.totalFrames
+        val openingBpm = compiledSchedule.tempoMap.bpmAtTick(0)
+
+        activeProcessingJob = viewModelScope.launch {
+            val outWav = SessionWorkspaceManager.createSessionTrackFile(appContext, "melody", "wav")
+            try {
+                NativeAudioEngine.nativeResetCancel()
+                _uiState.update {
+                    it.copy(
+                        processingTask = ProcessingTaskState(
+                            title = "正在生成「$instSummaryTitle」旋律音轨",
+                            subtitle = "正在渲染真实采样音源与自然延音尾韵...",
+                            progress = 0.08f,
+                            cancellable = true
+                        )
+                    )
+                }
+
+                val outcome = NativeAudioEngine.renderMelodyToWav(
+                    context = appContext,
+                    bank0 = inst0.bank,
+                    preset0 = inst0.presetNumber,
+                    gainDb0 = inst0.gainDb,
+                    reverbSend = snapshotMel.effectiveReverbSend,
+                    chorus0 = inst0.chorusDepth,
+                    sustain0 = snapshotMel.sustainPedal,
+                    sustainSec0 = snapshotMel.sustainDurationSec,
+                    bank1 = inst1.bank,
+                    preset1 = inst1.presetNumber,
+                    gainDb1 = inst1.gainDb,
+                    chorus1 = inst1.chorusDepth,
+                    sustain1 = snapshotMel.secondarySustainPedal,
+                    sustainSec1 = snapshotMel.secondarySustainDurationSec,
+                    notes = nativeNotes,
+                    sequenceDurationFrames = seqFrames,
+                    outputSampleRate = MELODY_SAMPLE_RATE,
+                    outputWav = outWav
+                ) { p ->
+                    _uiState.update { st ->
+                        st.copy(
+                            processingTask = st.processingTask?.copy(
+                                progress = (0.08f + p * 0.80f).coerceIn(0.08f, 0.88f)
+                            )
+                        )
+                    }
+                }
+
+                when (outcome) {
+                    is VocalSeparationOutcome.Cancelled -> {
+                        outWav.delete()
+                        sendMessage("已取消生成旋律音轨")
+                        return@launch
+                    }
+                    is VocalSeparationOutcome.Error -> {
+                        outWav.delete()
+                        sendMessage("生成旋律失败：${outcome.message}")
+                        return@launch
+                    }
+                    is VocalSeparationOutcome.Success -> Unit
+                }
+
+                _uiState.update { st ->
+                    st.copy(
+                        processingTask = st.processingTask?.copy(
+                            subtitle = "正在写入工作台音轨列表...",
+                            progress = 0.93f
+                        )
+                    )
+                }
+
+                val rawMetrics = NativeAudioEngine.analyzeWav(outWav) ?: run {
+                    outWav.delete()
+                    sendMessage("旋律音频分析失败")
+                    return@launch
+                }
+                val exactMetrics = rawMetrics.copy(detectedBpm = openingBpm)
+
+                val idx = melodyExportCounter++
+                val filePrefix = when {
+                    hasSlot0 && hasSlot1 && inst0 != inst1 -> "${inst0.shortName}_${inst1.shortName}"
+                    !hasSlot0 && hasSlot1 -> inst1.displayName
+                    else -> inst0.displayName
+                }
+                val customTitlePart = snapshotMel.scoreTitle.trim()
+                    .takeIf { it.isNotBlank() && it != "未命名乐谱" }
+                val rawTrackName = if (customTitlePart != null) {
+                    "${customTitlePart}_${filePrefix}"
+                } else {
+                    "${filePrefix}_旋律${String.format(Locale.US, "%02d", idx)}"
+                }
+                val displayName = AudioCodecHelper.sanitizeFileName(rawTrackName)
+                val swingNote = if (snapshotMel.swingPreset.isEnabled) " · ${snapshotMel.swingPreset.shortBadge}" else ""
+                val timeSigLabel = snapshotMel.timeSignature.label
+                val bpmInt = openingBpm.roundToInt()
+                val newTrack = SessionTrack(
+                    displayName = displayName,
+                    badge = "打谱 · $instShortSummary · ${timeSigLabel}拍 · ${bpmInt}BPM$swingNote",
+                    detailNote = "${pitchedNotes.size}音 · ${timeSigLabel}拍$swingNote · ${snapshotMel.reverbPreset.label} · ${formatMetricsSummary(exactMetrics)}",
+                    audioFile = outWav,
+                    originTrackId = null,
+                    metrics = exactMetrics
+                ).let { it.copy(originTrackId = it.id) }
+
+                stopMelodyPlaybackAndEngine()
+                _uiState.update { st -> st.copy(workspaceMode = AppWorkspaceMode.SINGLE_TRACK) }
+                appendTrackToWorkspace(newTrack)
+                refreshStorageInfo()
+                sendMessage("已将「$displayName」放入工作台音轨，可直接试听或点剪刀送入多轨剪辑")
+            } catch (_: CancellationException) {
+                outWav.delete()
+            } catch (e: Throwable) {
+                outWav.delete()
+                sendMessage("生成旋律异常：${e.message ?: "未知错误"}")
+            } finally {
+                _uiState.update { it.copy(processingTask = null) }
+            }
+        }
+    }
+
     override fun onCleared() {
         super.onCleared()
+        previewNoteJob?.cancel()
         updateCheckJob?.cancel()
         updateDownloadJob?.cancel()
+        runCatching { melodyPlayer.release() }
         runCatching { arrangerPlayer.release() }
         runCatching { exoPlayer.release() }
     }

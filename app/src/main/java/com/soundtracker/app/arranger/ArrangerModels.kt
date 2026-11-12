@@ -12,6 +12,7 @@ const val ARRANGER_SAMPLE_RATE = 44100
 
 enum class AppWorkspaceMode {
     SINGLE_TRACK,
+    MELODY_STUDIO,
     MULTI_TRACK_ARRANGER
 }
 
