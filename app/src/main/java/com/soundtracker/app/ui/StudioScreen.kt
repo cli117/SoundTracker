@@ -135,6 +135,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
@@ -4709,7 +4710,8 @@ private fun AppUpdateBottomSheet(
                             ) {
                                 Row(
                                     verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    modifier = Modifier.weight(1f, fill = false)
                                 ) {
                                     Surface(
                                         shape = RoundedCornerShape(6.dp),
@@ -4723,7 +4725,30 @@ private fun AppUpdateBottomSheet(
                                             modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
                                         )
                                     }
-                                    if (release.apkSizeBytes > 0L) {
+                                    if (release.isIncrementalAvailable) {
+                                        Surface(
+                                            shape = RoundedCornerShape(6.dp),
+                                            color = EmeraldLossless.copy(alpha = 0.14f),
+                                            border = BorderStroke(1.dp, EmeraldLossless.copy(alpha = 0.45f))
+                                        ) {
+                                            Text(
+                                                text = "增量仅 ${formatBytesShort(release.effectiveDownloadBytes)}",
+                                                fontSize = 10.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                color = EmeraldLossless,
+                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                            )
+                                        }
+                                        if (release.apkSizeBytes > 0L) {
+                                            Text(
+                                                text = formatBytesShort(release.apkSizeBytes),
+                                                fontSize = 10.sp,
+                                                fontFamily = FontFamily.Monospace,
+                                                textDecoration = TextDecoration.LineThrough,
+                                                color = TextMuted
+                                            )
+                                        }
+                                    } else if (release.apkSizeBytes > 0L) {
                                         Text(
                                             text = formatBytesShort(release.apkSizeBytes),
                                             fontSize = 11.sp,
@@ -4839,7 +4864,10 @@ private fun AppUpdateBottomSheet(
                     Spacer(modifier = Modifier.height(14.dp))
 
                     if (appUpdate.isDownloading) {
-                        val frac = if (appUpdate.totalBytes > 0L) {
+                        val isMerging = appUpdate.isMergingPatch
+                        val frac = if (isMerging) {
+                            appUpdate.mergeProgressFraction.coerceIn(0f, 1f)
+                        } else if (appUpdate.totalBytes > 0L) {
                             (appUpdate.downloadedBytes.toFloat() / appUpdate.totalBytes.toFloat()).coerceIn(0f, 1f)
                         } else {
                             0f
@@ -4850,6 +4878,12 @@ private fun AppUpdateBottomSheet(
                         } else {
                             "正在连接..."
                         }
+                        val statusColor = if (isMerging) EmeraldLossless else CyanPrimary
+                        val statusText = when {
+                            isMerging -> "正在本机合成完整安装包（校验签名）· $pctInt%"
+                            appUpdate.activeDownloadIsDelta -> "正在下载增量差分包 · $pctInt% ($speedStr)"
+                            else -> "正在下载安装包 · $pctInt% ($speedStr)"
+                        }
 
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -4857,13 +4891,15 @@ private fun AppUpdateBottomSheet(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
-                                text = "正在下载安装包 · $pctInt% ($speedStr)",
+                                text = statusText,
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.SemiBold,
-                                color = CyanPrimary
+                                color = statusColor
                             )
                             Text(
-                                text = if (appUpdate.totalBytes > 0L) {
+                                text = if (isMerging) {
+                                    formatBytesShort(release.apkSizeBytes)
+                                } else if (appUpdate.totalBytes > 0L) {
                                     "${formatBytesShort(appUpdate.downloadedBytes)} / ${formatBytesShort(appUpdate.totalBytes)}"
                                 } else {
                                     formatBytesShort(appUpdate.downloadedBytes)
@@ -4880,7 +4916,7 @@ private fun AppUpdateBottomSheet(
                                 .fillMaxWidth()
                                 .height(8.dp)
                                 .clip(RoundedCornerShape(4.dp)),
-                            color = CyanPrimary,
+                            color = statusColor,
                             trackColor = StudioSurfaceElevated
                         )
                         Spacer(modifier = Modifier.height(12.dp))
@@ -4916,6 +4952,8 @@ private fun AppUpdateBottomSheet(
                                 Text(
                                     text = if (appUpdate.hasReadyApk) {
                                         "安装包已就绪 · 立即安装"
+                                    } else if (release.isIncrementalAvailable) {
+                                        "增量下载并更新 (${formatBytesShort(release.effectiveDownloadBytes)})"
                                     } else if (release.apkSizeBytes > 0L) {
                                         "下载并更新 (${formatBytesShort(release.apkSizeBytes)})"
                                     } else {

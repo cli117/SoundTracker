@@ -25,6 +25,7 @@ models/
 
 # Build Outputs & Keystores
 *.apk
+*.stpatch
 *.aab
 *.ap_
 *.dex

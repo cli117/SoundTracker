@@ -2741,7 +2741,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 )
             }
 
-            val result = AppUpdateManager.fetchLatestRelease()
+            val result = AppUpdateManager.fetchLatestRelease(appContext)
             val timeStr = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm", Locale.CHINA))
 
             result.fold(
@@ -2767,7 +2767,16 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     }
                     if (manual) {
                         if (newer) {
-                            sendMessage("发现新版本 ${release.tagName}，可直接下载更新")
+                            if (release.isIncrementalAvailable) {
+                                val mbStr = String.format(
+                                    Locale.US,
+                                    "%.1f MB",
+                                    release.effectiveDownloadBytes / (1024.0 * 1024.0)
+                                )
+                                sendMessage("发现新版本 ${release.tagName}（支持增量更新，仅需 $mbStr）")
+                            } else {
+                                sendMessage("发现新版本 ${release.tagName}，可直接下载更新")
+                            }
                         } else {
                             sendMessage("当前已是最新版本 v$curVer")
                         }
@@ -2830,8 +2839,11 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 st.copy(
                     appUpdate = st.appUpdate.copy(
                         isDownloading = true,
+                        activeDownloadIsDelta = release.isIncrementalAvailable,
+                        isMergingPatch = false,
+                        mergeProgressFraction = 0f,
                         downloadedBytes = 0L,
-                        totalBytes = release.apkSizeBytes,
+                        totalBytes = release.effectiveDownloadBytes,
                         speedBytesPerSec = 0L,
                         errorMessage = null
                     )
@@ -2842,7 +2854,18 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 val res = AppUpdateManager.downloadReleaseApk(
                     context = appContext,
                     release = release,
-                    channel = channel
+                    channel = channel,
+                    onStageChanged = { isDelta, isMerging, mergeFrac ->
+                        _uiState.update { st ->
+                            st.copy(
+                                appUpdate = st.appUpdate.copy(
+                                    activeDownloadIsDelta = isDelta,
+                                    isMergingPatch = isMerging,
+                                    mergeProgressFraction = mergeFrac
+                                )
+                            )
+                        }
+                    }
                 ) { downloaded, total, speed ->
                     _uiState.update { st ->
                         st.copy(
@@ -2861,6 +2884,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                             st.copy(
                                 appUpdate = st.appUpdate.copy(
                                     isDownloading = false,
+                                    isMergingPatch = false,
+                                    mergeProgressFraction = 1f,
                                     downloadedBytes = apkFile.length(),
                                     totalBytes = apkFile.length(),
                                     speedBytesPerSec = 0L,
@@ -2878,6 +2903,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                             st.copy(
                                 appUpdate = st.appUpdate.copy(
                                     isDownloading = false,
+                                    isMergingPatch = false,
                                     speedBytesPerSec = 0L,
                                     errorMessage = "$msg（可尝试切换下载通道或用浏览器打开）"
                                 )
@@ -2891,6 +2917,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     st.copy(
                         appUpdate = st.appUpdate.copy(
                             isDownloading = false,
+                            isMergingPatch = false,
                             speedBytesPerSec = 0L
                         )
                     )
