@@ -646,6 +646,351 @@ object StaffScoreEngraver {
         )
     }
 
+    data class CursorScreenGeom(
+        val x: Float,
+        val handleCenterY: Float,
+        val handleRadius: Float,
+        val activeTopY: Float,
+        val activeBottomY: Float,
+        val fullTopY: Float,
+        val fullBottomY: Float
+    ) {
+        fun isInHandleHotzone(px: Float, py: Float, extraX: Float, extraY: Float): Boolean {
+            return abs(px - x) <= (handleRadius + extraX) &&
+                py >= (handleCenterY - handleRadius - extraY) &&
+                py <= (activeTopY + handleRadius * 0.9f + extraY * 0.55f)
+        }
+
+        fun isInLineHotzone(px: Float, py: Float, halfWidthPx: Float, extraY: Float): Boolean {
+            return abs(px - x) <= halfWidthPx &&
+                py >= (fullTopY - extraY) &&
+                py <= (fullBottomY + extraY)
+        }
+    }
+
+    private fun resolveCursorColor(
+        melody: MelodyStudioUiState,
+        palette: OnScreenPalette
+    ): Int = when {
+        melody.activeSlurGroupId != null -> Color.rgb(26, 122, 94)
+        melody.activeTuplet != null -> palette.selectedColor
+        else -> palette.cursorColor
+    }
+
+    private fun drawStepCursorWithHandle(
+        canvas: Canvas,
+        cx: Float,
+        trebleTopY: Float,
+        bassTopY: Float,
+        bottomStaffBottomY: Float,
+        staffHeight: Float,
+        lineSpacing: Float,
+        grandStaff: Boolean,
+        activeStaff: StaffPart,
+        cursorColor: Int,
+        paperBgColor: Int,
+        isDraggingCursor: Boolean,
+        minClampTopY: Float? = null,
+        maxClampBottomY: Float? = null
+    ): CursorScreenGeom {
+        if (grandStaff) {
+            val ghostGuidePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.argb(
+                    if (isDraggingCursor) 96 else 68,
+                    Color.red(cursorColor),
+                    Color.green(cursorColor),
+                    Color.blue(cursorColor)
+                )
+                strokeWidth = max(1.1f, lineSpacing * 0.11f)
+                style = Paint.Style.STROKE
+                pathEffect = DashPathEffect(floatArrayOf(lineSpacing * 0.45f, lineSpacing * 0.55f), 0f)
+            }
+            val gTop = minClampTopY?.let { max(it, trebleTopY - lineSpacing * 0.6f) } ?: (trebleTopY - lineSpacing * 0.6f)
+            val gBot = maxClampBottomY?.let { min(it, bottomStaffBottomY + lineSpacing * 0.6f) } ?: (bottomStaffBottomY + lineSpacing * 0.6f)
+            canvas.drawLine(cx, gTop, cx, gBot, ghostGuidePaint)
+        }
+
+        val activeStaffTopY = if (grandStaff && activeStaff == StaffPart.BASS) bassTopY else trebleTopY
+        val activeStaffBotY = if (grandStaff) (activeStaffTopY + staffHeight) else bottomStaffBottomY
+        val pinTipY = (activeStaffTopY - lineSpacing * 0.64f).let { y ->
+            minClampTopY?.let { max(it + 8f, y) } ?: y
+        }
+        val baseCapR = max(5.2f, lineSpacing * 0.66f)
+        val capR = if (isDraggingCursor) baseCapR * 1.18f else baseCapR
+        val capCenterY = (pinTipY - capR * 1.46f).let { y ->
+            minClampTopY?.let { max(it + capR + 1f, y) } ?: y
+        }
+
+        val lineTopY = min(pinTipY, activeStaffTopY - lineSpacing * 0.85f)
+        val lineBotY = (activeStaffBotY + lineSpacing * 1.05f).let { y ->
+            maxClampBottomY?.let { min(it, y) } ?: y
+        }
+
+        val cursorPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = cursorColor
+            strokeWidth = max(1.9f, lineSpacing * (if (isDraggingCursor) 0.22f else 0.17f))
+            style = Paint.Style.STROKE
+            pathEffect = DashPathEffect(floatArrayOf(lineSpacing * 0.65f, lineSpacing * 0.45f), 0f)
+        }
+        canvas.drawLine(cx, lineTopY, cx, lineBotY, cursorPaint)
+
+        // Soft halo ring when actively grabbed/scrubbing
+        if (isDraggingCursor) {
+            val haloPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.argb(
+                    48,
+                    Color.red(cursorColor),
+                    Color.green(cursorColor),
+                    Color.blue(cursorColor)
+                )
+                style = Paint.Style.FILL
+            }
+            canvas.drawCircle(cx, capCenterY, capR * 1.85f, haloPaint)
+        }
+
+        // Teardrop / Inverted Shield-Pin Handle (`水滴/倒三角游标头`)
+        val handleFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = cursorColor
+            style = Paint.Style.FILL
+        }
+        canvas.drawCircle(cx, capCenterY, capR, handleFillPaint)
+        val conePath = Path().apply {
+            moveTo(cx - capR * 0.86f, capCenterY + capR * 0.48f)
+            lineTo(cx + capR * 0.86f, capCenterY + capR * 0.48f)
+            lineTo(cx, max(pinTipY, capCenterY + capR * 0.95f))
+            close()
+        }
+        canvas.drawPath(conePath, handleFillPaint)
+
+        // Crisp warm-ivory keyhole center dot inside the handle bulb
+        val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = paperBgColor
+            style = Paint.Style.FILL
+        }
+        canvas.drawCircle(cx, capCenterY, capR * 0.34f, dotPaint)
+
+        val fullTopY = if (grandStaff) min(capCenterY - capR, trebleTopY - lineSpacing * 0.6f) else (capCenterY - capR)
+        val fullBotY = if (grandStaff) max(lineBotY, bottomStaffBottomY + lineSpacing * 0.6f) else lineBotY
+        return CursorScreenGeom(
+            x = cx,
+            handleCenterY = capCenterY,
+            handleRadius = baseCapR,
+            activeTopY = activeStaffTopY,
+            activeBottomY = activeStaffBotY,
+            fullTopY = fullTopY,
+            fullBottomY = fullBotY
+        )
+    }
+
+    private fun drawCursorScrubBubble(
+        canvas: Canvas,
+        geom: CursorScreenGeom,
+        viewportWidth: Float,
+        viewportHeight: Float,
+        minLeftX: Float,
+        lineSpacing: Float,
+        cursorColor: Int,
+        melody: MelodyStudioUiState,
+        grandStaff: Boolean
+    ) {
+        val label = MusicalNotationHelper.formatCursorBubbleLabel(
+            tick = melody.cursorTick,
+            timeSignature = melody.timeSignature,
+            staffPart = if (grandStaff) melody.activeStaff else null
+        )
+        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(250, 248, 243) // StudioSurface warm ivory
+            textSize = max(13.5f, lineSpacing * 1.10f)
+            typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+        }
+        val textW = textPaint.measureText(label)
+        val padX = max(9f, lineSpacing * 0.92f)
+        val pillW = textW + padX * 2f
+        val pillH = max(23f, lineSpacing * 1.92f)
+        val caretH = max(4.5f, lineSpacing * 0.42f)
+
+        val preferredTop = geom.handleCenterY - geom.handleRadius - caretH - pillH - lineSpacing * 0.32f
+        val placeBelow = preferredTop < 3f && (geom.activeBottomY + pillH + caretH + lineSpacing * 0.9f) <= (viewportHeight - 3f)
+        val pillTop = if (placeBelow) {
+            (geom.activeBottomY + caretH + lineSpacing * 0.65f).coerceAtMost(viewportHeight - pillH - 3f)
+        } else {
+            preferredTop.coerceAtLeast(3f)
+        }
+        val pillBottom = pillTop + pillH
+        val safeMinLeft = minLeftX.coerceAtLeast(4f)
+        val safeMaxLeft = (viewportWidth - pillW - 4f).coerceAtLeast(safeMinLeft)
+        val pillLeft = (geom.x - pillW * 0.5f).coerceIn(safeMinLeft, safeMaxLeft)
+        val pillRect = RectF(pillLeft, pillTop, pillLeft + pillW, pillBottom)
+        val cornerR = pillH * 0.48f
+
+        val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(242, 31, 30, 27) // VioletAccent warm ink
+            style = Paint.Style.FILL
+        }
+        val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = cursorColor
+            strokeWidth = max(1.2f, lineSpacing * 0.12f)
+            style = Paint.Style.STROKE
+        }
+        canvas.drawRoundRect(pillRect, cornerR, cornerR, bgPaint)
+        canvas.drawRoundRect(pillRect, cornerR, cornerR, borderPaint)
+
+        // Small caret pointing at exact cursor X
+        val caretX = geom.x.coerceIn(pillLeft + cornerR * 0.85f, pillLeft + pillW - cornerR * 0.85f)
+        val caretPath = Path().apply {
+            if (placeBelow) {
+                moveTo(caretX - caretH * 0.95f, pillTop + 0.5f)
+                lineTo(caretX + caretH * 0.95f, pillTop + 0.5f)
+                lineTo(caretX, pillTop - caretH)
+            } else {
+                moveTo(caretX - caretH * 0.95f, pillBottom - 0.5f)
+                lineTo(caretX + caretH * 0.95f, pillBottom - 0.5f)
+                lineTo(caretX, pillBottom + caretH)
+            }
+            close()
+        }
+        canvas.drawPath(caretPath, bgPaint)
+
+        val fm = textPaint.fontMetrics
+        val baseline = pillRect.centerY() - (fm.ascent + fm.descent) * 0.5f
+        canvas.drawText(label, pillLeft + padX, baseline, textPaint)
+    }
+
+    private fun snapInBarTickForBlankTap(
+        rawFrac: Float,
+        ticksPerBar: Int,
+        melody: MelodyStudioUiState
+    ): Int {
+        val safeTpb = ticksPerBar.coerceAtLeast(TICKS_PER_STEP)
+        val snapUnit = melody.smartBlankTapSnapTicks().coerceIn(1, safeTpb)
+        val maxSlot = ((safeTpb - 1).coerceAtLeast(0)) / snapUnit
+        val rawTickFloat = rawFrac.coerceIn(0f, 1f) * safeTpb.toFloat()
+        val slot = (rawTickFloat / snapUnit.toFloat()).roundToInt().coerceIn(0, maxSlot)
+        return (slot * snapUnit).coerceIn(0, (safeTpb - 1).coerceAtLeast(0))
+    }
+
+    private fun snapInBarTickForScrub(
+        rawFrac: Float,
+        barIdx: Int,
+        ticksPerBar: Int,
+        targetStaff: StaffPart,
+        melody: MelodyStudioUiState
+    ): Int {
+        val safeTpb = ticksPerBar.coerceAtLeast(TICKS_PER_STEP)
+        val barStartTick = barIdx.coerceAtLeast(0) * safeTpb
+        val barEndTick = barStartTick + safeTpb
+        val grand = melody.grandStaffEnabled
+
+        val staffNotesInBar = melody.notes.filter { n ->
+            val st = n.resolvedStartTick
+            st in barStartTick until barEndTick &&
+                (!grand || n.resolvedStaffPart(true) == targetStaff)
+        }
+        val tupletTags = staffNotesInBar.mapNotNull { it.tuplet }.distinctBy { it.groupKey }
+
+        val candidates = ArrayList<Int>(32)
+        var stepTick = 0
+        while (stepTick < safeTpb) {
+            val insideExistingTuplet = tupletTags.any { tag ->
+                val gStart = (tag.groupStartTick - barStartTick).coerceAtLeast(0)
+                val gEnd = (gStart + tag.spanTicks).coerceAtMost(safeTpb)
+                stepTick > gStart && stepTick < gEnd
+            }
+            if (!insideExistingTuplet) {
+                candidates.add(stepTick)
+            }
+            stepTick += TICKS_PER_STEP
+        }
+        for (tag in tupletTags) {
+            val gStart = (tag.groupStartTick - barStartTick).coerceIn(0, safeTpb - 1)
+            for (slotIdx in 0 until tag.count) {
+                val t = gStart + slotIdx * tag.noteTicks
+                if (t in 0 until safeTpb) {
+                    candidates.add(t)
+                }
+            }
+        }
+        melody.activeTuplet?.let { tup ->
+            val u = tup.noteTicks.coerceAtLeast(1)
+            var t = 0
+            while (t < safeTpb) {
+                candidates.add(t)
+                t += u
+            }
+        }
+        for (n in staffNotesInBar) {
+            val inBar = n.resolvedStartTick - barStartTick
+            if (inBar in 0 until safeTpb) {
+                candidates.add(inBar)
+            }
+        }
+        for (ch in melody.chordSymbols) {
+            if (ch.safeTick in barStartTick until barEndTick) {
+                candidates.add(ch.safeTick - barStartTick)
+            }
+        }
+        if (candidates.isEmpty()) return 0
+
+        val targetFloat = rawFrac.coerceIn(0f, 1f) * safeTpb.toFloat()
+        var bestTick = candidates[0]
+        var bestDist = abs(bestTick.toFloat() - targetFloat)
+        for (i in 1 until candidates.size) {
+            val c = candidates[i]
+            val d = abs(c.toFloat() - targetFloat)
+            if (d < bestDist) {
+                bestDist = d
+                bestTick = c
+            }
+        }
+        return bestTick.coerceIn(0, (safeTpb - 1).coerceAtLeast(0))
+    }
+
+    fun computeTimelineCursorScreenGeom(
+        viewportWidth: Float,
+        viewportHeight: Float,
+        scrollX: Float,
+        clefHeaderWidth: Float,
+        barWidth: Float,
+        melody: MelodyStudioUiState
+    ): CursorScreenGeom? {
+        if (melody.isRecording || viewportWidth <= clefHeaderWidth + 20f || viewportHeight <= 36f) return null
+        val ticksPerBar = melody.timeSignature.ticksPerBar.coerceAtLeast(1)
+        val vMetrics = computeTimelineVerticalMetrics(viewportHeight, melody)
+        val lineSpacing = vMetrics.lineSpacing
+        val cursorBar = melody.cursorTick.coerceAtLeast(0) / ticksPerBar
+        val tickInBar = melody.cursorTick.coerceAtLeast(0) % ticksPerBar
+        val barLeft = clefHeaderWidth + cursorBar * barWidth - scrollX
+        val (cNoteOriginX, cUsableW) = onScreenMeasureLayout(
+            melody = melody,
+            barIndex = cursorBar,
+            barLeft = barLeft,
+            barWidth = barWidth,
+            lineSpacing = lineSpacing
+        )
+        val cx = cNoteOriginX + (tickInBar.toFloat() / ticksPerBar.toFloat()) * cUsableW
+        if (cx !in (clefHeaderWidth - lineSpacing * 0.5f)..(viewportWidth + lineSpacing * 0.5f)) return null
+        val activeTopY = if (vMetrics.grandStaff && melody.activeStaff == StaffPart.BASS) {
+            vMetrics.bassTopY
+        } else {
+            vMetrics.trebleTopY
+        }
+        val activeBotY = if (vMetrics.grandStaff) (activeTopY + vMetrics.staffHeight) else vMetrics.bottomStaffBottomY
+        val baseCapR = max(5.2f, lineSpacing * 0.66f)
+        val pinTipY = max(10f, activeTopY - lineSpacing * 0.64f)
+        val capCenterY = max(baseCapR + 3f, pinTipY - baseCapR * 1.46f)
+        val fullTopY = if (vMetrics.grandStaff) min(capCenterY - baseCapR, vMetrics.trebleTopY - lineSpacing * 0.6f) else (capCenterY - baseCapR)
+        val fullBotY = if (vMetrics.grandStaff) (vMetrics.bottomStaffBottomY + lineSpacing * 0.6f) else (activeBotY + lineSpacing * 1.05f)
+        return CursorScreenGeom(
+            x = cx,
+            handleCenterY = capCenterY,
+            handleRadius = baseCapR,
+            activeTopY = activeTopY,
+            activeBottomY = activeBotY,
+            fullTopY = fullTopY,
+            fullBottomY = min(viewportHeight - 4f, fullBotY)
+        )
+    }
+
     fun drawInteractiveTimelineStaff(
         canvas: Canvas,
         viewportWidth: Float,
@@ -654,7 +999,8 @@ object StaffScoreEngraver {
         clefHeaderWidth: Float,
         barWidth: Float,
         melody: MelodyStudioUiState,
-        palette: OnScreenPalette = OnScreenPalette()
+        palette: OnScreenPalette = OnScreenPalette(),
+        isDraggingCursor: Boolean = false
     ): List<StaffHitTarget> {
         val hitTargets = mutableListOf<StaffHitTarget>()
         if (viewportWidth <= clefHeaderWidth + 20f || viewportHeight <= 36f) return hitTargets
@@ -1014,9 +1360,11 @@ object StaffScoreEngraver {
         )
 
         // Draw Step Input Cursor at exact `cursorTick` (emphasizing the currently active staff in Grand Staff mode!)
+        var timelineCursorGeom: CursorScreenGeom? = null
+        val timelineCursorColor = resolveCursorColor(melody, palette)
         if (!melody.isRecording) {
-            val cursorBar = melody.cursorTick / ticksPerBar
-            val tickInBar = melody.cursorTick % ticksPerBar
+            val cursorBar = melody.cursorTick.coerceAtLeast(0) / ticksPerBar
+            val tickInBar = melody.cursorTick.coerceAtLeast(0) % ticksPerBar
             val barLeft = clefHeaderWidth + cursorBar * barWidth - scrollX
             val (cNoteOriginX, cUsableW) = onScreenMeasureLayout(
                 melody = melody,
@@ -1027,59 +1375,22 @@ object StaffScoreEngraver {
             )
             val cx = cNoteOriginX + (tickInBar / ticksPerBar.toFloat()) * cUsableW
             if (cx in clefHeaderWidth..viewportWidth) {
-                val cursorColorActual = when {
-                    melody.activeSlurGroupId != null -> Color.rgb(26, 122, 94)
-                    melody.activeTuplet != null -> palette.selectedColor
-                    else -> palette.cursorColor
-                }
-                if (grandStaff) {
-                    val ghostGuidePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                        color = Color.argb(
-                            68,
-                            Color.red(cursorColorActual),
-                            Color.green(cursorColorActual),
-                            Color.blue(cursorColorActual)
-                        )
-                        strokeWidth = max(1.1f, lineSpacing * 0.11f)
-                        style = Paint.Style.STROKE
-                        pathEffect = DashPathEffect(floatArrayOf(lineSpacing * 0.45f, lineSpacing * 0.55f), 0f)
-                    }
-                    canvas.drawLine(
-                        cx,
-                        (trebleTopY - lineSpacing * 0.6f).coerceAtLeast(4f),
-                        cx,
-                        min(viewportHeight - 4f, bottomStaffBottomY + lineSpacing * 0.6f),
-                        ghostGuidePaint
-                    )
-                }
-                val activeStaffTopY = if (grandStaff && melody.activeStaff == StaffPart.BASS) bassTopY else trebleTopY
-                val activeStaffBotY = if (grandStaff) (activeStaffTopY + staffHeight) else bottomStaffBottomY
-                val cursorPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                    color = cursorColorActual
-                    strokeWidth = max(1.9f, lineSpacing * 0.17f)
-                    style = Paint.Style.STROKE
-                    pathEffect = DashPathEffect(floatArrayOf(lineSpacing * 0.65f, lineSpacing * 0.45f), 0f)
-                }
-                canvas.drawLine(
-                    cx,
-                    (activeStaffTopY - lineSpacing * 1.05f).coerceAtLeast(4f),
-                    cx,
-                    min(viewportHeight - 4f, activeStaffBotY + lineSpacing * 1.05f),
-                    cursorPaint
+                timelineCursorGeom = drawStepCursorWithHandle(
+                    canvas = canvas,
+                    cx = cx,
+                    trebleTopY = trebleTopY,
+                    bassTopY = bassTopY,
+                    bottomStaffBottomY = bottomStaffBottomY,
+                    staffHeight = staffHeight,
+                    lineSpacing = lineSpacing,
+                    grandStaff = grandStaff,
+                    activeStaff = melody.activeStaff,
+                    cursorColor = timelineCursorColor,
+                    paperBgColor = palette.paperBgColor,
+                    isDraggingCursor = isDraggingCursor,
+                    minClampTopY = 2f,
+                    maxClampBottomY = viewportHeight - 4f
                 )
-                val triPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                    color = cursorColorActual
-                    style = Paint.Style.FILL
-                }
-                val tri = Path().apply {
-                    val topY = (activeStaffTopY - lineSpacing * 1.32f).coerceAtLeast(2f)
-                    val sz = lineSpacing * 0.48f
-                    moveTo(cx - sz, topY)
-                    lineTo(cx + sz, topY)
-                    lineTo(cx, topY + sz * 1.15f)
-                    close()
-                }
-                canvas.drawPath(tri, triPaint)
             }
         }
 
@@ -1241,12 +1552,30 @@ object StaffScoreEngraver {
         }
         canvas.drawLine(clefHeaderWidth, trebleTopY, clefHeaderWidth, bottomStaffBottomY, sepPaint)
 
+        // Floating live beat bubble above cursor handle while dragging (drawn after sticky header so it never clips!)
+        if (isDraggingCursor && timelineCursorGeom != null) {
+            drawCursorScrubBubble(
+                canvas = canvas,
+                geom = timelineCursorGeom,
+                viewportWidth = viewportWidth,
+                viewportHeight = viewportHeight,
+                minLeftX = clefHeaderWidth + 4f,
+                lineSpacing = lineSpacing,
+                cursorColor = timelineCursorColor,
+                melody = melody,
+                grandStaff = grandStaff
+            )
+        }
+
         return hitTargets
     }
 
     /**
-     * Maps an X/Y tap coordinate on the interactive single-strip staff back to both a 1/16th-aligned `cursorTick`
+     * Maps an X/Y tap or scrub coordinate on the interactive single-strip staff back to both a snapped `cursorTick`
      * AND the tapped [StaffPart] (`TREBLE` upper staff vs `BASS` lower staff when Grand Staff is enabled).
+     *
+     * When [scrubFineMode] is `false` (blank-space tap), applies rounded smart beat-grid snapping based on
+     * active note duration / tuplet; when `true` (cursor dragging), snaps smoothly to 1/16th notes & existing note onsets.
      */
     fun mapTouchToTickAndStaff(
         touchX: Float,
@@ -1257,8 +1586,16 @@ object StaffScoreEngraver {
         barWidth: Float,
         lineSpacingEstimate: Float,
         totalBars: Int,
-        melody: MelodyStudioUiState
+        melody: MelodyStudioUiState,
+        scrubFineMode: Boolean = false
     ): Pair<Int, StaffPart> {
+        val vMetrics = computeTimelineVerticalMetrics(viewportHeight, melody)
+        val staff = if (!vMetrics.grandStaff) {
+            StaffPart.TREBLE
+        } else {
+            val splitY = (vMetrics.trebleTopY + vMetrics.staffHeight + vMetrics.bassTopY) * 0.5f
+            if (touchY >= splitY) StaffPart.BASS else StaffPart.TREBLE
+        }
         val tick = mapTouchXToTick(
             touchX = touchX,
             scrollX = scrollX,
@@ -1266,17 +1603,35 @@ object StaffScoreEngraver {
             barWidth = barWidth,
             lineSpacingEstimate = lineSpacingEstimate,
             totalBars = totalBars,
-            melody = melody
+            melody = melody,
+            scrubFineMode = scrubFineMode,
+            targetStaff = staff
         )
-        val vMetrics = computeTimelineVerticalMetrics(viewportHeight, melody)
-        if (!vMetrics.grandStaff) return tick to StaffPart.TREBLE
-        val splitY = (vMetrics.trebleTopY + vMetrics.staffHeight + vMetrics.bassTopY) * 0.5f
-        val staff = if (touchY >= splitY) StaffPart.BASS else StaffPart.TREBLE
         return tick to staff
     }
 
+    fun mapTouchToTick(
+        touchX: Float,
+        scrollX: Float,
+        clefHeaderWidth: Float,
+        barWidth: Float,
+        lineSpacingEstimate: Float,
+        totalBars: Int,
+        melody: MelodyStudioUiState,
+        scrubFineMode: Boolean = false
+    ): Int = mapTouchXToTick(
+        touchX = touchX,
+        scrollX = scrollX,
+        clefHeaderWidth = clefHeaderWidth,
+        barWidth = barWidth,
+        lineSpacingEstimate = lineSpacingEstimate,
+        totalBars = totalBars,
+        melody = melody,
+        scrubFineMode = scrubFineMode
+    )
+
     /**
-     * Maps an X tap coordinate on the interactive timeline staff back to a 1/16th-aligned `cursorTick`
+     * Maps an X coordinate on the interactive single-strip staff back to a snapped `cursorTick`
      * under [melody]'s time signature & mid-score key changes.
      */
     fun mapTouchXToTick(
@@ -1286,13 +1641,15 @@ object StaffScoreEngraver {
         barWidth: Float,
         lineSpacingEstimate: Float,
         totalBars: Int,
-        melody: MelodyStudioUiState
+        melody: MelodyStudioUiState,
+        scrubFineMode: Boolean = false,
+        targetStaff: StaffPart = melody.activeStaff
     ): Int {
         val timeSignature = melody.timeSignature
-        val ticksPerBar = timeSignature.ticksPerBar
-        val stepsPerBar = timeSignature.stepsPerBar
+        val ticksPerBar = timeSignature.ticksPerBar.coerceAtLeast(TICKS_PER_STEP)
+        val safeBars = totalBars.coerceAtLeast(1)
         val worldX = (touchX - clefHeaderWidth + scrollX).coerceAtLeast(0f)
-        val barIdx = floor(worldX / barWidth).toInt().coerceAtLeast(0)
+        val barIdx = floor(worldX / barWidth.coerceAtLeast(1f)).toInt().coerceIn(0, safeBars - 1)
         val inBarX = worldX - barIdx * barWidth
         val (noteOriginOffset, usableW) = onScreenMeasureLayout(
             melody = melody,
@@ -1301,10 +1658,15 @@ object StaffScoreEngraver {
             barWidth = barWidth,
             lineSpacing = lineSpacingEstimate
         )
-        val frac = ((inBarX - noteOriginOffset) / usableW).coerceIn(0f, 0.999f)
-        val stepInBar = floor(frac * stepsPerBar).toInt().coerceIn(0, (stepsPerBar - 1).coerceAtLeast(0))
-        val rawTick = barIdx * ticksPerBar + stepInBar * TICKS_PER_STEP
-        val maxTick = (totalBars.coerceAtLeast(1) * ticksPerBar - TICKS_PER_STEP).coerceAtLeast(0)
+        val frac = ((inBarX - noteOriginOffset) / usableW.coerceAtLeast(1f)).coerceIn(0f, 1f)
+        val inBarTick = if (scrubFineMode) {
+            snapInBarTickForScrub(frac, barIdx, ticksPerBar, targetStaff, melody)
+        } else {
+            snapInBarTickForBlankTap(frac, ticksPerBar, melody)
+        }
+        val rawTick = barIdx * ticksPerBar + inBarTick
+        val minStepUnit = melody.activeTuplet?.noteTicks ?: TICKS_PER_STEP
+        val maxTick = (safeBars * ticksPerBar - minStepUnit).coerceAtLeast(0)
         return rawTick.coerceIn(0, maxTick)
     }
 
@@ -1537,6 +1899,59 @@ object StaffScoreEngraver {
         return (barLeftX + effPadL) to usableW
     }
 
+    fun computePageCursorScreenGeom(
+        viewportHeight: Float,
+        scrollY: Float,
+        layout: PageStaffLayout,
+        melody: MelodyStudioUiState
+    ): CursorScreenGeom? {
+        if (melody.isRecording || viewportHeight <= 36f) return null
+        val ticksPerBar = melody.timeSignature.ticksPerBar.coerceAtLeast(1)
+        val cursorBarIdx = (melody.cursorTick.coerceAtLeast(0) / ticksPerBar)
+            .coerceIn(0, (layout.totalBars - 1).coerceAtLeast(0))
+        val sysIdx = layout.systemForBar(cursorBarIdx)
+        val hGeom = computePageSystemHorizontalGeom(sysIdx, layout, melody)
+        if (cursorBarIdx !in hGeom.startBar..hGeom.endBar) return null
+
+        val lineSpacing = layout.lineSpacing
+        val staffH = layout.staffHeight
+        val grandStaff = layout.grandStaff
+        val trebleTopY = layout.systemTrebleTopWorldY(sysIdx) - scrollY
+        val bassTopY = trebleTopY + staffH + layout.grandGap
+        val sysBottomY = if (grandStaff) bassTopY + staffH else trebleTopY + staffH
+        if (sysBottomY < -lineSpacing * 3f || trebleTopY > viewportHeight + lineSpacing * 3f) return null
+
+        val bOff = (cursorBarIdx - hGeom.startBar).coerceIn(0, (hGeom.barsInSys - 1).coerceAtLeast(0))
+        val bLeft = layout.marginLeftX + hGeom.clefZoneW + bOff * hGeom.singleBarW
+        val (noteOriginX, usableW) = pageMeasureNoteLayout(
+            melody = melody,
+            barIndex = cursorBarIdx,
+            bOffsetInSystem = bOff,
+            barLeftX = bLeft,
+            singleBarW = hGeom.singleBarW,
+            lineSpacing = lineSpacing
+        )
+        val tickInBar = melody.cursorTick.coerceAtLeast(0) % ticksPerBar
+        val cx = noteOriginX + (tickInBar.toFloat() / ticksPerBar.toFloat()) * usableW
+
+        val activeTopY = if (grandStaff && melody.activeStaff == StaffPart.BASS) bassTopY else trebleTopY
+        val activeBotY = if (grandStaff) (activeTopY + staffH) else sysBottomY
+        val baseCapR = max(5.2f, lineSpacing * 0.66f)
+        val pinTipY = activeTopY - lineSpacing * 0.64f
+        val capCenterY = pinTipY - baseCapR * 1.46f
+        val fullTopY = if (grandStaff) min(capCenterY - baseCapR, trebleTopY - lineSpacing * 0.6f) else (capCenterY - baseCapR)
+        val fullBotY = if (grandStaff) (sysBottomY + lineSpacing * 0.6f) else (activeBotY + lineSpacing * 1.05f)
+        return CursorScreenGeom(
+            x = cx,
+            handleCenterY = capCenterY,
+            handleRadius = baseCapR,
+            activeTopY = activeTopY,
+            activeBottomY = activeBotY,
+            fullTopY = fullTopY,
+            fullBottomY = fullBotY
+        )
+    }
+
     fun drawInteractivePageStaff(
         canvas: Canvas,
         viewportWidth: Float,
@@ -1544,7 +1959,8 @@ object StaffScoreEngraver {
         scrollY: Float,
         layout: PageStaffLayout,
         melody: MelodyStudioUiState,
-        palette: OnScreenPalette = OnScreenPalette()
+        palette: OnScreenPalette = OnScreenPalette(),
+        isDraggingCursor: Boolean = false
     ): List<StaffHitTarget> {
         val hitTargets = mutableListOf<StaffHitTarget>()
         if (viewportWidth <= 60f || viewportHeight <= 36f) return hitTargets
@@ -1599,6 +2015,8 @@ object StaffScoreEngraver {
         val cursorBarIdx = (melody.cursorTick.coerceAtLeast(0) / ticksPerBar)
         val playTotalTickFloat = melody.playheadBeat * TICKS_PER_BEAT.toFloat()
         val playBarIdx = floor(playTotalTickFloat / ticksPerBar.toFloat()).toInt().coerceAtLeast(0)
+        var pageCursorGeom: CursorScreenGeom? = null
+        val pageCursorColor = resolveCursorColor(melody, palette)
 
         val cullPad = lineSpacing * 6.0f
         val firstSys = floor(((scrollY - cullPad - layout.topPadding) / layout.systemRowStride))
@@ -2066,59 +2484,20 @@ object StaffScoreEngraver {
                 val mg = sysMeasureGeoms[bOff]
                 val tickInBar = melody.cursorTick.coerceAtLeast(0) % ticksPerBar
                 val cx = mg.noteOriginX + (tickInBar.toFloat() / ticksPerBar.toFloat()) * mg.usableWidth
-                val cursorColorActual = when {
-                    melody.activeSlurGroupId != null -> Color.rgb(26, 122, 94)
-                    melody.activeTuplet != null -> palette.selectedColor
-                    else -> palette.cursorColor
-                }
-                if (grandStaff) {
-                    val ghostPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                        color = Color.argb(
-                            68,
-                            Color.red(cursorColorActual),
-                            Color.green(cursorColorActual),
-                            Color.blue(cursorColorActual)
-                        )
-                        strokeWidth = max(1.1f, lineSpacing * 0.11f)
-                        style = Paint.Style.STROKE
-                        pathEffect = DashPathEffect(floatArrayOf(lineSpacing * 0.45f, lineSpacing * 0.55f), 0f)
-                    }
-                    canvas.drawLine(
-                        cx,
-                        trebleTopY - lineSpacing * 0.55f,
-                        cx,
-                        sysBottomY + lineSpacing * 0.55f,
-                        ghostPaint
-                    )
-                }
-                val activeTopY = if (grandStaff && melody.activeStaff == StaffPart.BASS) bassTopY else trebleTopY
-                val activeBotY = if (grandStaff) (activeTopY + staffH) else sysBottomY
-                val cursorPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                    color = cursorColorActual
-                    strokeWidth = max(1.9f, lineSpacing * 0.17f)
-                    style = Paint.Style.STROKE
-                    pathEffect = DashPathEffect(floatArrayOf(lineSpacing * 0.65f, lineSpacing * 0.45f), 0f)
-                }
-                canvas.drawLine(
-                    cx,
-                    activeTopY - lineSpacing * 1.05f,
-                    cx,
-                    activeBotY + lineSpacing * 1.05f,
-                    cursorPaint
+                pageCursorGeom = drawStepCursorWithHandle(
+                    canvas = canvas,
+                    cx = cx,
+                    trebleTopY = trebleTopY,
+                    bassTopY = bassTopY,
+                    bottomStaffBottomY = sysBottomY,
+                    staffHeight = staffH,
+                    lineSpacing = lineSpacing,
+                    grandStaff = grandStaff,
+                    activeStaff = melody.activeStaff,
+                    cursorColor = pageCursorColor,
+                    paperBgColor = palette.paperBgColor,
+                    isDraggingCursor = isDraggingCursor
                 )
-                val triPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                    color = cursorColorActual
-                    style = Paint.Style.FILL
-                }
-                val tri = Path().apply {
-                    val topY = activeTopY - lineSpacing * 1.32f
-                    val sz = lineSpacing * 0.48f
-                    moveTo(cx - sz, topY)
-                    lineTo(cx + sz, topY)
-                    lineTo(cx, topY + sz * 1.15f)
-                    close()
-                }
-                canvas.drawPath(tri, triPaint)
             }
 
             // Draw Live Transport Playhead on whichever row holds `playheadBeat`
@@ -2198,6 +2577,21 @@ object StaffScoreEngraver {
             }
             canvas.drawRoundRect(RectF(barLeft, trackTop, barLeft + barW, trackBottom), barW * 0.5f, barW * 0.5f, trackPaint)
             canvas.drawRoundRect(RectF(barLeft, thumbTop, barLeft + barW, thumbTop + thumbH), barW * 0.5f, barW * 0.5f, thumbPaint)
+        }
+
+        // Floating live beat bubble above cursor handle while dragging
+        if (isDraggingCursor && pageCursorGeom != null) {
+            drawCursorScrubBubble(
+                canvas = canvas,
+                geom = pageCursorGeom,
+                viewportWidth = viewportWidth,
+                viewportHeight = viewportHeight,
+                minLeftX = 4f,
+                lineSpacing = lineSpacing,
+                cursorColor = pageCursorColor,
+                melody = melody,
+                grandStaff = grandStaff
+            )
         }
 
         return hitTargets
@@ -2297,11 +2691,12 @@ object StaffScoreEngraver {
         touchY: Float,
         scrollY: Float,
         layout: PageStaffLayout,
-        melody: MelodyStudioUiState
+        melody: MelodyStudioUiState,
+        scrubFineMode: Boolean = false,
+        targetStaff: StaffPart = melody.activeStaff
     ): Int {
         val timeSig = melody.timeSignature
-        val ticksPerBar = timeSig.ticksPerBar
-        val stepsPerBar = timeSig.stepsPerBar
+        val ticksPerBar = timeSig.ticksPerBar.coerceAtLeast(TICKS_PER_STEP)
         val worldY = (touchY + scrollY).coerceAtLeast(0f)
         val sysIdx = resolvePageSystemIndexAtWorldY(worldY, layout)
         val hGeom = computePageSystemHorizontalGeom(sysIdx, layout, melody)
@@ -2320,10 +2715,15 @@ object StaffScoreEngraver {
             singleBarW = hGeom.singleBarW,
             lineSpacing = layout.lineSpacing
         )
-        val frac = ((touchX - noteOriginX) / usableW.coerceAtLeast(1f)).coerceIn(0f, 0.999f)
-        val stepInBar = floor(frac * stepsPerBar).toInt().coerceIn(0, (stepsPerBar - 1).coerceAtLeast(0))
-        val rawTick = barIdx * ticksPerBar + stepInBar * TICKS_PER_STEP
-        val maxTick = (layout.totalBars.coerceAtLeast(1) * ticksPerBar - TICKS_PER_STEP).coerceAtLeast(0)
+        val frac = ((touchX - noteOriginX) / usableW.coerceAtLeast(1f)).coerceIn(0f, 1f)
+        val inBarTick = if (scrubFineMode) {
+            snapInBarTickForScrub(frac, barIdx, ticksPerBar, targetStaff, melody)
+        } else {
+            snapInBarTickForBlankTap(frac, ticksPerBar, melody)
+        }
+        val rawTick = barIdx * ticksPerBar + inBarTick
+        val minStepUnit = melody.activeTuplet?.noteTicks ?: TICKS_PER_STEP
+        val maxTick = (layout.totalBars.coerceAtLeast(1) * ticksPerBar - minStepUnit).coerceAtLeast(0)
         return rawTick.coerceIn(0, maxTick)
     }
 
@@ -2332,21 +2732,27 @@ object StaffScoreEngraver {
         touchY: Float,
         scrollY: Float,
         layout: PageStaffLayout,
-        melody: MelodyStudioUiState
+        melody: MelodyStudioUiState,
+        scrubFineMode: Boolean = false
     ): Pair<Int, StaffPart> {
+        val staff = if (!layout.grandStaff) {
+            StaffPart.TREBLE
+        } else {
+            val worldY = (touchY + scrollY).coerceAtLeast(0f)
+            val sysIdx = resolvePageSystemIndexAtWorldY(worldY, layout)
+            val trebleTopWorldY = layout.systemTrebleTopWorldY(sysIdx)
+            val splitWorldY = trebleTopWorldY + layout.staffHeight + layout.grandGap * 0.5f
+            if (worldY >= splitWorldY) StaffPart.BASS else StaffPart.TREBLE
+        }
         val tick = mapPageTouchToTick(
             touchX = touchX,
             touchY = touchY,
             scrollY = scrollY,
             layout = layout,
-            melody = melody
+            melody = melody,
+            scrubFineMode = scrubFineMode,
+            targetStaff = staff
         )
-        if (!layout.grandStaff) return tick to StaffPart.TREBLE
-        val worldY = (touchY + scrollY).coerceAtLeast(0f)
-        val sysIdx = resolvePageSystemIndexAtWorldY(worldY, layout)
-        val trebleTopWorldY = layout.systemTrebleTopWorldY(sysIdx)
-        val splitWorldY = trebleTopWorldY + layout.staffHeight + layout.grandGap * 0.5f
-        val staff = if (worldY >= splitWorldY) StaffPart.BASS else StaffPart.TREBLE
         return tick to staff
     }
 

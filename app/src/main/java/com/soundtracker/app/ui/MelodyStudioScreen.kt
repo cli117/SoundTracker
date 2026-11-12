@@ -3,9 +3,11 @@ package com.soundtracker.app.ui
 import androidx.compose.animation.core.animate
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -106,13 +108,16 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerId
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -123,6 +128,7 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import android.os.SystemClock
+import android.view.HapticFeedbackConstants
 import com.soundtracker.app.melody.DynamicLevel
 import com.soundtracker.app.melody.DualKeyboardStaffRouting
 import com.soundtracker.app.melody.HairpinType
@@ -239,6 +245,8 @@ fun MelodyStudioScreen(
     onToggleMinimizeKeyboardForScore: () -> Unit,
     onTapCursorTick: (Int) -> Unit,
     onTapCursorTickAndStaff: (Int, StaffPart?) -> Unit,
+    onNudgeCursor: (direction: Int, fineSixteenth: Boolean) -> Unit,
+    onJumpCursorToBarBeat: (barNumber1Based: Int, beatNumber1Based: Int) -> Unit,
     onSelectNote: (String?) -> Unit,
     onSelectAnnotation: (SelectedScoreAnnotation?) -> Unit,
     onUpsertChordSymbol: (tick: Int, rawSymbol: String, editingId: String?) -> Boolean,
@@ -288,6 +296,7 @@ fun MelodyStudioScreen(
     var showProjectManagerDialog by remember { mutableStateOf(false) }
     var showTouchGuardDialog by remember { mutableStateOf(false) }
     var showMelodySettingsDialog by remember { mutableStateOf(false) }
+    var showCursorJumpDialog by remember { mutableStateOf(false) }
     // null = closed, 0 = 奏法·连线, 1 = 力度·渐变, 2 = 速度·变速
     var expressionDialogTab by remember { mutableStateOf<Int?>(null) }
     // null = closed, 0 = primary keyboard sustain dialog, 1 = secondary keyboard sustain dialog
@@ -530,7 +539,7 @@ fun MelodyStudioScreen(
                     ) {
                         Row(
                             modifier = Modifier
-                                .widthIn(max = availWidth * 0.52f)
+                                .widthIn(max = availWidth * 0.56f)
                                 .horizontalScroll(rememberScrollState()),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -542,7 +551,9 @@ fun MelodyStudioScreen(
                                 onPlayFromStart = onPlayFromStart,
                                 onSelectInputMode = onSelectInputMode,
                                 onToggleRecordStop = onToggleRecordStop,
-                                onSetActiveStaff = onSetActiveStaff
+                                onSetActiveStaff = onSetActiveStaff,
+                                onNudgeCursor = onNudgeCursor,
+                                onOpenCursorJumpDialog = { showCursorJumpDialog = true }
                             )
                             ThumbUndoRedoBackspaceCluster(
                                 canUndo = melody.canUndo,
@@ -585,7 +596,7 @@ fun MelodyStudioScreen(
                         }
                     }
                 } else {
-                    val showUndoLabels = availWidth >= 460.dp &&
+                    val showUndoLabels = availWidth >= 500.dp &&
                         melody.inputMode == MelodyInputMode.STEP_INPUT &&
                         !melody.grandStaffEnabled
                     Column(
@@ -594,7 +605,7 @@ fun MelodyStudioScreen(
                             .padding(horizontal = 10.dp, vertical = if (isShortLandscape) 3.dp else 4.dp),
                         verticalArrangement = Arrangement.spacedBy(if (isShortLandscape) 3.dp else 4.dp)
                     ) {
-                        // Row 3A: Transport + Active Staff (`上行𝄞|下行𝄢`) + Pinned Undo / Redo / Backspace
+                        // Row 3A: Transport + Active Staff (`上行𝄞|下行𝄢`) + Cursor Nudge (`◀ 小节:拍 ▶`) + Pinned Undo / Redo / Backspace
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -613,12 +624,14 @@ fun MelodyStudioScreen(
                                 ) {
                                     TransportAndModeLeftCluster(
                                         melody = melody,
-                                        compactModeLabels = availWidth < 430.dp,
+                                        compactModeLabels = availWidth < 450.dp,
                                         onTogglePlayStop = onTogglePlayStop,
                                         onPlayFromStart = onPlayFromStart,
                                         onSelectInputMode = onSelectInputMode,
                                         onToggleRecordStop = onToggleRecordStop,
-                                        onSetActiveStaff = onSetActiveStaff
+                                        onSetActiveStaff = onSetActiveStaff,
+                                        onNudgeCursor = onNudgeCursor,
+                                        onOpenCursorJumpDialog = { showCursorJumpDialog = true }
                                     )
                                 }
                             }
@@ -940,6 +953,22 @@ fun MelodyStudioScreen(
                     showClearConfirm = true
                 },
                 onDismiss = { showMelodySettingsDialog = false }
+            )
+        }
+
+        if (showCursorJumpDialog) {
+            MelodyCursorJumpDialog(
+                melody = melody,
+                onJumpToTick = { targetTick ->
+                    onSelectNote(null)
+                    onSelectAnnotation(null)
+                    onTapCursorTick(targetTick)
+                },
+                onJumpToBarBeat = { barNum, beatNum ->
+                    onJumpCursorToBarBeat(barNum, beatNum)
+                },
+                onNudgeCursor = onNudgeCursor,
+                onDismiss = { showCursorJumpDialog = false }
             )
         }
 
@@ -4389,6 +4418,7 @@ private fun InteractiveStaffScoreCanvas(
     modifier: Modifier = Modifier
 ) {
     val density = LocalDensity.current
+    val view = LocalView.current
     val baseClefHeaderWidthPx = with(density) { (if (isTablet) 68.dp else 56.dp).toPx() }
     val baseBarWidthPx = with(density) { (if (isTablet) 248.dp else 196.dp).toPx() }
     val quarterBeatsPerBar = melody.quarterBeatsPerBar.coerceAtLeast(0.25f)
@@ -4398,6 +4428,7 @@ private fun InteractiveStaffScoreCanvas(
     var canvasSize by remember { mutableStateOf(IntSize.Zero) }
     var scrollX by remember { mutableFloatStateOf(0f) }
     var scrollY by remember { mutableFloatStateOf(0f) }
+    var isDraggingCursor by remember { mutableStateOf(false) }
     var lastHitTargets by remember { mutableStateOf<List<StaffHitTarget>>(emptyList()) }
 
     val maxKeyBar = (melody.keySignatureEvents.maxOfOrNull { it.safeBarIndex + 1 } ?: 1)
@@ -4474,13 +4505,14 @@ private fun InteractiveStaffScoreCanvas(
     LaunchedEffect(
         melody.scoreViewMode,
         focusBeat,
+        isDraggingCursor,
         canvasSize.width,
         totalBars,
         barWidthPx,
         quarterBeatsPerBar,
         effectiveClefHeaderWidthPx
     ) {
-        if (melody.scoreViewMode != ScoreViewMode.SINGLE_STRIP || canvasSize.width <= 0) return@LaunchedEffect
+        if (isDraggingCursor || melody.scoreViewMode != ScoreViewMode.SINGLE_STRIP || canvasSize.width <= 0) return@LaunchedEffect
         val viewportW = (canvasSize.width - effectiveClefHeaderWidthPx).coerceAtLeast(80f)
         val focusX = (focusBeat / quarterBeatsPerBar) * barWidthPx
         val totalContentW = totalBars * barWidthPx + barWidthPx * 0.25f
@@ -4508,11 +4540,12 @@ private fun InteractiveStaffScoreCanvas(
     LaunchedEffect(
         melody.scoreViewMode,
         pageFollowTrigger,
+        isDraggingCursor,
         melody.isPlaying,
         melody.grandStaffEnabled,
         canvasSize.height
     ) {
-        if (melody.scoreViewMode != ScoreViewMode.PAGE_SCROLL || canvasSize.height <= 0) return@LaunchedEffect
+        if (isDraggingCursor || melody.scoreViewMode != ScoreViewMode.PAGE_SCROLL || canvasSize.height <= 0) return@LaunchedEffect
         val sysTop = pageLayout.systemTrebleTopWorldY(activeSystemIdx) - pageLayout.lineSpacing * 2.6f
         val sysBottom = pageLayout.systemTrebleTopWorldY(activeSystemIdx) +
             pageLayout.systemBlockHeight + pageLayout.lineSpacing * 2.8f
@@ -4562,129 +4595,382 @@ private fun InteractiveStaffScoreCanvas(
 
     val isPageMode = melody.scoreViewMode == ScoreViewMode.PAGE_SCROLL
 
+    val handleCanvasTap: (Offset, Float) -> Unit = { pos, canvasHeightPx ->
+        var handled = false
+        if (!isPageMode) {
+            val curHeaderW = latestHeaderWidthPx
+            if (pos.x < curHeaderW) {
+                val timeSigZoneLeft = curHeaderW - latestLineSpacingPx * 1.90f
+                if (pos.x >= timeSigZoneLeft) {
+                    latestOnTapTimeSig()
+                } else {
+                    latestOnTapKeySig()
+                }
+                handled = true
+            }
+        }
+
+        if (!handled) {
+            val hit = lastHitTargets.firstOrNull { t ->
+                t.bounds.contains(pos.x, pos.y)
+            }
+            if (hit != null) {
+                if (hit.annotation != null) {
+                    val alreadySelected = latestMelody.selectedAnnotation == hit.annotation
+                    when (hit.annotation) {
+                        is SelectedScoreAnnotation.ChordSymbol -> {
+                            if (latestMelody.isPlaying && !latestMelody.isRecording) {
+                                latestOnTapCursorTick(hit.startTick)
+                            } else {
+                                latestOnSelectAnnotation(hit.annotation)
+                                latestOnOpenChordDialog()
+                            }
+                        }
+                        is SelectedScoreAnnotation.KeyChange -> {
+                            if (alreadySelected) {
+                                latestOnTapKeySig()
+                            } else {
+                                latestOnSelectAnnotation(hit.annotation)
+                                latestOnTapCursorTick(hit.startTick)
+                            }
+                        }
+                        else -> {
+                            if (alreadySelected && latestMelody.isPlaying && !latestMelody.isRecording) {
+                                latestOnTapCursorTick(hit.startTick)
+                            } else {
+                                latestOnSelectAnnotation(if (alreadySelected) null else hit.annotation)
+                            }
+                        }
+                    }
+                } else if (hit.noteId != null) {
+                    val alreadySelected = latestMelody.selectedNoteId == hit.noteId
+                    if (alreadySelected && latestMelody.isPlaying && !latestMelody.isRecording) {
+                        latestOnTapCursorTick(hit.startTick)
+                    } else {
+                        latestOnSelectNote(if (alreadySelected) null else hit.noteId)
+                    }
+                }
+                handled = true
+            }
+        }
+
+        if (!handled) {
+            if (isPageMode) {
+                val headerHit = StaffScoreEngraver.resolvePageHeaderHit(
+                    touchX = pos.x,
+                    touchY = pos.y,
+                    scrollY = latestScrollY,
+                    layout = latestPageLayout,
+                    melody = latestMelody
+                )
+                if (headerHit != null) {
+                    when (headerHit) {
+                        StaffScoreEngraver.PageHeaderHitKind.TIME_SIGNATURE -> latestOnTapTimeSig()
+                        StaffScoreEngraver.PageHeaderHitKind.KEY_SIGNATURE -> latestOnTapKeySig()
+                    }
+                } else {
+                    latestOnSelectNote(null)
+                    latestOnSelectAnnotation(null)
+                    val (tick, tappedStaff) = StaffScoreEngraver.mapPageTouchToTickAndStaff(
+                        touchX = pos.x,
+                        touchY = pos.y,
+                        scrollY = latestScrollY,
+                        layout = latestPageLayout,
+                        melody = latestMelody,
+                        scrubFineMode = false
+                    )
+                    latestOnTapCursorTickAndStaff(tick, tappedStaff)
+                }
+            } else {
+                latestOnSelectNote(null)
+                latestOnSelectAnnotation(null)
+                val (tick, tappedStaff) = StaffScoreEngraver.mapTouchToTickAndStaff(
+                    touchX = pos.x,
+                    touchY = pos.y,
+                    viewportHeight = canvasHeightPx,
+                    scrollX = latestScrollX,
+                    clefHeaderWidth = latestHeaderWidthPx,
+                    barWidth = latestBarWidthPx,
+                    lineSpacingEstimate = latestLineSpacingPx,
+                    totalBars = latestTotalBars,
+                    melody = latestMelody,
+                    scrubFineMode = false
+                )
+                latestOnTapCursorTickAndStaff(tick, tappedStaff)
+            }
+        }
+    }
+    val latestHandleCanvasTap by rememberUpdatedState(handleCanvasTap)
+
     Canvas(
         modifier = modifier
             .background(Color(0xFFFAF7F0))
             .clipToBounds()
             .onSizeChanged { canvasSize = it }
-            .scrollable(
-                state = pageVerticalScrollState,
-                orientation = Orientation.Vertical,
-                enabled = isPageMode
-            )
             .pointerInput(isPageMode) {
-                if (!isPageMode) {
-                    detectDragGestures { change, dragAmount ->
-                        change.consume()
-                        val viewportW = (size.width - latestHeaderWidthPx).coerceAtLeast(1f)
-                        val bw = latestBarWidthPx
-                        val maxX = (latestTotalBars * bw + bw * 0.25f - viewportW).coerceAtLeast(0f)
-                        scrollX = (scrollX - dragAmount.x).coerceIn(0f, maxX)
-                    }
-                }
-            }
-            .pointerInput(isPageMode) {
-                detectTapGestures { pos ->
-                    if (!isPageMode) {
-                        val curHeaderW = latestHeaderWidthPx
-                        if (pos.x < curHeaderW) {
-                            val timeSigZoneLeft = curHeaderW - latestLineSpacingPx * 1.90f
-                            if (pos.x >= timeSigZoneLeft) {
-                                latestOnTapTimeSig()
-                            } else {
-                                latestOnTapKeySig()
-                            }
-                            return@detectTapGestures
-                        }
-                    }
+                val handleExtraX = 20.dp.toPx()
+                val handleExtraY = 16.dp.toPx()
+                val lineHalfWidthPx = 14.dp.toPx()
+                val lineExtraY = 10.dp.toPx()
+                val edgeAutoScrollZonePx = 24.dp.toPx()
+                val edgeAutoScrollStepPx = 5.5.dp.toPx()
 
-                    val hit = lastHitTargets.firstOrNull { t ->
-                        t.bounds.contains(pos.x, pos.y)
-                    }
-                    if (hit != null) {
-                        if (hit.annotation != null) {
-                            val alreadySelected = latestMelody.selectedAnnotation == hit.annotation
-                            when (hit.annotation) {
-                                is SelectedScoreAnnotation.ChordSymbol -> {
-                                    if (latestMelody.isPlaying && !latestMelody.isRecording) {
-                                        latestOnTapCursorTick(hit.startTick)
-                                    } else {
-                                        latestOnSelectAnnotation(hit.annotation)
-                                        latestOnOpenChordDialog()
-                                    }
-                                }
-                                is SelectedScoreAnnotation.KeyChange -> {
-                                    if (alreadySelected) {
-                                        latestOnTapKeySig()
-                                    } else {
-                                        latestOnSelectAnnotation(hit.annotation)
-                                        latestOnTapCursorTick(hit.startTick)
-                                    }
-                                }
-                                else -> {
-                                    if (alreadySelected && latestMelody.isPlaying && !latestMelody.isRecording) {
-                                        latestOnTapCursorTick(hit.startTick)
-                                    } else {
-                                        latestOnSelectAnnotation(if (alreadySelected) null else hit.annotation)
-                                    }
-                                }
-                            }
-                        } else if (hit.noteId != null) {
-                            val alreadySelected = latestMelody.selectedNoteId == hit.noteId
-                            if (alreadySelected && latestMelody.isPlaying && !latestMelody.isRecording) {
-                                // Tapping an already-selected note during playback still jumps audio right there!
-                                latestOnTapCursorTick(hit.startTick)
-                            } else {
-                                latestOnSelectNote(if (alreadySelected) null else hit.noteId)
-                            }
-                        }
-                        return@detectTapGestures
-                    }
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    val pointerId: PointerId = down.id
+                    val touchSlop = viewConfiguration.touchSlop
 
-                    if (isPageMode) {
-                        val headerHit = StaffScoreEngraver.resolvePageHeaderHit(
-                            touchX = pos.x,
-                            touchY = pos.y,
+                    val cursorGeom = if (latestMelody.isRecording) {
+                        null
+                    } else if (isPageMode) {
+                        StaffScoreEngraver.computePageCursorScreenGeom(
+                            viewportHeight = size.height.toFloat(),
                             scrollY = latestScrollY,
                             layout = latestPageLayout,
                             melody = latestMelody
                         )
-                        if (headerHit != null) {
-                            when (headerHit) {
-                                StaffScoreEngraver.PageHeaderHitKind.TIME_SIGNATURE -> latestOnTapTimeSig()
-                                StaffScoreEngraver.PageHeaderHitKind.KEY_SIGNATURE -> latestOnTapKeySig()
-                            }
-                            return@detectTapGestures
-                        }
-
-                        latestOnSelectNote(null)
-                        latestOnSelectAnnotation(null)
-                        val (tick, tappedStaff) = StaffScoreEngraver.mapPageTouchToTickAndStaff(
-                            touchX = pos.x,
-                            touchY = pos.y,
-                            scrollY = latestScrollY,
-                            layout = latestPageLayout,
-                            melody = latestMelody
-                        )
-                        latestOnTapCursorTickAndStaff(tick, tappedStaff)
                     } else {
-                        latestOnSelectNote(null)
-                        latestOnSelectAnnotation(null)
-                        val (tick, tappedStaff) = StaffScoreEngraver.mapTouchToTickAndStaff(
-                            touchX = pos.x,
-                            touchY = pos.y,
+                        StaffScoreEngraver.computeTimelineCursorScreenGeom(
+                            viewportWidth = size.width.toFloat(),
                             viewportHeight = size.height.toFloat(),
                             scrollX = latestScrollX,
                             clefHeaderWidth = latestHeaderWidthPx,
                             barWidth = latestBarWidthPx,
-                            lineSpacingEstimate = latestLineSpacingPx,
-                            totalBars = latestTotalBars,
                             melody = latestMelody
                         )
-                        latestOnTapCursorTickAndStaff(tick, tappedStaff)
+                    }
+
+                    var runStripPan = false
+                    var runCursorScrub = false
+                    var scrubInitialPos = down.position
+                    var scrubApplyImmediately = false
+
+                    // 1. Direct grab on Teardrop Cursor Handle (`水滴/倒三角游标把手`)
+                    if (cursorGeom != null &&
+                        cursorGeom.isInHandleHotzone(down.position.x, down.position.y, handleExtraX, handleExtraY)
+                    ) {
+                        down.consume()
+                        view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                        runCursorScrub = true
+                        scrubInitialPos = down.position
+                        scrubApplyImmediately = false
+                    } else if (cursorGeom != null &&
+                        cursorGeom.isInLineHotzone(down.position.x, down.position.y, lineHalfWidthPx, lineExtraY)
+                    ) {
+                        // 2. Touch on Red Dashed Cursor Line Body:
+                        //    - Quick tap (< touchSlop) -> normal tap (so notes/chords on cursor stay tappable!)
+                        //    - Horizontal drag -> scrub cursor
+                        //    - Vertical drag -> normal page scroll (never jams vertical scrolling!)
+                        //    - Hold >= 350ms -> scrub cursor
+                        var latestPos = down.position
+                        var liftedTapPos: Offset? = null
+                        var startScrub = false
+                        var letScrollOrPan = false
+
+                        val settledBeforeHold = withTimeoutOrNull(350L) {
+                            while (true) {
+                                val ev = awaitPointerEvent(PointerEventPass.Initial)
+                                val ch = ev.changes.firstOrNull { it.id == pointerId } ?: return@withTimeoutOrNull true
+                                latestPos = ch.position
+                                if (!ch.pressed) {
+                                    liftedTapPos = ch.position
+                                    return@withTimeoutOrNull true
+                                }
+                                val delta = ch.position - down.position
+                                if (delta.getDistance() > touchSlop) {
+                                    if (abs(delta.x) >= abs(delta.y) * 0.72f) {
+                                        ch.consume()
+                                        startScrub = true
+                                    } else {
+                                        letScrollOrPan = true
+                                    }
+                                    return@withTimeoutOrNull true
+                                }
+                            }
+                            @Suppress("UNREACHABLE_CODE")
+                            true
+                        }
+
+                        when {
+                            liftedTapPos != null -> {
+                                latestHandleCanvasTap(liftedTapPos!!, size.height.toFloat())
+                            }
+                            startScrub -> {
+                                view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                                runCursorScrub = true
+                                scrubInitialPos = latestPos
+                                scrubApplyImmediately = true
+                            }
+                            settledBeforeHold == null -> {
+                                view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                                runCursorScrub = true
+                                scrubInitialPos = latestPos
+                                scrubApplyImmediately = false
+                            }
+                            letScrollOrPan && !isPageMode -> {
+                                runStripPan = true
+                            }
+                        }
+                    } else {
+                        // 3. Touch anywhere else on Score:
+                        //    - Quick tap -> Smart Beat-Snapped blank tap / Note / Chord / Header tap
+                        //    - Drag before long-press -> Native vertical page scroll (`PAGE_SCROLL`) or horizontal strip pan (`SINGLE_STRIP`)
+                        //    - Stationary Long-Press (380ms) -> Activate live cursor scrubbing right under fingertip!
+                        var latestPos = down.position
+                        var liftedTapPos: Offset? = null
+                        var movedBeforeLongPress = false
+
+                        val finishedBeforeLongPress = withTimeoutOrNull(380L) {
+                            while (true) {
+                                val ev = awaitPointerEvent(PointerEventPass.Initial)
+                                val ch = ev.changes.firstOrNull { it.id == pointerId } ?: return@withTimeoutOrNull true
+                                latestPos = ch.position
+                                if (!ch.pressed) {
+                                    liftedTapPos = ch.position
+                                    return@withTimeoutOrNull true
+                                }
+                                val delta = ch.position - down.position
+                                if (delta.getDistance() > touchSlop) {
+                                    movedBeforeLongPress = true
+                                    if (!isPageMode) {
+                                        val dx = ch.positionChange().x
+                                        ch.consume()
+                                        val viewportW = (size.width - latestHeaderWidthPx).coerceAtLeast(1f)
+                                        val bw = latestBarWidthPx
+                                        val maxX = (latestTotalBars * bw + bw * 0.25f - viewportW).coerceAtLeast(0f)
+                                        scrollX = (scrollX - dx).coerceIn(0f, maxX)
+                                    }
+                                    return@withTimeoutOrNull true
+                                }
+                            }
+                            @Suppress("UNREACHABLE_CODE")
+                            true
+                        }
+
+                        when {
+                            liftedTapPos != null -> {
+                                latestHandleCanvasTap(liftedTapPos!!, size.height.toFloat())
+                            }
+                            movedBeforeLongPress -> {
+                                if (!isPageMode) {
+                                    runStripPan = true
+                                }
+                                // In `isPageMode`, returning without consuming lets `.scrollable(pageVerticalScrollState)`
+                                // continue handling vertical page scroll + native inertial fling seamlessly!
+                            }
+                            finishedBeforeLongPress == null -> {
+                                val onStickyHeader = !isPageMode && latestPos.x < latestHeaderWidthPx
+                                val onPageHeader = isPageMode && StaffScoreEngraver.resolvePageHeaderHit(
+                                    touchX = latestPos.x,
+                                    touchY = latestPos.y,
+                                    scrollY = latestScrollY,
+                                    layout = latestPageLayout,
+                                    melody = latestMelody
+                                ) != null
+                                if (!latestMelody.isRecording && !onStickyHeader && !onPageHeader) {
+                                    view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                                    runCursorScrub = true
+                                    scrubInitialPos = latestPos
+                                    scrubApplyImmediately = true
+                                }
+                            }
+                        }
+                    }
+
+                    if (runStripPan) {
+                        while (true) {
+                            val ev = awaitPointerEvent(PointerEventPass.Main)
+                            val ch = ev.changes.firstOrNull { it.id == pointerId } ?: break
+                            if (!ch.pressed) break
+                            val dx = ch.positionChange().x
+                            if (dx != 0f) {
+                                ch.consume()
+                                val viewportW = (size.width - latestHeaderWidthPx).coerceAtLeast(1f)
+                                val bw = latestBarWidthPx
+                                val maxX = (latestTotalBars * bw + bw * 0.25f - viewportW).coerceAtLeast(0f)
+                                scrollX = (scrollX - dx).coerceIn(0f, maxX)
+                            }
+                        }
+                    } else if (runCursorScrub) {
+                        isDraggingCursor = true
+                        try {
+                            latestOnSelectNote(null)
+                            latestOnSelectAnnotation(null)
+                            var prevTick = latestMelody.cursorTick
+                            var prevStaff = latestMelody.activeStaff
+
+                            fun updateFromPos(pos: Offset) {
+                                if (isPageMode) {
+                                    if (pos.y < edgeAutoScrollZonePx && scrollY > 0f) {
+                                        scrollY = (scrollY - edgeAutoScrollStepPx).coerceIn(0f, latestMaxPageScrollY)
+                                    } else if (pos.y > size.height - edgeAutoScrollZonePx && scrollY < latestMaxPageScrollY) {
+                                        scrollY = (scrollY + edgeAutoScrollStepPx).coerceIn(0f, latestMaxPageScrollY)
+                                    }
+                                    val (tick, staff) = StaffScoreEngraver.mapPageTouchToTickAndStaff(
+                                        touchX = pos.x,
+                                        touchY = pos.y,
+                                        scrollY = scrollY,
+                                        layout = latestPageLayout,
+                                        melody = latestMelody,
+                                        scrubFineMode = true
+                                    )
+                                    if (tick != prevTick || (latestMelody.grandStaffEnabled && staff != prevStaff)) {
+                                        prevTick = tick
+                                        prevStaff = staff
+                                        view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                                        latestOnTapCursorTickAndStaff(tick, staff)
+                                    }
+                                } else {
+                                    val viewportW = (size.width - latestHeaderWidthPx).coerceAtLeast(1f)
+                                    val bw = latestBarWidthPx
+                                    val maxX = (latestTotalBars * bw + bw * 0.25f - viewportW).coerceAtLeast(0f)
+                                    if (pos.x < latestHeaderWidthPx + edgeAutoScrollZonePx && scrollX > 0f) {
+                                        scrollX = (scrollX - edgeAutoScrollStepPx).coerceIn(0f, maxX)
+                                    } else if (pos.x > size.width - edgeAutoScrollZonePx && scrollX < maxX) {
+                                        scrollX = (scrollX + edgeAutoScrollStepPx).coerceIn(0f, maxX)
+                                    }
+                                    val (tick, staff) = StaffScoreEngraver.mapTouchToTickAndStaff(
+                                        touchX = pos.x,
+                                        touchY = pos.y,
+                                        viewportHeight = size.height.toFloat(),
+                                        scrollX = scrollX,
+                                        clefHeaderWidth = latestHeaderWidthPx,
+                                        barWidth = latestBarWidthPx,
+                                        lineSpacingEstimate = latestLineSpacingPx,
+                                        totalBars = latestTotalBars,
+                                        melody = latestMelody,
+                                        scrubFineMode = true
+                                    )
+                                    if (tick != prevTick || (latestMelody.grandStaffEnabled && staff != prevStaff)) {
+                                        prevTick = tick
+                                        prevStaff = staff
+                                        view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                                        latestOnTapCursorTickAndStaff(tick, staff)
+                                    }
+                                }
+                            }
+
+                            if (scrubApplyImmediately) {
+                                updateFromPos(scrubInitialPos)
+                            }
+                            while (true) {
+                                val ev = awaitPointerEvent(PointerEventPass.Initial)
+                                val ch = ev.changes.firstOrNull { it.id == pointerId } ?: break
+                                ev.changes.forEach { it.consume() }
+                                if (!ch.pressed) break
+                                updateFromPos(ch.position)
+                            }
+                        } finally {
+                            isDraggingCursor = false
+                        }
                     }
                 }
             }
+            .scrollable(
+                state = pageVerticalScrollState,
+                orientation = Orientation.Vertical,
+                enabled = isPageMode && !isDraggingCursor
+            )
     ) {
         lastHitTargets = if (isPageMode) {
             StaffScoreEngraver.drawInteractivePageStaff(
@@ -4694,7 +4980,8 @@ private fun InteractiveStaffScoreCanvas(
                 scrollY = scrollY,
                 layout = pageLayout,
                 melody = melody,
-                palette = palette
+                palette = palette,
+                isDraggingCursor = isDraggingCursor
             )
         } else {
             StaffScoreEngraver.drawInteractiveTimelineStaff(
@@ -4705,7 +4992,8 @@ private fun InteractiveStaffScoreCanvas(
                 clefHeaderWidth = effectiveClefHeaderWidthPx,
                 barWidth = barWidthPx,
                 melody = melody,
-                palette = palette
+                palette = palette,
+                isDraggingCursor = isDraggingCursor
             )
         }
     }
@@ -5761,6 +6049,7 @@ private fun GarageBandPianoKeyboard(
 // Transport + Input Mode + Active Grand-Staff Voice Cluster
 // ============================================================================
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun TransportAndModeLeftCluster(
     melody: MelodyStudioUiState,
@@ -5769,8 +6058,11 @@ private fun TransportAndModeLeftCluster(
     onPlayFromStart: () -> Unit,
     onSelectInputMode: (MelodyInputMode) -> Unit,
     onToggleRecordStop: () -> Unit,
-    onSetActiveStaff: (StaffPart) -> Unit
+    onSetActiveStaff: (StaffPart) -> Unit,
+    onNudgeCursor: (direction: Int, fineSixteenth: Boolean) -> Unit,
+    onOpenCursorJumpDialog: () -> Unit
 ) {
+    val view = LocalView.current
     Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(5.dp)
@@ -5957,6 +6249,116 @@ private fun TransportAndModeLeftCluster(
                                 maxLines = 1
                             )
                         }
+                    }
+                }
+            }
+        }
+
+        // Compact `◀ [小节:拍] ▶` Cursor Stepper & Quick-Jump Pill (constant 28.dp height, zero extra toolbar row!)
+        if (!melody.isRecording) {
+            val displayTick = if (melody.isPlaying) {
+                (melody.playheadBeat * TICKS_PER_BEAT.toFloat()).roundToInt().coerceAtLeast(0)
+            } else {
+                melody.cursorTick.coerceAtLeast(0)
+            }
+            val badgeText = MusicalNotationHelper.formatBarBeatBadge(displayTick, melody.timeSignature)
+            val canStepBack = displayTick > 0
+            val minStep = melody.activeTuplet?.noteTicks ?: TICKS_PER_STEP
+            val maxReachableTick = (maxOf(
+                melody.totalTicks,
+                melody.notes.maxOfOrNull { it.resolvedEndTick } ?: 0
+            ) - minStep).coerceAtLeast(0)
+            val canStepForward = displayTick < maxReachableTick
+            val nudgeShape = RoundedCornerShape(8.dp)
+
+            Surface(
+                shape = nudgeShape,
+                color = StudioSurfaceElevated,
+                border = BorderStroke(1.dp, CyanPrimary.copy(alpha = 0.50f)),
+                modifier = Modifier.height(28.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .fillMaxHeight()
+                            .width(if (compactModeLabels) 23.dp else 25.dp)
+                            .combinedClickable(
+                                enabled = canStepBack,
+                                onClick = {
+                                    view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                                    onNudgeCursor(-1, false)
+                                },
+                                onLongClick = {
+                                    view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                                    onNudgeCursor(-1, true)
+                                }
+                            )
+                    ) {
+                        Text(
+                            text = "◀",
+                            fontSize = 9.5.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = if (canStepBack) CyanPrimary else TextMuted.copy(alpha = 0.45f),
+                            maxLines = 1
+                        )
+                    }
+
+                    Box(
+                        modifier = Modifier
+                            .width(1.dp)
+                            .height(15.dp)
+                            .background(StudioBorder)
+                    )
+
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .fillMaxHeight()
+                            .clickable(onClick = onOpenCursorJumpDialog)
+                            .padding(horizontal = if (compactModeLabels) 6.dp else 7.dp)
+                    ) {
+                        Text(
+                            text = badgeText,
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.Bold,
+                            color = TextPrimary,
+                            maxLines = 1
+                        )
+                    }
+
+                    Box(
+                        modifier = Modifier
+                            .width(1.dp)
+                            .height(15.dp)
+                            .background(StudioBorder)
+                    )
+
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .fillMaxHeight()
+                            .width(if (compactModeLabels) 23.dp else 25.dp)
+                            .combinedClickable(
+                                enabled = canStepForward,
+                                onClick = {
+                                    view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                                    onNudgeCursor(1, false)
+                                },
+                                onLongClick = {
+                                    view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                                    onNudgeCursor(1, true)
+                                }
+                            )
+                    ) {
+                        Text(
+                            text = "▶",
+                            fontSize = 9.5.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = if (canStepForward) CyanPrimary else TextMuted.copy(alpha = 0.45f),
+                            maxLines = 1
+                        )
                     }
                 }
             }
@@ -9386,6 +9788,355 @@ private fun ChordSymbolStudioDialog(
         dismissButton = {
             TextButton(onClick = onDismiss) {
                 Text("关闭", color = TextSecondary)
+            }
+        }
+    )
+}
+
+@Composable
+private fun MelodyCursorJumpDialog(
+    melody: MelodyStudioUiState,
+    onJumpToTick: (Int) -> Unit,
+    onJumpToBarBeat: (barNum: Int, beatNum: Int) -> Unit,
+    onNudgeCursor: (direction: Int, fineSixteenth: Boolean) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val hostView = LocalView.current
+    val timeSig = melody.timeSignature
+    val ticksPerBar = timeSig.ticksPerBar.coerceAtLeast(1)
+    val unitTicks = timeSig.unitTicks.coerceAtLeast(1)
+    val activeTick = if (melody.isPlaying) {
+        (melody.playheadBeat * TICKS_PER_BEAT).roundToInt().coerceAtLeast(0)
+    } else {
+        melody.cursorTick
+    }
+    val currentBar1 = (activeTick.coerceAtLeast(0) / ticksPerBar) + 1
+    val currentBeat1 = ((activeTick.coerceAtLeast(0) % ticksPerBar) / unitTicks) + 1
+
+    var barText by remember { mutableStateOf(currentBar1.toString()) }
+    var selectedBeat by remember { mutableIntStateOf(1) }
+
+    // Keep live preview synced when user taps fine nudge buttons inside dialog
+    val parsedBar = barText.trim().toIntOrNull()?.coerceIn(1, MAX_MELODY_BARS) ?: currentBar1
+    val safeSelectedBeat = selectedBeat.coerceIn(1, timeSig.safeNumerator)
+
+    val livePosLabel = MusicalNotationHelper.formatCursorBubbleLabel(
+        tick = activeTick,
+        timeSignature = timeSig,
+        staffPart = if (melody.grandStaffEnabled) melody.activeStaff else null
+    )
+    val lastContentStartTick = remember(melody.notes, melody.chordSymbols, ticksPerBar) {
+        val maxNoteStart = melody.notes.maxOfOrNull { it.resolvedStartTick } ?: 0
+        val maxChordStart = melody.chordSymbols.maxOfOrNull { it.safeTick } ?: 0
+        max(maxNoteStart, maxChordStart).coerceAtLeast(0)
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = StudioSurface,
+        titleContentColor = TextPrimary,
+        textContentColor = TextSecondary,
+        title = {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "光标快速定位",
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = TextPrimary
+                )
+                Surface(
+                    shape = RoundedCornerShape(7.dp),
+                    color = StudioSurfaceElevated,
+                    border = BorderStroke(1.dp, StudioBorder)
+                ) {
+                    Text(
+                        text = livePosLabel,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = CyanPrimary,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                    )
+                }
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                // 1. 快捷一键跳回本小节首拍 / 全曲首尾
+                Text(
+                    text = "快捷定位",
+                    fontSize = 11.5.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = TextPrimary
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Surface(
+                        modifier = Modifier
+                            .weight(1.35f)
+                            .height(34.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable {
+                                hostView.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                                onJumpToBarBeat(currentBar1, 1)
+                                onDismiss()
+                            },
+                        shape = RoundedCornerShape(8.dp),
+                        color = CyanPrimary.copy(alpha = 0.13f),
+                        border = BorderStroke(1.dp, CyanPrimary.copy(alpha = 0.55f))
+                    ) {
+                        Box(contentAlignment = Alignment.Center, modifier = Modifier.padding(horizontal = 6.dp)) {
+                            Text(
+                                text = "本小节首拍 ($currentBar1:1)",
+                                fontSize = 11.5.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = CyanPrimary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+
+                    Surface(
+                        modifier = Modifier
+                            .weight(0.85f)
+                            .height(34.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable {
+                                hostView.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                                onJumpToTick(0)
+                                onDismiss()
+                            },
+                        shape = RoundedCornerShape(8.dp),
+                        color = StudioSurfaceElevated,
+                        border = BorderStroke(1.dp, StudioBorder)
+                    ) {
+                        Box(contentAlignment = Alignment.Center, modifier = Modifier.padding(horizontal = 4.dp)) {
+                            Text(
+                                text = "全曲开头",
+                                fontSize = 11.5.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = TextPrimary,
+                                maxLines = 1
+                            )
+                        }
+                    }
+
+                    Surface(
+                        modifier = Modifier
+                            .weight(0.85f)
+                            .height(34.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable {
+                                hostView.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                                onJumpToTick(lastContentStartTick)
+                                onDismiss()
+                            },
+                        shape = RoundedCornerShape(8.dp),
+                        color = StudioSurfaceElevated,
+                        border = BorderStroke(1.dp, StudioBorder)
+                    ) {
+                        Box(contentAlignment = Alignment.Center, modifier = Modifier.padding(horizontal = 4.dp)) {
+                            Text(
+                                text = "写谱末尾",
+                                fontSize = 11.5.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = TextPrimary,
+                                maxLines = 1
+                            )
+                        }
+                    }
+                }
+
+                HorizontalDivider(color = StudioBorder)
+
+                // 2. 刻度微调（支持试听时边点边听）
+                Text(
+                    text = "步进微调（16分音符 / 整拍）",
+                    fontSize = 11.5.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = TextPrimary
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(5.dp)
+                ) {
+                    val stepActions: List<Pair<String, () -> Unit>> = listOf(
+                        "-1小节" to {
+                            val nextTick = (activeTick - ticksPerBar).coerceAtLeast(0)
+                            onJumpToTick(nextTick)
+                            barText = ((nextTick / ticksPerBar) + 1).toString()
+                        },
+                        "-1拍" to {
+                            val nextTick = (activeTick - unitTicks).coerceAtLeast(0)
+                            onJumpToTick(nextTick)
+                            barText = ((nextTick / ticksPerBar) + 1).toString()
+                        },
+                        "-1/16" to {
+                            onNudgeCursor(-1, true)
+                        },
+                        "+1/16" to {
+                            onNudgeCursor(1, true)
+                        },
+                        "+1拍" to {
+                            val maxT = max(melody.totalBars * ticksPerBar, ticksPerBar)
+                            val nextTick = (activeTick + unitTicks).coerceAtMost(maxT)
+                            onJumpToTick(nextTick)
+                            barText = ((nextTick / ticksPerBar) + 1).toString()
+                        },
+                        "+1小节" to {
+                            val nextBar = (currentBar1 + 1).coerceAtMost(MAX_MELODY_BARS)
+                            onJumpToBarBeat(nextBar, currentBeat1)
+                            barText = nextBar.toString()
+                        }
+                    )
+                    stepActions.forEach { (label, action) ->
+                        Surface(
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(30.dp)
+                                .clip(RoundedCornerShape(6.dp))
+                                .clickable {
+                                    hostView.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                                    action()
+                                },
+                            shape = RoundedCornerShape(6.dp),
+                            color = StudioSurfaceElevated,
+                            border = BorderStroke(1.dp, StudioBorder)
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Text(
+                                    text = label,
+                                    fontSize = 10.5.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = TextPrimary,
+                                    maxLines = 1
+                                )
+                            }
+                        }
+                    }
+                }
+
+                HorizontalDivider(color = StudioBorder)
+
+                // 3. 输入指定小节与拍位直接跳转
+                Text(
+                    text = "跳转至指定小节（1 ~ $MAX_MELODY_BARS，超出当前总小节将自动扩充）",
+                    fontSize = 11.5.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = TextPrimary
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedButton(
+                        onClick = {
+                            val next = (parsedBar - 1).coerceAtLeast(1)
+                            barText = next.toString()
+                        },
+                        modifier = Modifier.height(44.dp),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp)
+                    ) {
+                        Text("-1", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
+
+                    OutlinedTextField(
+                        value = barText,
+                        onValueChange = { raw ->
+                            val filtered = raw.filter { it.isDigit() }.take(2)
+                            barText = filtered
+                        },
+                        modifier = Modifier.weight(1f),
+                        singleLine = true,
+                        label = { Text("目标小节号 (当前共 ${melody.totalBars} 小节)", fontSize = 11.sp) },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                    )
+
+                    OutlinedButton(
+                        onClick = {
+                            val next = (parsedBar + 1).coerceAtMost(MAX_MELODY_BARS)
+                            barText = next.toString()
+                        },
+                        modifier = Modifier.height(44.dp),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp)
+                    ) {
+                        Text("+1", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "拍位:",
+                        fontSize = 11.5.sp,
+                        color = TextSecondary
+                    )
+                    for (beat in 1..timeSig.safeNumerator) {
+                        val selected = beat == safeSelectedBeat
+                        Surface(
+                            modifier = Modifier
+                                .height(28.dp)
+                                .clip(RoundedCornerShape(7.dp))
+                                .clickable { selectedBeat = beat },
+                            shape = RoundedCornerShape(7.dp),
+                            color = if (selected) CyanPrimary else StudioSurfaceElevated,
+                            border = BorderStroke(1.dp, if (selected) CyanPrimary else StudioBorder)
+                        ) {
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier.padding(horizontal = 10.dp)
+                            ) {
+                                Text(
+                                    text = "第 $beat 拍",
+                                    fontSize = 11.sp,
+                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                                    color = if (selected) OnAccentLight else TextPrimary
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    hostView.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                    onJumpToBarBeat(parsedBar, safeSelectedBeat)
+                    onDismiss()
+                },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = CyanPrimary,
+                    contentColor = OnAccentLight
+                )
+            ) {
+                Text(
+                    text = "跳至 第 $parsedBar 小节 · 第 $safeSelectedBeat 拍",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("取消", color = TextSecondary)
             }
         }
     )

@@ -752,6 +752,76 @@ data class MelodyStudioUiState(
             .coerceIn(1, timeSignature.safeNumerator)
 
     /**
+     * Dynamic beat-snapping grid (in ticks) when single-tapping blank staff space:
+     * - Tuplet active -> current tuplet step (`activeTuplet.noteTicks`)
+     * - Whole / Half / Dotted-Half / Quarter -> whole beat (`TICKS_PER_BEAT`, capped by meter beat unit)
+     * - Eighth / Dotted-Quarter -> half beat (`TICKS_PER_BEAT / 2`, capped by meter beat unit)
+     * - Sixteenth / Dotted-Eighth -> sixteenth step (`TICKS_PER_STEP`)
+     */
+    fun smartBlankTapSnapTicks(): Int {
+        activeTuplet?.let { return it.noteTicks.coerceAtLeast(1) }
+        val beatCap = minOf(TICKS_PER_BEAT, timeSignature.unitTicks).coerceAtLeast(TICKS_PER_STEP)
+        return when (noteDuration) {
+            NoteDurationPreset.WHOLE,
+            NoteDurationPreset.DOTTED_HALF,
+            NoteDurationPreset.HALF,
+            NoteDurationPreset.QUARTER -> beatCap
+            NoteDurationPreset.DOTTED_QUARTER,
+            NoteDurationPreset.EIGHTH -> minOf(TICKS_PER_BEAT / 2, timeSignature.unitTicks).coerceAtLeast(TICKS_PER_STEP)
+            NoteDurationPreset.DOTTED_EIGHTH,
+            NoteDurationPreset.SIXTEENTH -> TICKS_PER_STEP
+        }
+    }
+
+    /**
+     * Step size (in ticks) for the `◀ / ▶` cursor nudge buttons (at most 1 beat, or 1/16th when [fineSixteenth] is true).
+     */
+    fun cursorNudgeStepTicks(fineSixteenth: Boolean = false): Int {
+        if (fineSixteenth) return TICKS_PER_STEP
+        activeTuplet?.let { return minOf(it.noteTicks, TICKS_PER_BEAT).coerceAtLeast(1) }
+        return smartBlankTapSnapTicks()
+    }
+
+    /**
+     * Computes the next/previous grid-aligned cursor tick across measures without cumulative barline drift.
+     * When playback is running (`isPlaying && !isRecording`), steps relative to the live playhead position.
+     */
+    fun computeNudgedCursorTick(direction: Int, fineSixteenth: Boolean = false): Int {
+        val minStepUnit = activeTuplet?.noteTicks ?: TICKS_PER_STEP
+        val maxTick = (totalTicks - minStepUnit).coerceAtLeast(0)
+        val baseTick = if (isPlaying && !isRecording) {
+            (playheadBeat * TICKS_PER_BEAT.toFloat()).roundToInt().coerceIn(0, maxTick)
+        } else {
+            cursorTick.coerceIn(0, maxTick)
+        }
+        val step = cursorNudgeStepTicks(fineSixteenth).coerceAtLeast(1)
+        val tpb = ticksPerBar.coerceAtLeast(1)
+        val barStart = (baseTick / tpb) * tpb
+        val inBar = baseTick - barStart
+        val target = if (direction >= 0) {
+            val nextInBar = ((inBar / step) + 1) * step
+            if (nextInBar < tpb) {
+                barStart + nextInBar
+            } else {
+                barStart + tpb
+            }
+        } else {
+            if (inBar % step != 0) {
+                barStart + (inBar / step) * step
+            } else if (inBar > 0) {
+                barStart + (inBar - step).coerceAtLeast(0)
+            } else if (barStart <= 0) {
+                0
+            } else {
+                val prevBarStart = barStart - tpb
+                val lastSlotInPrevBar = ((tpb - 1).coerceAtLeast(0) / step) * step
+                prevBarStart + lastSlotInPrevBar
+            }
+        }
+        return target.coerceIn(0, maxTick)
+    }
+
+    /**
      * 1-based slot index (`1..count`) of the next tuplet note to enter when [activeTuplet] is enabled.
      */
     val currentTupletSlotNumber: Int
@@ -798,6 +868,70 @@ object MusicalNotationHelper {
 
     fun formatSustainSeconds(sec: Float): String =
         String.format(Locale.US, "%.3f", sec.coerceIn(0.030f, 10.000f))
+
+    private tailrec fun gcdInt(a: Int, b: Int): Int =
+        if (b == 0) kotlin.math.abs(a) else gcdInt(b, a % b)
+
+    /**
+     * Compact `[小节:拍]` badge for the thumb-dock cursor stepper (`1:1`, `3:2`, `3:2½`, `3:2¼`, `3:2¾`).
+     */
+    fun formatBarBeatBadge(tick: Int, timeSignature: TimeSignature): String {
+        val tpb = timeSignature.ticksPerBar.coerceAtLeast(1)
+        val unit = timeSignature.unitTicks.coerceAtLeast(1)
+        val safe = tick.coerceAtLeast(0)
+        val barNum = (safe / tpb) + 1
+        val inBar = safe % tpb
+        val beatNum = ((inBar / unit) + 1).coerceIn(1, timeSignature.safeNumerator)
+        val rem = inBar % unit
+        if (rem == 0) return "$barNum:$beatNum"
+        val g = gcdInt(rem, unit).coerceAtLeast(1)
+        val num = rem / g
+        val den = unit / g
+        val fracBadge = when {
+            num == 1 && den == 2 -> "½"
+            num == 1 && den == 4 -> "¼"
+            num == 3 && den == 4 -> "¾"
+            num == 1 && den == 3 -> "⅓"
+            num == 2 && den == 3 -> "⅔"
+            else -> "+$num/$den"
+        }
+        return "$barNum:$beatNum$fracBadge"
+    }
+
+    /**
+     * Expressive floating bubble label while dragging the red dashed cursor (`第 3 小节 · 第 2 拍`, `第 3 小节 · 2 拍半`, `第 3 小节 · 2 拍 1/4`).
+     */
+    fun formatCursorBubbleLabel(
+        tick: Int,
+        timeSignature: TimeSignature,
+        staffPart: StaffPart? = null
+    ): String {
+        val tpb = timeSignature.ticksPerBar.coerceAtLeast(1)
+        val unit = timeSignature.unitTicks.coerceAtLeast(1)
+        val safe = tick.coerceAtLeast(0)
+        val barNum = (safe / tpb) + 1
+        val inBar = safe % tpb
+        val beatNum = ((inBar / unit) + 1).coerceIn(1, timeSignature.safeNumerator)
+        val rem = inBar % unit
+        val beatText = if (rem == 0) {
+            "第 $beatNum 拍"
+        } else {
+            val g = gcdInt(rem, unit).coerceAtLeast(1)
+            val num = rem / g
+            val den = unit / g
+            when {
+                num == 1 && den == 2 -> "$beatNum 拍半"
+                den in listOf(3, 4, 5, 6, 8, 16) -> "$beatNum 拍 $num/$den"
+                else -> "$beatNum 拍 +${(rem.toFloat() / TICKS_PER_STEP.toFloat()).roundToInt()}/16"
+            }
+        }
+        val staffSuffix = when (staffPart) {
+            StaffPart.TREBLE -> " · 𝄞"
+            StaffPart.BASS -> " · 𝄢"
+            null -> ""
+        }
+        return "第 $barNum 小节 · $beatText$staffSuffix"
+    }
 
     /**
      * Default ergonomic white key physical width (dp) for a screen container width.

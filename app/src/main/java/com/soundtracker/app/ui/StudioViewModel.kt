@@ -4603,10 +4603,66 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         setMelodyCursorTickAndStaff(tick = tick, staff = null)
     }
 
+    fun nudgeMelodyCursor(direction: Int, fineSixteenth: Boolean = false) {
+        val cur = _uiState.value.melody
+        if (cur.isRecording) return
+        val nextTick = cur.computeNudgedCursorTick(direction = direction, fineSixteenth = fineSixteenth)
+        _uiState.update { st ->
+            st.copy(
+                melody = st.melody.copy(
+                    selectedNoteId = null,
+                    selectedAnnotation = null
+                )
+            )
+        }
+        setMelodyCursorTickAndStaff(tick = nextTick, staff = null)
+    }
+
+    fun jumpMelodyCursorToBarBeat(barNumber1Based: Int, beatNumber1Based: Int = 1) {
+        val cur = _uiState.value.melody
+        if (cur.isRecording) return
+        val safeBar = barNumber1Based.coerceIn(1, MAX_MELODY_BARS)
+        val safeBeat = beatNumber1Based.coerceIn(1, cur.timeSignature.safeNumerator)
+        val expandedBars = safeBar > cur.totalBars
+        if (expandedBars) {
+            pushMelodyUndoSnapshot()
+            _uiState.update { st ->
+                st.copy(
+                    melody = st.melody.copy(
+                        totalBars = safeBar,
+                        selectedNoteId = null,
+                        selectedAnnotation = null
+                    )
+                )
+            }
+            syncMelodySequenceToEngine()
+        } else {
+            _uiState.update { st ->
+                st.copy(
+                    melody = st.melody.copy(
+                        selectedNoteId = null,
+                        selectedAnnotation = null
+                    )
+                )
+            }
+        }
+        val tpb = _uiState.value.melody.ticksPerBar.coerceAtLeast(1)
+        val unit = _uiState.value.melody.timeSignature.unitTicks.coerceAtLeast(1)
+        val targetTick = (safeBar - 1) * tpb + (safeBeat - 1) * unit
+        setMelodyCursorTickAndStaff(tick = targetTick, staff = null)
+    }
+
     fun setMelodyCursorTickAndStaff(tick: Int, staff: StaffPart?) {
         val cur = _uiState.value.melody
         val minStepUnit = cur.activeTuplet?.noteTicks ?: TICKS_PER_STEP
-        val clamped = tick.coerceIn(0, (cur.totalTicks - minStepUnit).coerceAtLeast(0))
+        val tpb = cur.ticksPerBar.coerceAtLeast(1)
+        val maxContentTick = maxOf(
+            cur.totalTicks,
+            cur.notes.maxOfOrNull { it.resolvedEndTick } ?: 0,
+            cur.chordSymbols.maxOfOrNull { ((it.safeTick / tpb) + 1) * tpb } ?: 0,
+            cur.keySignatureEvents.maxOfOrNull { (it.safeBarIndex + 1) * tpb } ?: 0
+        )
+        val clamped = tick.coerceIn(0, (maxContentTick - minStepUnit).coerceAtLeast(0))
         val nextBeat = clamped.toFloat() / TICKS_PER_BEAT.toFloat()
         var notesChanged = false
         _uiState.update { st ->

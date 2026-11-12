@@ -335,6 +335,8 @@ class MainActivity : ComponentActivity() {
                             onToggleMinimizeKeyboardForScore = viewModel::toggleMinimizeKeyboardForScore,
                             onTapCursorTick = viewModel::setMelodyCursorTick,
                             onTapCursorTickAndStaff = viewModel::setMelodyCursorTickAndStaff,
+                            onNudgeCursor = viewModel::nudgeMelodyCursor,
+                            onJumpCursorToBarBeat = viewModel::jumpMelodyCursorToBarBeat,
                             onSelectNote = viewModel::selectMelodyNote,
                             onSelectAnnotation = viewModel::selectMelodyAnnotation,
                             onUpsertChordSymbol = viewModel::upsertMelodyChordSymbol,

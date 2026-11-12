@@ -38,14 +38,14 @@
 
 ### 3. 乐器打谱与五线谱工坊（`melody/` + `ui/MelodyStudioScreen.kt` + `cpp/melody_synth.cpp`）
 - `melody/MelodyModels.kt`：
-  - 统一高精度符号时间轴：`TICKS_PER_BEAT = 480`（四分音符），`TICKS_PER_STEP = 120`（十六分音符）。
+  - 统一高精度符号时间轴：`TICKS_PER_BEAT = 240`（四分音符），`TICKS_PER_STEP = 60`（十六分音符）。
   - 核心数据结构：`StudioInstrument`（9 种精选采样乐器）、`TimeSignature`（任意拍号）、`SwingPreset`、`TupletPreset`（二/三/五/六/七连音）、`StaffPart`（`TREBLE` 上行高音 / `BASS` 下行低音）、`DualKeyboardStaffRouting`、`MelodyScoreNote`（含显式谱表归属 `targetStaff`、连音元数据、圆滑线组 `slurGroupId`、奏法/重音/延长号）、`MelodySnapshot`（Undo/Redo 快照）与 `MelodyStudioUiState`。
 - `melody/MelodyKeySignature.kt`：完整五度圈大小调（`-7♭ ~ 0 ~ +7♯`）、中途转调事件 `ScoreKeySignatureEvent`，以及小节内临时升降还原号（`♯ / ♭ / ♮`）推导状态机。
 - `melody/MelodyChords.kt`：谱表上方字母和弦标记 `ScoreChordSymbol`、跟随当前生效调号（含中途转调）的顺阶三和弦/顺阶七和弦智能推荐器、通用字母和弦文本解析器（`parseChordSymbol`，支持升降根音、大小七/属七/减七/半减七/挂留/加九/扩展音与 `/Bass` 斜杠转位）及 `G2~E4` 温暖伴奏声部排布器。
 - `melody/MelodyExpressions.kt`：段落力度（`pp~ff`/`sfz`/`fp`）、渐强渐弱发夹线（`cresc.`/`dim.`）、奏法（跳音/顿音/保持音/半连音/圆滑线 Legato/延长记号 `𝄐`）、速度术语及变速曲线（`rit.`/`accel.`/`a tempo`），以及**统一音频事件编译器 `MelodyExpressionCompiler`**（将谱面音符、表情变速与上方和弦伴奏统一编译为采样帧级时间表，同时驱动实时试听与离线 WAV 导出）。
 - `melody/StaffScoreEngraver.kt`：
   - 三端同源五线谱排版与渲染引擎：支持**整页多行纵向滚动谱（`PAGE_SCROLL`）**、**单行横向卷轴谱（`SINGLE_STRIP`）**以及 **A4 印刷级纯矢量 PDF（`exportScoreToPdfFile`）**。
-  - 支持可选双行钢琴大谱表（`Grand Staff`，含行首古典花括号联谱号 `{`）、上下行独立补齐休止符与符干方向、触屏直点切换上下行声部（`mapPageTouchToTickAndStaff` / `mapTouchToTickAndStaff`），以及多层记号垂直防碰撞排版。
+  - 支持可选双行钢琴大谱表（`Grand Staff`，含行首古典花括号联谱号 `{`）、上下行独立补齐休止符与符干方向、单点空白智能拍位四舍五入吸附与可拖拽红虚线水滴游标（`mapPageTouchToTickAndStaff` / `mapTouchToTickAndStaff` + 实时拍位气泡 + `◀ [小节:拍] ▶` 步进微调胶囊），以及多层记号垂直防碰撞排版。
 - `melody/MelodyProjectRepository.kt`：版本化 `.stscore.json` 本地多项目存档管理、跨设备导入导出，以及防杀进程丢数据的实时防抖自动保存草稿（`__autosave_draft__`）。
 - `melody/KeyboardLayoutPreferences.kt`：按 `(手机/平板 × 横竖屏 × 单/双排键盘)` 组合键独立持久化键盘高度、宽度占比、琴键宽度、八度滚动位置与双排折叠状态。
 - `melody/MelodyRealtimePlayer.kt` + `cpp/melody_synth.cpp`：基于 `TinySoundFont` (`tsf.h`) 的低延迟双键盘槽实时发声、房间/大厅混响、节拍器、任意进度 `seekTransport` 试听与离线 `.wav` 渲染。
