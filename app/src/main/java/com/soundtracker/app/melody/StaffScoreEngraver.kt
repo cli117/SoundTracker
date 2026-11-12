@@ -1134,6 +1134,920 @@ object StaffScoreEngraver {
     }
 
     // ========================================================================
+    // 1B. Multi-System Vertically-Scrollable Full-Page Sheet Music (`整页谱`)
+    //     Displays multiple rows of measures at once so pitch/rhythm mistakes
+    //     are immediately visible by eye, and any measure/note on any row can
+    //     be tapped to seek playback or edit directly!
+    // ========================================================================
+
+    enum class PageHeaderHitKind {
+        KEY_SIGNATURE,
+        TIME_SIGNATURE
+    }
+
+    data class PageStaffLayout(
+        val viewportWidth: Float,
+        val marginLeftX: Float,
+        val marginRightX: Float,
+        val contentWidth: Float,
+        val lineSpacing: Float,
+        val grandStaff: Boolean,
+        val totalBars: Int,
+        val barsPerSystem: Int,
+        val totalSystems: Int,
+        val staffHeight: Float,
+        val grandGap: Float,
+        val systemBlockHeight: Float,
+        val topPadding: Float,
+        val systemRowStride: Float,
+        val bottomPadding: Float,
+        val totalContentHeight: Float
+    ) {
+        fun systemTrebleTopWorldY(sysIdx: Int): Float =
+            topPadding + sysIdx * systemRowStride
+
+        fun systemForBar(barIndex: Int): Int =
+            (barIndex.coerceAtLeast(0) / barsPerSystem.coerceAtLeast(1))
+                .coerceIn(0, (totalSystems - 1).coerceAtLeast(0))
+    }
+
+    private data class PageSystemHorizontalGeom(
+        val sysIdx: Int,
+        val startBar: Int,
+        val barsInSys: Int,
+        val endBar: Int,
+        val isFirstSystem: Boolean,
+        val sysStartKey: KeySignature,
+        val clefZoneW: Float,
+        val nextSysKeyEv: ScoreKeySignatureEvent?,
+        val courtesyCancelTreble: List<Int>,
+        val courtesyZoneW: Float,
+        val singleBarW: Float,
+        val systemActualW: Float
+    )
+
+    fun computePageStaffLayout(
+        viewportWidth: Float,
+        densityScale: Float,
+        melody: MelodyStudioUiState
+    ): PageStaffLayout {
+        val safeDensity = densityScale.coerceAtLeast(1f)
+        val safeWidth = viewportWidth.coerceAtLeast(160f)
+        val viewportWidthDp = safeWidth / safeDensity
+        val timeSig = melody.timeSignature
+        val ticksPerBar = timeSig.ticksPerBar
+        val quarterBeatsPerBar = timeSig.quarterBeatsPerBar.coerceAtLeast(0.25f)
+
+        val maxNoteBeat = melody.notes.maxOfOrNull { it.endBeat } ?: quarterBeatsPerBar
+        val maxMarkTick = maxOf(
+            melody.dynamicMarks.maxOfOrNull { it.tick } ?: 0,
+            melody.hairpins.maxOfOrNull { it.safeEndTick } ?: 0,
+            melody.tempoEvents.maxOfOrNull { it.safeEndTick } ?: 0
+        )
+        val maxKeyBar = (melody.keySignatureEvents.maxOfOrNull { it.safeBarIndex + 1 } ?: 1)
+        val totalBars = maxOf(
+            melody.totalBars,
+            ceil(maxNoteBeat / quarterBeatsPerBar).toInt(),
+            ceil(maxMarkTick / ticksPerBar.toFloat()).toInt(),
+            maxKeyBar
+        ).coerceAtLeast(1)
+
+        val wideMeter = ticksPerBar > 1200
+        val barsPerSystem = when {
+            viewportWidthDp >= 820f -> if (wideMeter) 3 else 4
+            viewportWidthDp >= 540f -> if (wideMeter) 2 else 3
+            else -> 2
+        }
+        val totalSystems = ceil(totalBars / barsPerSystem.toFloat()).toInt().coerceAtLeast(1)
+        val grandStaff = needsGrandStaff(melody.notes)
+
+        val lineSpacingDp = when {
+            viewportWidthDp >= 820f -> if (grandStaff) 7.4f else 8.4f
+            viewportWidthDp >= 600f -> if (grandStaff) 7.0f else 8.0f
+            else -> if (grandStaff) 6.4f else 7.2f
+        }
+        val lineSpacing = lineSpacingDp * safeDensity
+        val staffHeight = lineSpacing * 4f
+        val grandGap = lineSpacing * 3.4f
+        val systemBlockHeight = if (grandStaff) (staffHeight * 2f + grandGap) else staffHeight
+
+        val hasTopMarks = melody.tempoEvents.isNotEmpty() ||
+            melody.keySignatureEvents.isNotEmpty() ||
+            melody.notes.any { it.hasFermata || it.accent == NoteAccent.MARCATO }
+        val hasBottomMarks = melody.dynamicMarks.isNotEmpty() || melody.hairpins.isNotEmpty()
+
+        val topPadding = lineSpacing * (if (hasTopMarks) 3.7f else 3.1f)
+        val interSystemGap = lineSpacing * (
+            4.8f +
+                (if (hasTopMarks) 1.0f else 0f) +
+                (if (hasBottomMarks) 1.0f else 0f)
+            )
+        val systemRowStride = systemBlockHeight + interSystemGap
+        val bottomPadding = lineSpacing * (if (hasBottomMarks) 4.0f else 3.0f)
+        val totalContentHeight = topPadding +
+            (totalSystems - 1).coerceAtLeast(0) * systemRowStride +
+            systemBlockHeight +
+            bottomPadding
+
+        val marginLeftX = (if (viewportWidthDp >= 600f) 16f else 10f) * safeDensity
+        val marginRightX = (if (viewportWidthDp >= 600f) 20f else 14f) * safeDensity
+        val contentWidth = (safeWidth - marginLeftX - marginRightX).coerceAtLeast(lineSpacing * 18f)
+
+        return PageStaffLayout(
+            viewportWidth = safeWidth,
+            marginLeftX = marginLeftX,
+            marginRightX = marginRightX,
+            contentWidth = contentWidth,
+            lineSpacing = lineSpacing,
+            grandStaff = grandStaff,
+            totalBars = totalBars,
+            barsPerSystem = barsPerSystem,
+            totalSystems = totalSystems,
+            staffHeight = staffHeight,
+            grandGap = grandGap,
+            systemBlockHeight = systemBlockHeight,
+            topPadding = topPadding,
+            systemRowStride = systemRowStride,
+            bottomPadding = bottomPadding,
+            totalContentHeight = totalContentHeight
+        )
+    }
+
+    private fun computePageSystemHorizontalGeom(
+        sysIdx: Int,
+        layout: PageStaffLayout,
+        melody: MelodyStudioUiState
+    ): PageSystemHorizontalGeom {
+        val s = layout.lineSpacing
+        val startBar = sysIdx * layout.barsPerSystem
+        val barsInSys = min(layout.barsPerSystem, layout.totalBars - startBar).coerceAtLeast(1)
+        val endBar = startBar + barsInSys - 1
+        val isFirstSystem = (sysIdx == 0)
+
+        val sysStartKey = melody.keySignatureAtBar(startBar)
+        val sysStartKeyW = keySignatureGroupWidth(0, abs(sysStartKey.safeFifths), s)
+        val clefZoneW = (if (isFirstSystem) s * 5.25f else s * 3.15f) + sysStartKeyW
+
+        val nextSysKeyEv = if (endBar + 1 < layout.totalBars) {
+            melody.keySignatureEventAtBar(endBar + 1)
+        } else {
+            null
+        }
+        val endBarKey = melody.keySignatureAtBar(endBar)
+        val courtesyCancelTreble = if (nextSysKeyEv != null) {
+            endBarKey.cancelledStaffStepsTo(nextSysKeyEv.keySignature, isBass = false)
+        } else {
+            emptyList()
+        }
+        val courtesyGroupW = if (nextSysKeyEv != null) {
+            keySignatureGroupWidth(
+                cancelledCount = courtesyCancelTreble.size,
+                newSigCount = abs(nextSysKeyEv.keySignature.safeFifths),
+                s = s
+            )
+        } else {
+            0f
+        }
+        val courtesyZoneW = if (nextSysKeyEv != null) {
+            s * 0.55f + max(courtesyGroupW, s * 0.6f)
+        } else {
+            0f
+        }
+
+        val availBarsW = (layout.contentWidth - clefZoneW - courtesyZoneW).coerceAtLeast(s * 14f)
+        val singleBarW = availBarsW / layout.barsPerSystem.toFloat()
+        val systemActualW = clefZoneW + singleBarW * barsInSys + courtesyZoneW
+
+        return PageSystemHorizontalGeom(
+            sysIdx = sysIdx,
+            startBar = startBar,
+            barsInSys = barsInSys,
+            endBar = endBar,
+            isFirstSystem = isFirstSystem,
+            sysStartKey = sysStartKey,
+            clefZoneW = clefZoneW,
+            nextSysKeyEv = nextSysKeyEv,
+            courtesyCancelTreble = courtesyCancelTreble,
+            courtesyZoneW = courtesyZoneW,
+            singleBarW = singleBarW,
+            systemActualW = systemActualW
+        )
+    }
+
+    private fun pageMeasureNoteLayout(
+        melody: MelodyStudioUiState,
+        barIndex: Int,
+        bOffsetInSystem: Int,
+        barLeftX: Float,
+        singleBarW: Float,
+        lineSpacing: Float
+    ): Pair<Float, Float> {
+        val basePadL = lineSpacing * 1.25f
+        val padR = lineSpacing * 0.80f
+        val midSysKeyEv = if (bOffsetInSystem > 0 && barIndex >= 1) {
+            melody.keySignatureEventAtBar(barIndex)
+        } else {
+            null
+        }
+        val midKeyW = if (midSysKeyEv != null) midBarKeyChangeWidth(melody, barIndex, lineSpacing) else 0f
+        val effPadL = if (midSysKeyEv != null) {
+            max(basePadL, lineSpacing * 0.45f + midKeyW + lineSpacing * 0.65f)
+        } else {
+            basePadL
+        }
+        val usableW = (singleBarW - effPadL - padR).coerceAtLeast(lineSpacing * 2.4f)
+        return (barLeftX + effPadL) to usableW
+    }
+
+    fun drawInteractivePageStaff(
+        canvas: Canvas,
+        viewportWidth: Float,
+        viewportHeight: Float,
+        scrollY: Float,
+        layout: PageStaffLayout,
+        melody: MelodyStudioUiState,
+        palette: OnScreenPalette = OnScreenPalette()
+    ): List<StaffHitTarget> {
+        val hitTargets = mutableListOf<StaffHitTarget>()
+        if (viewportWidth <= 60f || viewportHeight <= 36f) return hitTargets
+
+        val timeSig = melody.timeSignature
+        val ticksPerBar = timeSig.ticksPerBar
+        val beatCount = timeSig.safeNumerator
+        val lineSpacing = layout.lineSpacing
+        val staffH = layout.staffHeight
+        val grandStaff = layout.grandStaff
+        val marginX = layout.marginLeftX
+
+        val symbols = buildBarSymbols(
+            notes = melody.notes,
+            totalBars = layout.totalBars,
+            timeSignature = timeSig,
+            grandStaff = grandStaff,
+            fillAutoRestsInActiveBars = true,
+            fillAllBarsWithAutoRests = false
+        )
+
+        val subGridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = palette.subGridColor
+            strokeWidth = max(1f, lineSpacing * 0.08f)
+        }
+        val barNumPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(205, 102, 92, 82)
+            textSize = max(15f, lineSpacing * 1.05f)
+            typeface = Typeface.create(Typeface.SERIF, Typeface.ITALIC)
+        }
+        val barLinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = palette.barLineColor
+            strokeWidth = max(1.25f, lineSpacing * 0.13f)
+        }
+        val leftBracePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = palette.inkColor
+            strokeWidth = if (grandStaff) max(2.0f, lineSpacing * 0.22f) else max(1.3f, lineSpacing * 0.14f)
+        }
+        val activeCursorBarTintPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(15, 201, 100, 66)
+            style = Paint.Style.FILL
+        }
+        val activePlayBarTintPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(18, 190, 58, 48)
+            style = Paint.Style.FILL
+        }
+        val rowDividerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(38, 150, 140, 126)
+            strokeWidth = max(1f, lineSpacing * 0.08f)
+        }
+
+        val cursorBarIdx = (melody.cursorTick.coerceAtLeast(0) / ticksPerBar)
+        val playTotalTickFloat = melody.playheadBeat * TICKS_PER_BEAT.toFloat()
+        val playBarIdx = floor(playTotalTickFloat / ticksPerBar.toFloat()).toInt().coerceAtLeast(0)
+
+        val cullPad = lineSpacing * 6.0f
+        val firstSys = floor(((scrollY - cullPad - layout.topPadding) / layout.systemRowStride))
+            .toInt()
+            .coerceIn(0, layout.totalSystems - 1)
+        val lastSys = ceil(((scrollY + viewportHeight + cullPad - layout.topPadding) / layout.systemRowStride))
+            .toInt()
+            .coerceIn(firstSys, layout.totalSystems - 1)
+
+        for (sysIdx in firstSys..lastSys) {
+            val hGeom = computePageSystemHorizontalGeom(sysIdx, layout, melody)
+            val trebleTopY = layout.systemTrebleTopWorldY(sysIdx) - scrollY
+            val bassTopY = trebleTopY + staffH + layout.grandGap
+            val sysBottomY = if (grandStaff) bassTopY + staffH else trebleTopY + staffH
+
+            // Subtle inter-system paper guide rule
+            if (sysIdx > 0) {
+                val sepY = trebleTopY - (layout.systemRowStride - layout.systemBlockHeight) * 0.48f
+                if (sepY in 0f..viewportHeight) {
+                    canvas.drawLine(
+                        marginX,
+                        sepY,
+                        marginX + layout.contentWidth,
+                        sepY,
+                        rowDividerPaint
+                    )
+                }
+            }
+
+            // Highlight active cursor measure / live playing measure so the eye spots it immediately
+            for (bOffset in 0 until hGeom.barsInSys) {
+                val bar = hGeom.startBar + bOffset
+                val bLeft = marginX + hGeom.clefZoneW + bOffset * hGeom.singleBarW
+                val bRight = bLeft + hGeom.singleBarW
+                if ((melody.isPlaying || melody.isRecording) && bar == playBarIdx) {
+                    canvas.drawRoundRect(
+                        RectF(bLeft + 1f, trebleTopY - lineSpacing * 0.7f, bRight - 1f, sysBottomY + lineSpacing * 0.7f),
+                        lineSpacing * 0.45f,
+                        lineSpacing * 0.45f,
+                        activePlayBarTintPaint
+                    )
+                } else if (!melody.isRecording && bar == cursorBarIdx) {
+                    canvas.drawRoundRect(
+                        RectF(bLeft + 1f, trebleTopY - lineSpacing * 0.6f, bRight - 1f, sysBottomY + lineSpacing * 0.6f),
+                        lineSpacing * 0.45f,
+                        lineSpacing * 0.45f,
+                        activeCursorBarTintPaint
+                    )
+                }
+            }
+
+            // 5-line staves & system opening brace / clef / key signature / row-1 time signature
+            drawFiveLines(canvas, marginX, marginX + hGeom.systemActualW, trebleTopY, lineSpacing, palette.staffLineColor)
+            if (grandStaff) {
+                drawFiveLines(canvas, marginX, marginX + hGeom.systemActualW, bassTopY, lineSpacing, palette.staffLineColor)
+            }
+            canvas.drawLine(marginX, trebleTopY, marginX, sysBottomY, leftBracePaint)
+
+            drawTrebleClef(canvas, marginX + lineSpacing * 1.30f, trebleTopY, lineSpacing, palette.inkColor)
+            if (grandStaff) {
+                drawBassClef(canvas, marginX + lineSpacing * 1.25f, bassTopY, lineSpacing, palette.inkColor)
+            }
+
+            val sysKeyEndX = if (hGeom.sysStartKey.safeFifths != 0) {
+                val kLeft = marginX + lineSpacing * 2.48f
+                val endT = drawKeySignatureGroup(
+                    canvas = canvas,
+                    leftX = kLeft,
+                    staffTopY = trebleTopY,
+                    isBass = false,
+                    s = lineSpacing,
+                    cancelledSteps = emptyList(),
+                    newKey = hGeom.sysStartKey,
+                    color = palette.inkColor
+                )
+                if (grandStaff) {
+                    drawKeySignatureGroup(
+                        canvas = canvas,
+                        leftX = kLeft,
+                        staffTopY = bassTopY,
+                        isBass = true,
+                        s = lineSpacing,
+                        cancelledSteps = emptyList(),
+                        newKey = hGeom.sysStartKey,
+                        color = palette.inkColor
+                    )
+                }
+                endT
+            } else {
+                marginX + lineSpacing * 2.50f
+            }
+
+            if (hGeom.isFirstSystem) {
+                val tsX = max(marginX + lineSpacing * 3.45f, sysKeyEndX + lineSpacing * 0.85f)
+                drawTimeSignature(
+                    canvas = canvas,
+                    centerX = tsX,
+                    staffTopY = trebleTopY,
+                    s = lineSpacing,
+                    numerator = timeSig.safeNumerator,
+                    denominator = timeSig.safeDenominator,
+                    color = palette.inkColor
+                )
+                if (grandStaff) {
+                    drawTimeSignature(
+                        canvas = canvas,
+                        centerX = tsX,
+                        staffTopY = bassTopY,
+                        s = lineSpacing,
+                        numerator = timeSig.safeNumerator,
+                        denominator = timeSig.safeDenominator,
+                        color = palette.inkColor
+                    )
+                }
+            }
+
+            // Clef-zone vertical separator
+            val clefSepPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.argb(85, 160, 150, 138)
+                strokeWidth = max(1f, lineSpacing * 0.09f)
+            }
+            canvas.drawLine(marginX + hGeom.clefZoneW, trebleTopY, marginX + hGeom.clefZoneW, sysBottomY, clefSepPaint)
+
+            val sysMeasureGeoms = ArrayList<MeasureSpanGeom>(hGeom.barsInSys)
+            val sysChordAnchors = mutableListOf<RenderedChordAnchor>()
+            val sysTupletObstacles = mutableListOf<RenderedTupletObstacle>()
+            val sysPendingFermatas = mutableListOf<PendingFermataRender>()
+
+            for (bOffset in 0 until hGeom.barsInSys) {
+                val bar = hGeom.startBar + bOffset
+                val bLeft = marginX + hGeom.clefZoneW + bOffset * hGeom.singleBarW
+                val bRight = bLeft + hGeom.singleBarW
+                val (barNoteOriginX, usableW) = pageMeasureNoteLayout(
+                    melody = melody,
+                    barIndex = bar,
+                    bOffsetInSystem = bOffset,
+                    barLeftX = bLeft,
+                    singleBarW = hGeom.singleBarW,
+                    lineSpacing = lineSpacing
+                )
+                sysMeasureGeoms += MeasureSpanGeom(
+                    barIndex = bar,
+                    barLeftX = bLeft,
+                    barRightX = bRight,
+                    noteOriginX = barNoteOriginX,
+                    usableWidth = usableW
+                )
+
+                val barKeyEv = if (bar >= 1) melody.keySignatureEventAtBar(bar) else null
+                if (barKeyEv != null && bOffset > 0) {
+                    val isModSelected = melody.selectedAnnotation == SelectedScoreAnnotation.KeyChange(barKeyEv.id)
+                    val modColor = if (isModSelected) palette.selectedColor else palette.inkColor
+                    val modBarPaint = Paint(barLinePaint).apply {
+                        if (isModSelected) color = palette.selectedColor
+                    }
+                    val thinPreX = bLeft - lineSpacing * 0.34f
+                    canvas.drawLine(thinPreX, trebleTopY, thinPreX, sysBottomY, modBarPaint)
+                    canvas.drawLine(bLeft, trebleTopY, bLeft, sysBottomY, modBarPaint)
+
+                    val prevKey = melody.keySignatureAtBar(bar - 1)
+                    val cancelT = prevKey.cancelledStaffStepsTo(barKeyEv.keySignature, isBass = false)
+                    val kStart = bLeft + lineSpacing * 0.38f
+                    val groupEndX = drawKeySignatureGroup(
+                        canvas = canvas,
+                        leftX = kStart,
+                        staffTopY = trebleTopY,
+                        isBass = false,
+                        s = lineSpacing,
+                        cancelledSteps = cancelT,
+                        newKey = barKeyEv.keySignature,
+                        color = modColor
+                    )
+                    if (grandStaff) {
+                        val cancelB = prevKey.cancelledStaffStepsTo(barKeyEv.keySignature, isBass = true)
+                        drawKeySignatureGroup(
+                            canvas = canvas,
+                            leftX = kStart,
+                            staffTopY = bassTopY,
+                            isBass = true,
+                            s = lineSpacing,
+                            cancelledSteps = cancelB,
+                            newKey = barKeyEv.keySignature,
+                            color = modColor
+                        )
+                    }
+
+                    drawInteractiveModulationPill(
+                        canvas = canvas,
+                        barNumber = bar + 1,
+                        keyEvent = barKeyEv,
+                        isSelected = isModSelected,
+                        pillAnchorX = bLeft - lineSpacing * 0.15f,
+                        trebleTopY = trebleTopY,
+                        sysBottomY = sysBottomY,
+                        minHitLeftX = thinPreX - lineSpacing * 0.35f,
+                        minHitRightX = groupEndX + lineSpacing * 0.3f,
+                        lineSpacing = lineSpacing,
+                        selectedColor = palette.selectedColor,
+                        startTick = bar * ticksPerBar,
+                        outHitTargets = hitTargets
+                    )
+                } else if (barKeyEv != null && bOffset == 0) {
+                    // Key change occurring right at the opening bar of a new system
+                    val isModSelected = melody.selectedAnnotation == SelectedScoreAnnotation.KeyChange(barKeyEv.id)
+                    drawInteractiveModulationPill(
+                        canvas = canvas,
+                        barNumber = bar + 1,
+                        keyEvent = barKeyEv,
+                        isSelected = isModSelected,
+                        pillAnchorX = bLeft,
+                        trebleTopY = trebleTopY,
+                        sysBottomY = sysBottomY,
+                        minHitLeftX = bLeft - lineSpacing * 0.2f,
+                        minHitRightX = bLeft + lineSpacing * 2.2f,
+                        lineSpacing = lineSpacing,
+                        selectedColor = palette.selectedColor,
+                        startTick = bar * ticksPerBar,
+                        outHitTargets = hitTargets
+                    )
+                } else {
+                    // Draw measure number on every measure so proofreading wrong bars is effortless!
+                    canvas.drawText(
+                        "${bar + 1}",
+                        bLeft + lineSpacing * 0.36f,
+                        trebleTopY - lineSpacing * 1.15f,
+                        barNumPaint
+                    )
+                }
+
+                for (b in 1 until beatCount) {
+                    val bx = barNoteOriginX + (b.toFloat() / beatCount.toFloat()) * usableW
+                    canvas.drawLine(bx, trebleTopY, bx, trebleTopY + staffH, subGridPaint)
+                    if (grandStaff) {
+                        canvas.drawLine(bx, bassTopY, bx, bassTopY + staffH, subGridPaint)
+                    }
+                }
+
+                val barSyms = symbols.filter { it.barIndex == bar }
+                renderSingleMeasureSymbols(
+                    canvas = canvas,
+                    barSyms = barSyms,
+                    timeSignature = timeSig,
+                    activeKeySignature = melody.keySignatureAtBar(bar),
+                    atNewSystemStart = (bOffset == 0),
+                    noteOriginX = barNoteOriginX,
+                    usableMeasureWidth = usableW,
+                    trebleTopY = trebleTopY,
+                    bassTopY = bassTopY,
+                    lineSpacing = lineSpacing,
+                    grandStaff = grandStaff,
+                    selectedNoteId = melody.selectedNoteId,
+                    paperBgColor = palette.paperBgColor,
+                    slot0Color = palette.slot0Color,
+                    slot1Color = palette.slot1Color,
+                    selectedColor = palette.selectedColor,
+                    autoRestColor = palette.autoRestColor,
+                    outHitTargets = hitTargets,
+                    outChordAnchors = sysChordAnchors,
+                    outTupletObstacles = sysTupletObstacles,
+                    outPendingFermatas = sysPendingFermatas
+                )
+
+                val nextInSysHasKeyChange = (bOffset + 1 < hGeom.barsInSys) &&
+                    (melody.keySignatureEventAtBar(bar + 1) != null)
+                if (bar == layout.totalBars - 1) {
+                    val thinX = bRight - lineSpacing * 0.36f
+                    canvas.drawLine(thinX, trebleTopY, thinX, sysBottomY, barLinePaint)
+                    val thickPaint = Paint(barLinePaint).apply {
+                        strokeWidth = max(2.5f, lineSpacing * 0.32f)
+                    }
+                    canvas.drawLine(bRight, trebleTopY, bRight, sysBottomY, thickPaint)
+                } else if (bar == hGeom.endBar && hGeom.nextSysKeyEv != null) {
+                    val thinPreX = bRight - lineSpacing * 0.34f
+                    canvas.drawLine(thinPreX, trebleTopY, thinPreX, sysBottomY, barLinePaint)
+                    canvas.drawLine(bRight, trebleTopY, bRight, sysBottomY, barLinePaint)
+                    val cStartX = bRight + lineSpacing * 0.36f
+                    drawKeySignatureGroup(
+                        canvas = canvas,
+                        leftX = cStartX,
+                        staffTopY = trebleTopY,
+                        isBass = false,
+                        s = lineSpacing,
+                        cancelledSteps = hGeom.courtesyCancelTreble,
+                        newKey = hGeom.nextSysKeyEv.keySignature,
+                        color = palette.inkColor
+                    )
+                    if (grandStaff) {
+                        val courtesyCancelBass = melody.keySignatureAtBar(hGeom.endBar).cancelledStaffStepsTo(
+                            hGeom.nextSysKeyEv.keySignature,
+                            isBass = true
+                        )
+                        drawKeySignatureGroup(
+                            canvas = canvas,
+                            leftX = cStartX,
+                            staffTopY = bassTopY,
+                            isBass = true,
+                            s = lineSpacing,
+                            cancelledSteps = courtesyCancelBass,
+                            newKey = hGeom.nextSysKeyEv.keySignature,
+                            color = palette.inkColor
+                        )
+                    }
+                } else if (!nextInSysHasKeyChange) {
+                    canvas.drawLine(bRight, trebleTopY, bRight, sysBottomY, barLinePaint)
+                }
+            }
+
+            val sysStartTick = hGeom.startBar * ticksPerBar
+            val sysEndTick = (hGeom.endBar + 1) * ticksPerBar
+            val sysLeftContX = marginX + hGeom.clefZoneW + lineSpacing * 0.30f
+            val sysRightContX = marginX + hGeom.clefZoneW + hGeom.singleBarW * hGeom.barsInSys - lineSpacing * 0.28f
+
+            renderSystemPhraseSlurs(
+                canvas = canvas,
+                allScoreNotes = melody.notes,
+                chordAnchors = sysChordAnchors,
+                tupletObstacles = sysTupletObstacles,
+                pendingFermatas = sysPendingFermatas,
+                measureGeoms = sysMeasureGeoms,
+                isContinuousTimeline = false,
+                ticksPerBar = ticksPerBar,
+                trebleTopY = trebleTopY,
+                bassTopY = bassTopY,
+                lineSpacing = lineSpacing,
+                defaultColor = palette.expressionInkColor,
+                selectedColor = palette.selectedColor,
+                selectedNoteId = melody.selectedNoteId
+            )
+
+            renderPendingFermatas(
+                canvas = canvas,
+                pendingFermatas = sysPendingFermatas,
+                lineSpacing = lineSpacing
+            )
+
+            val sysTickToX: (Int) -> Float = { tick ->
+                val clamped = tick.coerceIn(sysStartTick, sysEndTick)
+                if (clamped >= sysEndTick) {
+                    sysRightContX
+                } else {
+                    val bOff = ((clamped / ticksPerBar) - hGeom.startBar).coerceIn(0, sysMeasureGeoms.lastIndex)
+                    val rem = clamped % ticksPerBar
+                    val mg = sysMeasureGeoms[bOff]
+                    mg.noteOriginX + (rem.toFloat() / ticksPerBar.toFloat()) * mg.usableWidth
+                }
+            }
+
+            renderSystemDynamicsAndHairpins(
+                canvas = canvas,
+                dynamicMarks = melody.dynamicMarks,
+                hairpins = melody.hairpins,
+                sysStartTick = sysStartTick,
+                sysEndTick = sysEndTick,
+                isContinuousTimeline = false,
+                sysLeftContinuationX = sysLeftContX,
+                sysRightContinuationX = sysRightContX,
+                tickToX = sysTickToX,
+                chordAnchors = sysChordAnchors,
+                bottomStaffBottomY = sysBottomY,
+                viewportMaxBottomY = sysBottomY + lineSpacing * 3.4f,
+                lineSpacing = lineSpacing,
+                inkColor = palette.expressionInkColor,
+                selectedColor = palette.selectedColor,
+                selectedAnnotation = melody.selectedAnnotation,
+                outHitTargets = hitTargets
+            )
+
+            renderSystemTempoEvents(
+                canvas = canvas,
+                tempoEvents = melody.tempoEvents,
+                sysStartTick = sysStartTick,
+                sysEndTick = sysEndTick,
+                isContinuousTimeline = false,
+                sysLeftContinuationX = sysLeftContX,
+                sysRightContinuationX = sysRightContX,
+                tickToX = sysTickToX,
+                trebleTopY = trebleTopY,
+                chordAnchors = sysChordAnchors,
+                pendingFermatas = sysPendingFermatas,
+                viewportMinTopY = trebleTopY - lineSpacing * 3.2f,
+                lineSpacing = lineSpacing,
+                inkColor = palette.expressionInkColor,
+                selectedColor = palette.selectedColor,
+                selectedAnnotation = melody.selectedAnnotation,
+                outHitTargets = hitTargets
+            )
+
+            // Draw Step Input Cursor on whichever row holds `cursorTick`
+            if (!melody.isRecording && cursorBarIdx in hGeom.startBar..hGeom.endBar) {
+                val bOff = (cursorBarIdx - hGeom.startBar).coerceIn(0, sysMeasureGeoms.lastIndex)
+                val mg = sysMeasureGeoms[bOff]
+                val tickInBar = melody.cursorTick.coerceAtLeast(0) % ticksPerBar
+                val cx = mg.noteOriginX + (tickInBar.toFloat() / ticksPerBar.toFloat()) * mg.usableWidth
+                val cursorColorActual = when {
+                    melody.activeSlurGroupId != null -> Color.rgb(26, 122, 94)
+                    melody.activeTuplet != null -> palette.selectedColor
+                    else -> palette.cursorColor
+                }
+                val cursorPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = cursorColorActual
+                    strokeWidth = max(1.8f, lineSpacing * 0.17f)
+                    style = Paint.Style.STROKE
+                    pathEffect = DashPathEffect(floatArrayOf(lineSpacing * 0.65f, lineSpacing * 0.45f), 0f)
+                }
+                canvas.drawLine(
+                    cx,
+                    trebleTopY - lineSpacing * 1.05f,
+                    cx,
+                    sysBottomY + lineSpacing * 1.05f,
+                    cursorPaint
+                )
+                val triPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = cursorColorActual
+                    style = Paint.Style.FILL
+                }
+                val tri = Path().apply {
+                    val topY = trebleTopY - lineSpacing * 1.32f
+                    val sz = lineSpacing * 0.48f
+                    moveTo(cx - sz, topY)
+                    lineTo(cx + sz, topY)
+                    lineTo(cx, topY + sz * 1.15f)
+                    close()
+                }
+                canvas.drawPath(tri, triPaint)
+            }
+
+            // Draw Live Transport Playhead on whichever row holds `playheadBeat`
+            if ((melody.isPlaying || melody.isRecording) && playBarIdx in hGeom.startBar..hGeom.endBar) {
+                val bOff = (playBarIdx - hGeom.startBar).coerceIn(0, sysMeasureGeoms.lastIndex)
+                val mg = sysMeasureGeoms[bOff]
+                val pRemTick = (playTotalTickFloat - playBarIdx * ticksPerBar).coerceIn(0f, ticksPerBar.toFloat())
+                val px = mg.noteOriginX + (pRemTick / ticksPerBar.toFloat()) * mg.usableWidth
+                val phPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = palette.playheadColor
+                    strokeWidth = max(2.3f, lineSpacing * 0.22f)
+                }
+                canvas.drawLine(
+                    px,
+                    trebleTopY - lineSpacing * 1.18f,
+                    px,
+                    sysBottomY + lineSpacing * 1.18f,
+                    phPaint
+                )
+                val headDotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = palette.playheadColor
+                    style = Paint.Style.FILL
+                }
+                canvas.drawCircle(px, trebleTopY - lineSpacing * 1.22f, lineSpacing * 0.34f, headDotPaint)
+            }
+        }
+
+        // Empty Score Watermark
+        if (melody.notes.isEmpty() &&
+            melody.dynamicMarks.isEmpty() &&
+            melody.hairpins.isEmpty() &&
+            melody.tempoEvents.isEmpty() &&
+            !melody.isRecording
+        ) {
+            val hintPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.argb(148, 112, 102, 90)
+                textSize = max(18f, lineSpacing * 1.20f)
+                textAlign = Paint.Align.CENTER
+            }
+            val hintY = min(
+                viewportHeight - max(10f, lineSpacing * 0.75f),
+                layout.totalContentHeight - scrollY - lineSpacing * 0.4f
+            ).coerceAtLeast(lineSpacing * 2.5f)
+            canvas.drawText(
+                "点击任意小节定位试听/打谱 · 上下滑动浏览整页乐谱 · 点右上角「全屏看谱」放大检阅",
+                viewportWidth * 0.5f,
+                hintY,
+                hintPaint
+            )
+        }
+
+        // Subtle right-edge scrollbar indicator when multi-system page exceeds viewport height
+        if (layout.totalContentHeight > viewportHeight + 4f) {
+            val maxScroll = (layout.totalContentHeight - viewportHeight).coerceAtLeast(1f)
+            val trackTop = lineSpacing * 0.8f
+            val trackBottom = viewportHeight - lineSpacing * 0.8f
+            val trackH = (trackBottom - trackTop).coerceAtLeast(24f)
+            val thumbH = ((viewportHeight / layout.totalContentHeight) * trackH).coerceIn(lineSpacing * 2.6f, trackH)
+            val frac = (scrollY / maxScroll).coerceIn(0f, 1f)
+            val thumbTop = trackTop + frac * (trackH - thumbH)
+            val barW = max(3.5f, lineSpacing * 0.38f)
+            val barLeft = viewportWidth - barW - max(3f, lineSpacing * 0.32f)
+
+            val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.argb(36, 120, 110, 98)
+                style = Paint.Style.FILL
+            }
+            val thumbPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.argb(135, 118, 106, 92)
+                style = Paint.Style.FILL
+            }
+            canvas.drawRoundRect(RectF(barLeft, trackTop, barLeft + barW, trackBottom), barW * 0.5f, barW * 0.5f, trackPaint)
+            canvas.drawRoundRect(RectF(barLeft, thumbTop, barLeft + barW, thumbTop + thumbH), barW * 0.5f, barW * 0.5f, thumbPaint)
+        }
+
+        return hitTargets
+    }
+
+    private fun drawInteractiveModulationPill(
+        canvas: Canvas,
+        barNumber: Int,
+        keyEvent: ScoreKeySignatureEvent,
+        isSelected: Boolean,
+        pillAnchorX: Float,
+        trebleTopY: Float,
+        sysBottomY: Float,
+        minHitLeftX: Float,
+        minHitRightX: Float,
+        lineSpacing: Float,
+        selectedColor: Int,
+        startTick: Int,
+        outHitTargets: MutableList<StaffHitTarget>
+    ) {
+        val badgeText = "$barNumber · ${keyEvent.keySignature.modulationBadgeText}"
+        val badgeTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = if (isSelected) Color.WHITE else Color.rgb(68, 42, 128)
+            textSize = max(13f, lineSpacing * 0.96f)
+            typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+        }
+        val textW = badgeTextPaint.measureText(badgeText)
+        val pillH = max(17f, lineSpacing * 1.38f)
+        val pillW = textW + lineSpacing * 0.90f
+        val pillTop = trebleTopY - pillH - lineSpacing * 0.68f
+        val pillRect = RectF(pillAnchorX, pillTop, pillAnchorX + pillW, pillTop + pillH)
+
+        val pillBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = if (isSelected) selectedColor else Color.argb(232, 238, 232, 252)
+            style = Paint.Style.FILL
+        }
+        canvas.drawRoundRect(pillRect, pillH * 0.38f, pillH * 0.38f, pillBgPaint)
+        val pillStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = if (isSelected) selectedColor else Color.argb(140, 124, 77, 204)
+            style = Paint.Style.STROKE
+            strokeWidth = max(1f, lineSpacing * 0.10f)
+        }
+        canvas.drawRoundRect(pillRect, pillH * 0.38f, pillH * 0.38f, pillStrokePaint)
+        val fm = badgeTextPaint.fontMetrics
+        val textBaseline = pillRect.centerY() - (fm.ascent + fm.descent) * 0.5f
+        canvas.drawText(badgeText, pillRect.left + lineSpacing * 0.44f, textBaseline, badgeTextPaint)
+
+        outHitTargets += StaffHitTarget(
+            annotation = SelectedScoreAnnotation.KeyChange(keyEvent.id),
+            bounds = RectF(
+                min(minHitLeftX, pillRect.left),
+                pillRect.top - lineSpacing * 0.2f,
+                max(minHitRightX, pillRect.right) + lineSpacing * 0.25f,
+                sysBottomY + lineSpacing * 0.3f
+            ),
+            startTick = startTick
+        )
+    }
+
+    private fun resolvePageSystemIndexAtWorldY(worldY: Float, layout: PageStaffLayout): Int {
+        val rowOrigin = layout.topPadding - (layout.systemRowStride - layout.systemBlockHeight) * 0.48f
+        return floor((worldY - rowOrigin) / layout.systemRowStride.coerceAtLeast(1f))
+            .toInt()
+            .coerceIn(0, (layout.totalSystems - 1).coerceAtLeast(0))
+    }
+
+    fun resolvePageHeaderHit(
+        touchX: Float,
+        touchY: Float,
+        scrollY: Float,
+        layout: PageStaffLayout,
+        melody: MelodyStudioUiState
+    ): PageHeaderHitKind? {
+        val worldY = touchY + scrollY
+        val sysIdx = resolvePageSystemIndexAtWorldY(worldY, layout)
+        val hGeom = computePageSystemHorizontalGeom(sysIdx, layout, melody)
+        val headerRight = layout.marginLeftX + hGeom.clefZoneW
+        if (touchX < layout.marginLeftX - layout.lineSpacing || touchX > headerRight) return null
+        val trebleTopWorldY = layout.systemTrebleTopWorldY(sysIdx)
+        val sysBottomWorldY = trebleTopWorldY + layout.systemBlockHeight
+        if (worldY < trebleTopWorldY - layout.lineSpacing * 1.8f ||
+            worldY > sysBottomWorldY + layout.lineSpacing * 1.8f
+        ) {
+            return null
+        }
+        if (hGeom.isFirstSystem) {
+            val timeSigLeft = headerRight - layout.lineSpacing * 1.95f
+            if (touchX >= timeSigLeft) {
+                return PageHeaderHitKind.TIME_SIGNATURE
+            }
+        }
+        return PageHeaderHitKind.KEY_SIGNATURE
+    }
+
+    fun mapPageTouchToTick(
+        touchX: Float,
+        touchY: Float,
+        scrollY: Float,
+        layout: PageStaffLayout,
+        melody: MelodyStudioUiState
+    ): Int {
+        val timeSig = melody.timeSignature
+        val ticksPerBar = timeSig.ticksPerBar
+        val stepsPerBar = timeSig.stepsPerBar
+        val worldY = (touchY + scrollY).coerceAtLeast(0f)
+        val sysIdx = resolvePageSystemIndexAtWorldY(worldY, layout)
+        val hGeom = computePageSystemHorizontalGeom(sysIdx, layout, melody)
+        val measuresOriginX = layout.marginLeftX + hGeom.clefZoneW
+        val relX = (touchX - measuresOriginX).coerceAtLeast(0f)
+        val bOffset = floor(relX / hGeom.singleBarW.coerceAtLeast(1f))
+            .toInt()
+            .coerceIn(0, (hGeom.barsInSys - 1).coerceAtLeast(0))
+        val barIdx = hGeom.startBar + bOffset
+        val bLeft = measuresOriginX + bOffset * hGeom.singleBarW
+        val (noteOriginX, usableW) = pageMeasureNoteLayout(
+            melody = melody,
+            barIndex = barIdx,
+            bOffsetInSystem = bOffset,
+            barLeftX = bLeft,
+            singleBarW = hGeom.singleBarW,
+            lineSpacing = layout.lineSpacing
+        )
+        val frac = ((touchX - noteOriginX) / usableW.coerceAtLeast(1f)).coerceIn(0f, 0.999f)
+        val stepInBar = floor(frac * stepsPerBar).toInt().coerceIn(0, (stepsPerBar - 1).coerceAtLeast(0))
+        val rawTick = barIdx * ticksPerBar + stepInBar * TICKS_PER_STEP
+        val maxTick = (layout.totalBars.coerceAtLeast(1) * ticksPerBar - TICKS_PER_STEP).coerceAtLeast(0)
+        return rawTick.coerceIn(0, maxTick)
+    }
+
+    // ========================================================================
     // 2. Multi-Page Vector A4 PDF Sheet Music Exporter
     // ========================================================================
 

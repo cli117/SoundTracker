@@ -13,11 +13,12 @@ import androidx.core.content.FileProvider
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.FileOutputStream
 import java.util.UUID
 
 /**
  * Versioned JSON serialization/deserialization, multi-project local storage (`filesDir/melody_projects`),
- * silent auto-save draft protection, and `.stscore.json` export/share/import for Melody Studio (`乐器打谱`).
+ * crash-safe atomic real-time auto-save protection, and `.stscore.json` export/share/import for Melody Studio (`乐器打谱`).
  */
 object MelodyProjectRepository {
 
@@ -28,10 +29,19 @@ object MelodyProjectRepository {
     private const val SHARE_STAGING_SUBDIR = "wechat_share_staging"
     const val AUTOSAVE_PROJECT_ID = "__autosave_draft__"
 
+    private val ioLock = Any()
+
     data class LoadedMelodyProject(
         val projectId: String?,
         val savedAtMs: Long,
         val state: MelodyStudioUiState
+    )
+
+    data class AutoPersistOutcome(
+        val projectId: String?,
+        val savedAtMs: Long,
+        val savedProjects: List<MelodyProjectSummary>,
+        val autoDraftSummary: MelodyProjectSummary?
     )
 
     private fun projectsDir(context: Context): File =
@@ -44,6 +54,41 @@ object MelodyProjectRepository {
 
     private fun autoSaveFile(context: Context): File =
         File(projectsDir(context), AUTOSAVE_FILE_NAME)
+
+    /**
+     * Crash-safe atomic write: writes UTF-8 JSON to `<target>.tmp`, flushes kernel buffers (`fd.sync()`),
+     * then atomically renames over [target] so killing the app mid-write never corrupts or truncates data.
+     */
+    private fun writeTextAtomic(target: File, content: String) {
+        synchronized(ioLock) {
+            val dir = target.parentFile?.apply { mkdirs() } ?: return
+            val tmp = File(dir, "${target.name}.tmp")
+            FileOutputStream(tmp).use { fos ->
+                fos.write(content.toByteArray(Charsets.UTF_8))
+                fos.flush()
+                runCatching { fos.fd.sync() }
+            }
+            if (!tmp.renameTo(target)) {
+                tmp.copyTo(target, overwrite = true)
+                tmp.delete()
+            }
+        }
+    }
+
+    private fun readTextAtomicSafe(target: File): String? {
+        synchronized(ioLock) {
+            if (target.exists() && target.length() > 0L) {
+                runCatching { target.readText(Charsets.UTF_8) }.getOrNull()?.let { text ->
+                    if (text.isNotBlank()) return text
+                }
+            }
+            val tmp = File(target.parentFile ?: return null, "${target.name}.tmp")
+            if (tmp.exists() && tmp.length() > 0L) {
+                return runCatching { tmp.readText(Charsets.UTF_8) }.getOrNull()
+            }
+            return null
+        }
+    }
 
     fun sanitizeDisplayTitle(rawTitle: String?): String {
         val t = rawTitle?.trim().orEmpty()
@@ -103,6 +148,18 @@ object MelodyProjectRepository {
     }
 
     /**
+     * Extended session fingerprint including cursor position and score view mode (`整页谱`/`单行谱`),
+     * so auto-save remembers even where on the page the user was reading/playing before app exit.
+     */
+    fun computeSessionPersistenceFingerprint(state: MelodyStudioUiState): Int {
+        var h = computeContentFingerprint(state)
+        h = 31 * h + state.cursorTick
+        h = 31 * h + state.scoreViewMode.ordinal
+        h = 31 * h + (state.currentProjectId?.hashCode() ?: 0)
+        return h
+    }
+
+    /**
      * Serializes the complete [MelodyStudioUiState] into a versioned, human-readable JSON string (`schemaVersion = 1`).
      */
     fun serializeToJson(
@@ -118,6 +175,7 @@ object MelodyProjectRepository {
         }
         root.put("savedAtMs", savedAtMs)
         root.put("scoreTitle", sanitizeDisplayTitle(state.scoreTitle))
+        root.put("scoreViewMode", state.scoreViewMode.name)
 
         // Time signature
         root.put("timeSignature", JSONObject().apply {
@@ -470,8 +528,14 @@ object MelodyProjectRepository {
             val cursorTick = root.optInt("cursorTick", 0).coerceIn(0, maxTick)
             val tupletAnchorTick = root.optInt("tupletAnchorTick", 0).coerceIn(0, maxTick)
 
+            val scoreViewMode = safeEnumValueOf(
+                root.optString("scoreViewMode"),
+                ScoreViewMode.PAGE_SCROLL
+            )
+
             val restoredState = MelodyStudioUiState(
                 scoreTitle = title,
+                scoreViewMode = scoreViewMode,
                 instrument = instrument,
                 secondaryInstrument = secondaryInstrument,
                 dualKeyboardEnabled = dualKeyboardEnabled,
@@ -511,8 +575,8 @@ object MelodyProjectRepository {
     }
 
     private fun parseSummaryFromFile(file: File, fallbackId: String): MelodyProjectSummary? {
-        if (!file.exists() || file.length() <= 0L) return null
-        val loaded = runCatching { deserializeFromJson(file.readText()) }.getOrNull() ?: return null
+        val rawText = readTextAtomicSafe(file) ?: return null
+        val loaded = runCatching { deserializeFromJson(rawText) }.getOrNull() ?: return null
         val st = loaded.state
         val keyLabel = if (st.keySignatureEvents.isEmpty()) {
             st.initialKeySignature.shortPillLabel
@@ -532,15 +596,17 @@ object MelodyProjectRepository {
     }
 
     fun listProjects(context: Context): List<MelodyProjectSummary> {
-        val dir = projectsDir(context)
-        val files = dir.listFiles { f ->
-            f.isFile && f.name.startsWith("proj_") && f.name.endsWith(PROJECT_FILE_EXT)
-        } ?: return emptyList()
+        synchronized(ioLock) {
+            val dir = projectsDir(context)
+            val files = dir.listFiles { f ->
+                f.isFile && f.name.startsWith("proj_") && f.name.endsWith(PROJECT_FILE_EXT)
+            } ?: return emptyList()
 
-        return files.mapNotNull { file ->
-            val fallbackId = file.name.removePrefix("proj_").removeSuffix(PROJECT_FILE_EXT)
-            parseSummaryFromFile(file, fallbackId)
-        }.sortedByDescending { it.updatedAtMs }
+            return files.mapNotNull { file ->
+                val fallbackId = file.name.removePrefix("proj_").removeSuffix(PROJECT_FILE_EXT)
+                parseSummaryFromFile(file, fallbackId)
+            }.sortedByDescending { it.updatedAtMs }
+        }
     }
 
     fun saveProject(
@@ -550,67 +616,109 @@ object MelodyProjectRepository {
         customTitle: String? = null
     ): MelodyProjectSummary? {
         return runCatching {
-            val id = existingProjectId?.takeIf { it.isNotBlank() && it != AUTOSAVE_PROJECT_ID }
-                ?: UUID.randomUUID().toString()
-            val cleanTitle = sanitizeDisplayTitle(customTitle ?: state.scoreTitle)
-            val now = System.currentTimeMillis()
-            val updatedState = state.copy(scoreTitle = cleanTitle, currentProjectId = id)
-            val json = serializeToJson(updatedState, projectId = id, savedAtMs = now)
-            val outFile = projectFileForId(context, id)
-            outFile.writeText(json)
-            parseSummaryFromFile(outFile, id)
+            synchronized(ioLock) {
+                val id = existingProjectId?.takeIf { it.isNotBlank() && it != AUTOSAVE_PROJECT_ID }
+                    ?: UUID.randomUUID().toString()
+                val cleanTitle = sanitizeDisplayTitle(customTitle ?: state.scoreTitle)
+                val now = System.currentTimeMillis()
+                val updatedState = state.copy(scoreTitle = cleanTitle, currentProjectId = id)
+                val json = serializeToJson(updatedState, projectId = id, savedAtMs = now)
+                val outFile = projectFileForId(context, id)
+                writeTextAtomic(outFile, json)
+                parseSummaryFromFile(outFile, id)
+            }
         }.getOrNull()
     }
 
     fun loadProject(context: Context, projectId: String): LoadedMelodyProject? {
         val file = projectFileForId(context, projectId)
-        if (!file.exists()) return null
+        val rawText = readTextAtomicSafe(file) ?: return null
         return runCatching {
-            deserializeFromJson(file.readText())?.copy(projectId = projectId)
+            deserializeFromJson(rawText)?.copy(projectId = projectId)
         }.getOrNull()
     }
 
     fun renameProject(context: Context, projectId: String, newTitle: String): Boolean {
-        val file = projectFileForId(context, projectId)
-        if (!file.exists()) return false
-        val loaded = loadProject(context, projectId) ?: return false
-        val cleanTitle = sanitizeDisplayTitle(newTitle)
-        val json = serializeToJson(
-            loaded.state.copy(scoreTitle = cleanTitle),
-            projectId = projectId,
-            savedAtMs = System.currentTimeMillis()
-        )
-        return runCatching {
-            file.writeText(json)
-            true
-        }.getOrDefault(false)
+        return synchronized(ioLock) {
+            val file = projectFileForId(context, projectId)
+            val loaded = loadProject(context, projectId) ?: return@synchronized false
+            val cleanTitle = sanitizeDisplayTitle(newTitle)
+            val json = serializeToJson(
+                loaded.state.copy(scoreTitle = cleanTitle),
+                projectId = projectId,
+                savedAtMs = System.currentTimeMillis()
+            )
+            runCatching {
+                writeTextAtomic(file, json)
+                true
+            }.getOrDefault(false)
+        }
     }
 
     fun deleteProject(context: Context, projectId: String): Boolean {
-        val file = projectFileForId(context, projectId)
-        return if (file.exists()) file.delete() else false
+        return synchronized(ioLock) {
+            val file = projectFileForId(context, projectId)
+            val tmp = File(file.parentFile ?: projectsDir(context), "${file.name}.tmp")
+            if (tmp.exists()) tmp.delete()
+            if (file.exists()) file.delete() else false
+        }
     }
 
     fun writeAutoSaveDraft(context: Context, state: MelodyStudioUiState) {
         runCatching {
-            val file = autoSaveFile(context)
-            if (!hasMeaningfulContent(state) && state.currentProjectId == null) {
-                if (file.exists()) file.delete()
-                return
+            synchronized(ioLock) {
+                val file = autoSaveFile(context)
+                if (!hasMeaningfulContent(state) && state.currentProjectId == null) {
+                    if (file.exists()) file.delete()
+                    return@synchronized
+                }
+                val json = serializeToJson(
+                    state = state,
+                    projectId = state.currentProjectId ?: AUTOSAVE_PROJECT_ID,
+                    savedAtMs = System.currentTimeMillis()
+                )
+                writeTextAtomic(file, json)
             }
-            val json = serializeToJson(
-                state = state,
-                projectId = state.currentProjectId ?: AUTOSAVE_PROJECT_ID,
-                savedAtMs = System.currentTimeMillis()
+        }
+    }
+
+    /**
+     * Zero-manual-save real-time persistence:
+     * - Automatically promotes any meaningful score to a durable `proj_<id>.stscore.json` file
+     *   AND updates `autosave_latest.stscore.json` atomically (`tmp` + `fsync` + `rename`).
+     * - If the workspace is completely blank and unlinked (`currentProjectId == null`), clears stale auto-draft
+     *   so reopening after intentional "New Blank Score" opens blank cleanly while keeping all saved projects intact.
+     */
+    fun autoPersistActiveSession(context: Context, state: MelodyStudioUiState): AutoPersistOutcome {
+        return synchronized(ioLock) {
+            val now = System.currentTimeMillis()
+            val meaningful = hasMeaningfulContent(state)
+            val activeId = state.currentProjectId?.takeIf { it.isNotBlank() && it != AUTOSAVE_PROJECT_ID }
+                ?: if (meaningful) UUID.randomUUID().toString() else null
+
+            val autoFile = autoSaveFile(context)
+            if (activeId != null) {
+                val stateWithId = state.copy(currentProjectId = activeId)
+                val json = serializeToJson(stateWithId, projectId = activeId, savedAtMs = now)
+                writeTextAtomic(projectFileForId(context, activeId), json)
+                writeTextAtomic(autoFile, json)
+            } else {
+                if (autoFile.exists()) autoFile.delete()
+            }
+
+            AutoPersistOutcome(
+                projectId = activeId,
+                savedAtMs = if (activeId != null) now else 0L,
+                savedProjects = listProjects(context),
+                autoDraftSummary = readAutoSaveSummary(context)
             )
-            file.writeText(json)
         }
     }
 
     fun readAutoSaveDraft(context: Context): LoadedMelodyProject? {
         val file = autoSaveFile(context)
-        if (!file.exists() || file.length() <= 0L) return null
-        return runCatching { deserializeFromJson(file.readText()) }.getOrNull()
+        val rawText = readTextAtomicSafe(file) ?: return null
+        return runCatching { deserializeFromJson(rawText) }.getOrNull()
     }
 
     fun readAutoSaveSummary(context: Context): MelodyProjectSummary? {

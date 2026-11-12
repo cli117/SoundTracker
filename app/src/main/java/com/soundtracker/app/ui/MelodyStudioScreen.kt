@@ -1,16 +1,20 @@
 package com.soundtracker.app.ui
 
+import androidx.compose.animation.core.animate
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
+import androidx.compose.foundation.gestures.rememberScrollableState
+import androidx.compose.foundation.gestures.scrollable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -56,8 +60,11 @@ import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.SaveAlt
 import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material.icons.rounded.Shield
+import androidx.compose.material.icons.rounded.SkipPrevious
 import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material.icons.rounded.Tune
+import androidx.compose.material.icons.rounded.UnfoldLess
+import androidx.compose.material.icons.rounded.UnfoldMore
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -131,6 +138,7 @@ import com.soundtracker.app.melody.NoteArticulation
 import com.soundtracker.app.melody.NoteDurationPreset
 import com.soundtracker.app.melody.PianoTouchGuardConfig
 import com.soundtracker.app.melody.ScoreTempoEvent
+import com.soundtracker.app.melody.ScoreViewMode
 import com.soundtracker.app.melody.SelectedScoreAnnotation
 import com.soundtracker.app.melody.StaffHitTarget
 import com.soundtracker.app.melody.StaffScoreEngraver
@@ -215,7 +223,10 @@ fun MelodyStudioScreen(
     onToggleMetronome: () -> Unit,
     onToggleLoop: () -> Unit,
     onTogglePlayStop: () -> Unit,
+    onPlayFromStart: () -> Unit,
     onToggleRecordStop: () -> Unit,
+    onScoreViewModeChange: (ScoreViewMode) -> Unit,
+    onToggleMinimizeKeyboardForScore: () -> Unit,
     onTapCursorTick: (Int) -> Unit,
     onSelectNote: (String?) -> Unit,
     onSelectAnnotation: (SelectedScoreAnnotation?) -> Unit,
@@ -425,25 +436,19 @@ fun MelodyStudioScreen(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(if (compactHeaderLabels) 4.dp else 5.dp)
                     ) {
-                        // Score Drafts & Local Multi-Project Save / Load (`草稿/工程`)
+                        // Score Drafts & Local Multi-Project Auto-Save / Load (`草稿/工程`)
                         val projShape = RoundedCornerShape(9.dp)
-                        val hasLinkedOrDirty = melody.currentProjectId != null || melody.isProjectDirty
+                        val isAutoSavedProject = melody.currentProjectId != null
                         Surface(
                             shape = projShape,
-                            color = if (melody.isProjectDirty) {
-                                WarmUmber.copy(alpha = 0.14f)
-                            } else if (hasLinkedOrDirty) {
+                            color = if (isAutoSavedProject) {
                                 EmeraldLossless.copy(alpha = 0.13f)
                             } else {
                                 StudioSurfaceElevated
                             },
                             border = BorderStroke(
                                 1.dp,
-                                when {
-                                    melody.isProjectDirty -> WarmUmber.copy(alpha = 0.55f)
-                                    hasLinkedOrDirty -> EmeraldLossless.copy(alpha = 0.48f)
-                                    else -> StudioBorder
-                                }
+                                if (isAutoSavedProject) EmeraldLossless.copy(alpha = 0.48f) else StudioBorder
                             ),
                             modifier = Modifier
                                 .height(31.dp)
@@ -455,30 +460,22 @@ fun MelodyStudioScreen(
                                 modifier = Modifier.padding(horizontal = if (compactHeaderLabels) 6.dp else 8.dp)
                             ) {
                                 Icon(
-                                    imageVector = Icons.Rounded.FolderOpen,
+                                    imageVector = if (isAutoSavedProject) Icons.Rounded.Check else Icons.Rounded.FolderOpen,
                                     contentDescription = null,
-                                    tint = when {
-                                        melody.isProjectDirty -> WarmUmber
-                                        hasLinkedOrDirty -> EmeraldLossless
-                                        else -> CyanPrimary
-                                    },
+                                    tint = if (isAutoSavedProject) EmeraldLossless else CyanPrimary,
                                     modifier = Modifier.size(13.dp)
                                 )
                                 Spacer(modifier = Modifier.width(3.dp))
                                 Text(
                                     text = when {
-                                        compactHeaderLabels && melody.isProjectDirty -> "草稿*"
+                                        compactHeaderLabels && isAutoSavedProject -> "已存·草稿"
                                         compactHeaderLabels -> "草稿"
-                                        melody.isProjectDirty -> "草稿/工程*"
+                                        isAutoSavedProject -> "已自动存·工程"
                                         else -> "草稿/工程"
                                     },
                                     fontSize = 11.sp,
                                     fontWeight = FontWeight.SemiBold,
-                                    color = when {
-                                        melody.isProjectDirty -> WarmUmber
-                                        hasLinkedOrDirty -> EmeraldLossless
-                                        else -> TextPrimary
-                                    },
+                                    color = if (isAutoSavedProject) EmeraldLossless else TextPrimary,
                                     maxLines = 1
                                 )
                             }
@@ -581,7 +578,9 @@ fun MelodyStudioScreen(
 
             // ================================================================
             // 2. Instrument & Global Groove (`拍号` + `调号` + `BPM` + `Swing`) / FX / Sustain Bar
+            //    Automatically collapses in Full-Screen Score mode (`全屏看谱`) for maximum sheet space!
             // ================================================================
+            if (!melody.keyboardMinimizedForScore) {
             Surface(
                 color = StudioSurface.copy(alpha = 0.92f),
                 modifier = Modifier.fillMaxWidth()
@@ -823,12 +822,13 @@ fun MelodyStudioScreen(
             }
 
             HorizontalDivider(color = StudioBorder)
+            }
 
             // ================================================================
-            // 3. Eye-Level Real 5-Line Staff (`五线谱`) + Custom Score Title Bar
+            // 3. Eye-Level Real 5-Line Staff (`五线谱` · 支持整页上下滚动与单行切换) + Score Title Bar
             //    Placed ABOVE the Composing/Undo Dock so fingers never block the score!
             // ================================================================
-            if (scoreCollapsed) {
+            if (scoreCollapsed && !melody.keyboardMinimizedForScore) {
                 Surface(
                     color = StudioSurfaceElevated.copy(alpha = 0.65f),
                     modifier = Modifier
@@ -878,6 +878,9 @@ fun MelodyStudioScreen(
                 ) {
                     StaffTitleBanner(
                         scoreTitle = melody.scoreTitle,
+                        scoreViewMode = melody.scoreViewMode,
+                        keyboardMinimizedForScore = melody.keyboardMinimizedForScore,
+                        autoSavedActive = melody.currentProjectId != null,
                         activeKeySignature = activeKeyAtCursor,
                         timeSignature = melody.timeSignature,
                         bpm = melody.bpm,
@@ -885,6 +888,9 @@ fun MelodyStudioScreen(
                         barNum = melody.barNumberAtTick(),
                         beatNum = melody.beatNumberAtTick(),
                         isGrandStaff = StaffScoreEngraver.needsGrandStaff(melody.notes),
+                        compact = availWidth < 520.dp,
+                        onScoreViewModeChange = onScoreViewModeChange,
+                        onToggleFullScreenScore = onToggleMinimizeKeyboardForScore,
                         onEditTitleClick = { showEditTitleDialog = true },
                         onExportPdfClick = { showExportPdfDialog = true }
                     )
@@ -932,6 +938,7 @@ fun MelodyStudioScreen(
                                 melody = melody,
                                 compactModeLabels = false,
                                 onTogglePlayStop = onTogglePlayStop,
+                                onPlayFromStart = onPlayFromStart,
                                 onSelectInputMode = onSelectInputMode,
                                 onToggleRecordStop = onToggleRecordStop
                             )
@@ -996,6 +1003,7 @@ fun MelodyStudioScreen(
                                 melody = melody,
                                 compactModeLabels = availWidth < 410.dp,
                                 onTogglePlayStop = onTogglePlayStop,
+                                onPlayFromStart = onPlayFromStart,
                                 onSelectInputMode = onSelectInputMode,
                                 onToggleRecordStop = onToggleRecordStop
                             )
@@ -1050,8 +1058,64 @@ fun MelodyStudioScreen(
 
             // ================================================================
             // 5. Resizable & Layout-Persisted Primary & Secondary Keyboards
+            //    (Or slim Expand-Keyboard bar when Full-Screen Score mode is active!)
             // ================================================================
-            if (!melody.dualKeyboardEnabled) {
+            if (melody.keyboardMinimizedForScore) {
+                Surface(
+                    color = StudioSurfaceElevated,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(34.dp)
+                        .clickable(onClick = onToggleMinimizeKeyboardForScore)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.Piano,
+                                contentDescription = null,
+                                tint = CyanPrimary,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Text(
+                                text = "全屏看谱中（点谱面任意位置即可试听/定位/选错音）",
+                                fontSize = 11.5.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = TextSecondary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(2.dp)
+                        ) {
+                            Text(
+                                text = "展开琴键弹奏",
+                                fontSize = 11.5.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = CyanPrimary,
+                                maxLines = 1
+                            )
+                            Icon(
+                                imageVector = Icons.Rounded.ExpandLess,
+                                contentDescription = null,
+                                tint = CyanPrimary,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                    }
+                }
+            } else if (!melody.dualKeyboardEnabled) {
                 IndependentKeyboardDeck(
                     deckTitle = null,
                     accentColor = CyanPrimary,
@@ -3480,6 +3544,9 @@ private fun MusicalRestGlyphIcon(
 @Composable
 private fun StaffTitleBanner(
     scoreTitle: String,
+    scoreViewMode: ScoreViewMode,
+    keyboardMinimizedForScore: Boolean,
+    autoSavedActive: Boolean,
     activeKeySignature: KeySignature,
     timeSignature: TimeSignature,
     bpm: Int,
@@ -3487,6 +3554,9 @@ private fun StaffTitleBanner(
     barNum: Int,
     beatNum: Int,
     isGrandStaff: Boolean,
+    compact: Boolean,
+    onScoreViewModeChange: (ScoreViewMode) -> Unit,
+    onToggleFullScreenScore: () -> Unit,
     onEditTitleClick: () -> Unit,
     onExportPdfClick: () -> Unit
 ) {
@@ -3495,12 +3565,12 @@ private fun StaffTitleBanner(
         color = Color(0xFFFAF7F0),
         modifier = Modifier
             .fillMaxWidth()
-            .height(29.dp)
+            .height(31.dp)
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 10.dp),
+                .padding(horizontal = if (compact) 6.dp else 10.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
@@ -3516,7 +3586,7 @@ private fun StaffTitleBanner(
                     text = "《${scoreTitle.ifBlank { "未命名乐谱" }}》",
                     fontFamily = FontFamily.Serif,
                     fontWeight = FontWeight.Bold,
-                    fontSize = 13.sp,
+                    fontSize = if (compact) 12.sp else 13.sp,
                     color = TextPrimary,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
@@ -3526,11 +3596,25 @@ private fun StaffTitleBanner(
                     imageVector = Icons.Rounded.DriveFileRenameOutline,
                     contentDescription = "编辑标题",
                     tint = CyanPrimary,
-                    modifier = Modifier.size(14.dp)
+                    modifier = Modifier.size(13.dp)
                 )
-                Spacer(modifier = Modifier.width(8.dp))
+                if (autoSavedActive && !compact) {
+                    Spacer(modifier = Modifier.width(5.dp))
+                    Text(
+                        text = "✓自动保存",
+                        fontSize = 9.5.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = EmeraldLossless,
+                        maxLines = 1
+                    )
+                }
+                Spacer(modifier = Modifier.width(6.dp))
                 Text(
-                    text = "${if (isGrandStaff) "大谱表" else "高音谱表"} · ${activeKeySignature.shortPillLabel} · ${timeSignature.label}拍 · ♩=$bpm$swingTag · 第${barNum}小节第${beatNum}拍",
+                    text = if (compact) {
+                        "${activeKeySignature.shortPillLabel} · 第${barNum}小节"
+                    } else {
+                        "${if (isGrandStaff) "大谱表" else "高音谱表"} · ${activeKeySignature.shortPillLabel} · ${timeSignature.label}拍 · ♩=$bpm$swingTag · 第${barNum}小节第${beatNum}拍"
+                    },
                     fontSize = 10.5.sp,
                     color = if (swingPreset.isEnabled) WarmUmber else TextMuted,
                     maxLines = 1,
@@ -3538,17 +3622,111 @@ private fun StaffTitleBanner(
                 )
             }
 
-            Text(
-                text = "导出五线谱PDF ▸",
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Bold,
-                color = VioletAccent,
-                maxLines = 1,
-                modifier = Modifier
-                    .clip(RoundedCornerShape(6.dp))
-                    .clickable(onClick = onExportPdfClick)
-                    .padding(horizontal = 6.dp, vertical = 3.dp)
-            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(if (compact) 4.dp else 6.dp)
+            ) {
+                // Segmented Toggle: `整页谱` (Multi-row scrollable sheet) vs `单行谱` (Horizontal strip)
+                Surface(
+                    shape = RoundedCornerShape(7.dp),
+                    color = Color(0xFFEDE7DC),
+                    border = BorderStroke(0.8.dp, StudioBorder.copy(alpha = 0.7f)),
+                    modifier = Modifier.height(23.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        ScoreViewMode.entries.forEach { mode ->
+                            val selected = mode == scoreViewMode
+                            val segShape = RoundedCornerShape(6.dp)
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier
+                                    .fillMaxHeight()
+                                    .clip(segShape)
+                                    .background(if (selected) CyanPrimary else Color.Transparent)
+                                    .clickable { onScoreViewModeChange(mode) }
+                                    .padding(horizontal = if (compact) 6.dp else 8.dp)
+                            ) {
+                                Text(
+                                    text = if (compact) {
+                                        when (mode) {
+                                            ScoreViewMode.PAGE_SCROLL -> "整页"
+                                            ScoreViewMode.SINGLE_STRIP -> "单行"
+                                        }
+                                    } else {
+                                        mode.label
+                                    },
+                                    fontSize = 10.sp,
+                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                                    color = if (selected) OnAccentLight else TextSecondary,
+                                    maxLines = 1
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // Quick Full-Screen Score Toggle (`全屏看谱` / `展开琴键`)
+                val fsShape = RoundedCornerShape(7.dp)
+                Surface(
+                    shape = fsShape,
+                    color = if (keyboardMinimizedForScore) {
+                        CyanPrimary.copy(alpha = 0.16f)
+                    } else {
+                        Color(0xFFEDE7DC)
+                    },
+                    border = BorderStroke(
+                        0.8.dp,
+                        if (keyboardMinimizedForScore) CyanPrimary else StudioBorder.copy(alpha = 0.7f)
+                    ),
+                    modifier = Modifier
+                        .height(23.dp)
+                        .clip(fsShape)
+                        .clickable(onClick = onToggleFullScreenScore)
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(horizontal = if (compact) 5.dp else 7.dp)
+                    ) {
+                        Icon(
+                            imageVector = if (keyboardMinimizedForScore) {
+                                Icons.Rounded.UnfoldLess
+                            } else {
+                                Icons.Rounded.UnfoldMore
+                            },
+                            contentDescription = null,
+                            tint = if (keyboardMinimizedForScore) CyanPrimary else TextPrimary,
+                            modifier = Modifier.size(12.dp)
+                        )
+                        Spacer(modifier = Modifier.width(2.dp))
+                        Text(
+                            text = when {
+                                keyboardMinimizedForScore && compact -> "琴键"
+                                keyboardMinimizedForScore -> "展开琴键"
+                                compact -> "全谱"
+                                else -> "全屏看谱"
+                            },
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = if (keyboardMinimizedForScore) CyanPrimary else TextPrimary,
+                            maxLines = 1
+                        )
+                    }
+                }
+
+                if (!compact) {
+                    Text(
+                        text = "PDF ▸",
+                        fontSize = 10.5.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = VioletAccent,
+                        maxLines = 1,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .clickable(onClick = onExportPdfClick)
+                            .padding(horizontal = 5.dp, vertical = 2.dp)
+                    )
+                }
+            }
         }
     }
 }
@@ -3573,6 +3751,7 @@ private fun InteractiveStaffScoreCanvas(
 
     var canvasSize by remember { mutableStateOf(IntSize.Zero) }
     var scrollX by remember { mutableFloatStateOf(0f) }
+    var scrollY by remember { mutableFloatStateOf(0f) }
     var lastHitTargets by remember { mutableStateOf<List<StaffHitTarget>>(emptyList()) }
 
     val maxKeyBar = (melody.keySignatureEvents.maxOfOrNull { it.safeBarIndex + 1 } ?: 1)
@@ -3600,14 +3779,55 @@ private fun InteractiveStaffScoreCanvas(
         lineSpacingEstimate = estLineSpacing
     )
 
-    // Auto-follow live playhead or step cursor smoothly across measures
+    val pageLayout = remember(
+        canvasSize.width,
+        density.density,
+        melody.timeSignature,
+        melody.totalBars,
+        melody.notes,
+        melody.dynamicMarks,
+        melody.hairpins,
+        melody.tempoEvents,
+        melody.keySignatureEvents
+    ) {
+        StaffScoreEngraver.computePageStaffLayout(
+            viewportWidth = canvasSize.width.toFloat().coerceAtLeast(180f),
+            densityScale = density.density,
+            melody = melody
+        )
+    }
+    val maxPageScrollY = if (canvasSize.height > 0) {
+        (pageLayout.totalContentHeight - canvasSize.height).coerceAtLeast(0f)
+    } else {
+        0f
+    }
+    if (scrollY > maxPageScrollY) {
+        scrollY = maxPageScrollY
+    }
+    val latestMaxPageScrollY by rememberUpdatedState(maxPageScrollY)
+    val pageVerticalScrollState = rememberScrollableState { delta ->
+        val oldY = scrollY
+        val newY = (oldY - delta).coerceIn(0f, latestMaxPageScrollY)
+        scrollY = newY
+        -(newY - oldY)
+    }
+
+    // Auto-follow in Single-Strip mode (`单行谱`)
     val focusBeat = if (melody.isPlaying || melody.isRecording) {
         melody.playheadBeat
     } else {
         melody.cursorTick.toFloat() / TICKS_PER_BEAT.toFloat()
     }
-    LaunchedEffect(focusBeat, canvasSize.width, totalBars, barWidthPx, quarterBeatsPerBar, effectiveClefHeaderWidthPx) {
-        if (canvasSize.width <= 0) return@LaunchedEffect
+    LaunchedEffect(
+        melody.scoreViewMode,
+        focusBeat,
+        canvasSize.width,
+        totalBars,
+        barWidthPx,
+        quarterBeatsPerBar,
+        effectiveClefHeaderWidthPx
+    ) {
+        if (melody.scoreViewMode != ScoreViewMode.SINGLE_STRIP || canvasSize.width <= 0) return@LaunchedEffect
         val viewportW = (canvasSize.width - effectiveClefHeaderWidthPx).coerceAtLeast(80f)
         val focusX = (focusBeat / quarterBeatsPerBar) * barWidthPx
         val totalContentW = totalBars * barWidthPx + barWidthPx * 0.25f
@@ -3619,8 +3839,43 @@ private fun InteractiveStaffScoreCanvas(
         }
     }
 
+    // Smart System-Row Auto-Follow in Page-Scroll mode (`整页谱`)
+    val activeFocusTick = if (melody.isPlaying || melody.isRecording) {
+        (melody.playheadBeat * TICKS_PER_BEAT.toFloat()).roundToInt().coerceAtLeast(0)
+    } else {
+        melody.cursorTick.coerceAtLeast(0)
+    }
+    val activeFocusBar = activeFocusTick / melody.ticksPerBar.coerceAtLeast(1)
+    val activeSystemIdx = pageLayout.systemForBar(activeFocusBar)
+    val pageFollowTrigger = if (melody.isPlaying || melody.isRecording) {
+        activeSystemIdx
+    } else {
+        melody.cursorTick
+    }
+    LaunchedEffect(melody.scoreViewMode, pageFollowTrigger, melody.isPlaying, canvasSize.height) {
+        if (melody.scoreViewMode != ScoreViewMode.PAGE_SCROLL || canvasSize.height <= 0) return@LaunchedEffect
+        val sysTop = pageLayout.systemTrebleTopWorldY(activeSystemIdx) - pageLayout.lineSpacing * 2.6f
+        val sysBottom = pageLayout.systemTrebleTopWorldY(activeSystemIdx) +
+            pageLayout.systemBlockHeight + pageLayout.lineSpacing * 2.8f
+        val viewH = canvasSize.height.toFloat()
+        val maxScroll = (pageLayout.totalContentHeight - viewH).coerceAtLeast(0f)
+        val targetScrollY = when {
+            sysTop < scrollY -> sysTop.coerceIn(0f, maxScroll)
+            sysBottom > scrollY + viewH -> (sysBottom - viewH * 0.72f).coerceIn(0f, maxScroll)
+            else -> null
+        }
+        if (targetScrollY != null && abs(targetScrollY - scrollY) > 2f) {
+            val startY = scrollY
+            animate(initialValue = startY, targetValue = targetScrollY) { value, _ ->
+                scrollY = value.coerceIn(0f, maxScroll)
+            }
+        }
+    }
+
     val latestMelody by rememberUpdatedState(melody)
     val latestScrollX by rememberUpdatedState(scrollX)
+    val latestScrollY by rememberUpdatedState(scrollY)
+    val latestPageLayout by rememberUpdatedState(pageLayout)
     val latestTotalBars by rememberUpdatedState(totalBars)
     val latestBarWidthPx by rememberUpdatedState(barWidthPx)
     val latestHeaderWidthPx by rememberUpdatedState(effectiveClefHeaderWidthPx)
@@ -3644,32 +3899,44 @@ private fun InteractiveStaffScoreCanvas(
         )
     }
 
+    val isPageMode = melody.scoreViewMode == ScoreViewMode.PAGE_SCROLL
+
     Canvas(
         modifier = modifier
             .background(Color(0xFFFAF7F0))
             .clipToBounds()
             .onSizeChanged { canvasSize = it }
-            .pointerInput(Unit) {
-                detectDragGestures { change, dragAmount ->
-                    change.consume()
-                    val viewportW = (size.width - latestHeaderWidthPx).coerceAtLeast(1f)
-                    val bw = latestBarWidthPx
-                    val maxX = (latestTotalBars * bw + bw * 0.25f - viewportW).coerceAtLeast(0f)
-                    scrollX = (scrollX - dragAmount.x).coerceIn(0f, maxX)
+            .scrollable(
+                state = pageVerticalScrollState,
+                orientation = Orientation.Vertical,
+                enabled = isPageMode
+            )
+            .pointerInput(isPageMode) {
+                if (!isPageMode) {
+                    detectDragGestures { change, dragAmount ->
+                        change.consume()
+                        val viewportW = (size.width - latestHeaderWidthPx).coerceAtLeast(1f)
+                        val bw = latestBarWidthPx
+                        val maxX = (latestTotalBars * bw + bw * 0.25f - viewportW).coerceAtLeast(0f)
+                        scrollX = (scrollX - dragAmount.x).coerceIn(0f, maxX)
+                    }
                 }
             }
-            .pointerInput(Unit) {
+            .pointerInput(isPageMode) {
                 detectTapGestures { pos ->
-                    val curHeaderW = latestHeaderWidthPx
-                    if (pos.x < curHeaderW) {
-                        val timeSigZoneLeft = curHeaderW - latestLineSpacingPx * 1.90f
-                        if (pos.x >= timeSigZoneLeft) {
-                            latestOnTapTimeSig()
-                        } else {
-                            latestOnTapKeySig()
+                    if (!isPageMode) {
+                        val curHeaderW = latestHeaderWidthPx
+                        if (pos.x < curHeaderW) {
+                            val timeSigZoneLeft = curHeaderW - latestLineSpacingPx * 1.90f
+                            if (pos.x >= timeSigZoneLeft) {
+                                latestOnTapTimeSig()
+                            } else {
+                                latestOnTapKeySig()
+                            }
+                            return@detectTapGestures
                         }
-                        return@detectTapGestures
                     }
+
                     val hit = lastHitTargets.firstOrNull { t ->
                         t.bounds.contains(pos.x, pos.y)
                     }
@@ -3684,42 +3951,89 @@ private fun InteractiveStaffScoreCanvas(
                                     latestOnTapCursorTick(hit.startTick)
                                 }
                             } else {
-                                latestOnSelectAnnotation(if (alreadySelected) null else hit.annotation)
+                                if (alreadySelected && latestMelody.isPlaying && !latestMelody.isRecording) {
+                                    latestOnTapCursorTick(hit.startTick)
+                                } else {
+                                    latestOnSelectAnnotation(if (alreadySelected) null else hit.annotation)
+                                }
                             }
                         } else if (hit.noteId != null) {
-                            latestOnSelectNote(
-                                if (latestMelody.selectedNoteId == hit.noteId) null else hit.noteId
-                            )
+                            val alreadySelected = latestMelody.selectedNoteId == hit.noteId
+                            if (alreadySelected && latestMelody.isPlaying && !latestMelody.isRecording) {
+                                // Tapping an already-selected note during playback still jumps audio right there!
+                                latestOnTapCursorTick(hit.startTick)
+                            } else {
+                                latestOnSelectNote(if (alreadySelected) null else hit.noteId)
+                            }
                         }
                         return@detectTapGestures
                     }
 
-                    latestOnSelectNote(null)
-                    latestOnSelectAnnotation(null)
-                    val tick = StaffScoreEngraver.mapTouchXToTick(
-                        touchX = pos.x,
-                        scrollX = latestScrollX,
-                        clefHeaderWidth = curHeaderW,
-                        barWidth = latestBarWidthPx,
-                        lineSpacingEstimate = latestLineSpacingPx,
-                        totalBars = latestTotalBars,
-                        melody = latestMelody
-                    )
-                    latestOnTapCursorTick(tick)
+                    if (isPageMode) {
+                        val headerHit = StaffScoreEngraver.resolvePageHeaderHit(
+                            touchX = pos.x,
+                            touchY = pos.y,
+                            scrollY = latestScrollY,
+                            layout = latestPageLayout,
+                            melody = latestMelody
+                        )
+                        if (headerHit != null) {
+                            when (headerHit) {
+                                StaffScoreEngraver.PageHeaderHitKind.TIME_SIGNATURE -> latestOnTapTimeSig()
+                                StaffScoreEngraver.PageHeaderHitKind.KEY_SIGNATURE -> latestOnTapKeySig()
+                            }
+                            return@detectTapGestures
+                        }
+
+                        latestOnSelectNote(null)
+                        latestOnSelectAnnotation(null)
+                        val tick = StaffScoreEngraver.mapPageTouchToTick(
+                            touchX = pos.x,
+                            touchY = pos.y,
+                            scrollY = latestScrollY,
+                            layout = latestPageLayout,
+                            melody = latestMelody
+                        )
+                        latestOnTapCursorTick(tick)
+                    } else {
+                        latestOnSelectNote(null)
+                        latestOnSelectAnnotation(null)
+                        val tick = StaffScoreEngraver.mapTouchXToTick(
+                            touchX = pos.x,
+                            scrollX = latestScrollX,
+                            clefHeaderWidth = latestHeaderWidthPx,
+                            barWidth = latestBarWidthPx,
+                            lineSpacingEstimate = latestLineSpacingPx,
+                            totalBars = latestTotalBars,
+                            melody = latestMelody
+                        )
+                        latestOnTapCursorTick(tick)
+                    }
                 }
             }
     ) {
-        val targets = StaffScoreEngraver.drawInteractiveTimelineStaff(
-            canvas = drawContext.canvas.nativeCanvas,
-            viewportWidth = size.width,
-            viewportHeight = size.height,
-            scrollX = scrollX,
-            clefHeaderWidth = effectiveClefHeaderWidthPx,
-            barWidth = barWidthPx,
-            melody = melody,
-            palette = palette
-        )
-        lastHitTargets = targets
+        lastHitTargets = if (isPageMode) {
+            StaffScoreEngraver.drawInteractivePageStaff(
+                canvas = drawContext.canvas.nativeCanvas,
+                viewportWidth = size.width,
+                viewportHeight = size.height,
+                scrollY = scrollY,
+                layout = pageLayout,
+                melody = melody,
+                palette = palette
+            )
+        } else {
+            StaffScoreEngraver.drawInteractiveTimelineStaff(
+                canvas = drawContext.canvas.nativeCanvas,
+                viewportWidth = size.width,
+                viewportHeight = size.height,
+                scrollX = scrollX,
+                clefHeaderWidth = effectiveClefHeaderWidthPx,
+                barWidth = barWidthPx,
+                melody = melody,
+                palette = palette
+            )
+        }
     }
 }
 
@@ -4984,6 +5298,7 @@ private fun TransportAndModeLeftCluster(
     melody: MelodyStudioUiState,
     compactModeLabels: Boolean = false,
     onTogglePlayStop: () -> Unit,
+    onPlayFromStart: () -> Unit,
     onSelectInputMode: (MelodyInputMode) -> Unit,
     onToggleRecordStop: () -> Unit
 ) {
@@ -4993,6 +5308,16 @@ private fun TransportAndModeLeftCluster(
     ) {
         val playShape = RoundedCornerShape(8.dp)
         val playing = melody.isPlaying && !melody.isRecording
+        val maxEndTick = melody.notes.filterNot { it.isRest }.maxOfOrNull { it.resolvedEndTick } ?: 0
+        val effEndTick = if (melody.hasPlayableNotes) maxEndTick else melody.totalTicks
+        val willStartMidScore = !playing && (melody.cursorTick in 1 until effEndTick)
+        val startBar = melody.barNumberAtTick(melody.cursorTick)
+        val playLabel = when {
+            playing -> "停止"
+            willStartMidScore && compactModeLabels -> "试听·${startBar}"
+            willStartMidScore -> "试听(第${startBar}小节)"
+            else -> "试听"
+        }
         Surface(
             shape = playShape,
             color = if (playing) WarmUmber else VioletAccent,
@@ -5013,12 +5338,47 @@ private fun TransportAndModeLeftCluster(
                 )
                 Spacer(modifier = Modifier.width(3.dp))
                 Text(
-                    text = if (playing) "停止" else "试听",
+                    text = playLabel,
                     fontSize = 11.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = OnAccentLight,
                     maxLines = 1
                 )
+            }
+        }
+
+        if ((melody.cursorTick > 0 || playing) && !melody.isRecording) {
+            val restartShape = RoundedCornerShape(8.dp)
+            Surface(
+                shape = restartShape,
+                color = StudioSurfaceElevated,
+                border = BorderStroke(1.dp, VioletAccent.copy(alpha = 0.52f)),
+                modifier = Modifier
+                    .height(28.dp)
+                    .clip(restartShape)
+                    .clickable(onClick = onPlayFromStart)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.padding(horizontal = if (compactModeLabels) 6.dp else 7.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.SkipPrevious,
+                        contentDescription = "从头试听",
+                        tint = VioletAccent,
+                        modifier = Modifier.size(14.dp)
+                    )
+                    if (!compactModeLabels) {
+                        Spacer(modifier = Modifier.width(2.dp))
+                        Text(
+                            text = "从头",
+                            fontSize = 10.5.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = VioletAccent,
+                            maxLines = 1
+                        )
+                    }
+                }
             }
         }
 
@@ -7161,6 +7521,8 @@ private fun MelodyProjectManagerDialog(
     }
 
     val requestSwitchWithDirtyGuard: (PendingScoreSwitchAction) -> Unit = { action ->
+        // Every score change is now flushed synchronously before switching in StudioViewModel,
+        // so only prompt if an unexpected unsaved dirty state ever exists.
         if (melody.isProjectDirty) {
             pendingSwitch = action
         } else {
@@ -7178,32 +7540,21 @@ private fun MelodyProjectManagerDialog(
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 Text(
-                    text = "乐谱草稿与工程管理",
+                    text = "乐谱自动存档与工程管理",
                     fontWeight = FontWeight.Bold,
                     fontSize = 16.sp,
                     color = TextPrimary
                 )
                 Surface(
                     shape = RoundedCornerShape(6.dp),
-                    color = if (melody.isProjectDirty) {
-                        WarmUmber.copy(alpha = 0.14f)
-                    } else {
-                        EmeraldLossless.copy(alpha = 0.13f)
-                    },
-                    border = BorderStroke(
-                        1.dp,
-                        if (melody.isProjectDirty) WarmUmber.copy(alpha = 0.5f) else EmeraldLossless.copy(alpha = 0.45f)
-                    )
+                    color = EmeraldLossless.copy(alpha = 0.13f),
+                    border = BorderStroke(1.dp, EmeraldLossless.copy(alpha = 0.45f))
                 ) {
                     Text(
-                        text = when {
-                            melody.isProjectDirty -> "有未保存修改 · 自动保护中"
-                            melody.currentProjectId != null -> "已保存同步"
-                            else -> "实时自动草稿保护"
-                        },
+                        text = "✓ 实时自动保存已开启",
                         fontSize = 10.sp,
                         fontWeight = FontWeight.Bold,
-                        color = if (melody.isProjectDirty) WarmUmber else EmeraldLossless,
+                        color = EmeraldLossless,
                         modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp)
                     )
                 }
@@ -7216,7 +7567,7 @@ private fun MelodyProjectManagerDialog(
                     .verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                // 1. Current Score Save / Save-As / New Blank Card
+                // 1. Current Score Auto-Save Info + Save-As / New Blank Card
                 Surface(
                     shape = RoundedCornerShape(10.dp),
                     color = StudioSurfaceElevated,
@@ -7227,6 +7578,15 @@ private fun MelodyProjectManagerDialog(
                         modifier = Modifier.padding(10.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
+                        Text(
+                            text = if (melody.lastAutoSavedAtMs > 0L) {
+                                "每次修改均实时原子落盘，切后台或强杀应用也不会丢数据（最近同步：${formatProjectTimestamp(melody.lastAutoSavedAtMs)}）"
+                            } else {
+                                "每次弹入或修改音符均自动保存到本地，切后台或强杀应用重启后自动恢复继续打谱"
+                            },
+                            fontSize = 10.5.sp,
+                            color = EmeraldLossless
+                        )
                         OutlinedTextField(
                             value = titleInput,
                             onValueChange = { raw ->
@@ -7235,7 +7595,7 @@ private fun MelodyProjectManagerDialog(
                                 onUpdateTitle(sanitized)
                             },
                             singleLine = true,
-                            label = { Text("当前乐谱名称") },
+                            label = { Text("当前乐谱名称（修改即自动同步）") },
                             placeholder = { Text("例如：晴天 · 前奏打谱草稿") },
                             modifier = Modifier.fillMaxWidth()
                         )
@@ -7257,17 +7617,17 @@ private fun MelodyProjectManagerDialog(
                                         .weight(1f)
                                         .height(36.dp)
                                 ) {
-                                    Text("保存覆盖", fontSize = 12.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+                                    Text("立即同步保存", fontSize = 12.sp, fontWeight = FontWeight.Bold, maxLines = 1)
                                 }
                                 OutlinedButton(
-                                    onClick = { onSaveProject(false, cleanTitle) },
+                                    onClick = { onSaveProject(false, "${cleanTitle}_副本") },
                                     shape = RoundedCornerShape(8.dp),
                                     contentPadding = PaddingValues(horizontal = 8.dp),
                                     modifier = Modifier
                                         .weight(1f)
                                         .height(36.dp)
                                 ) {
-                                    Text("另存为新谱", fontSize = 11.5.sp, color = TextPrimary, maxLines = 1)
+                                    Text("另存新副本", fontSize = 11.5.sp, color = TextPrimary, maxLines = 1)
                                 }
                             } else {
                                 Button(
@@ -7288,7 +7648,7 @@ private fun MelodyProjectManagerDialog(
                                         modifier = Modifier.size(15.dp)
                                     )
                                     Spacer(modifier = Modifier.width(4.dp))
-                                    Text("保存到本地草稿箱", fontSize = 12.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+                                    Text("立即创建存档", fontSize = 12.sp, fontWeight = FontWeight.Bold, maxLines = 1)
                                 }
                             }
 
@@ -7446,7 +7806,7 @@ private fun MelodyProjectManagerDialog(
 
                 if (melody.savedProjects.isEmpty()) {
                     Text(
-                        text = "暂无手动存档的乐谱。写到一半点上方「保存到本地草稿箱」，下次可随时读取继续打谱。",
+                        text = "暂无已存乐谱。在下方弹入音符后会自动生成存档并实时落盘保存，无需手动点击保存。",
                         fontSize = 11.5.sp,
                         color = TextMuted
                     )

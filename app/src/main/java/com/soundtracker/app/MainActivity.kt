@@ -326,7 +326,10 @@ class MainActivity : ComponentActivity() {
                             onToggleMetronome = viewModel::toggleMelodyMetronome,
                             onToggleLoop = viewModel::toggleMelodyLoop,
                             onTogglePlayStop = viewModel::toggleMelodyPlayStop,
+                            onPlayFromStart = viewModel::playMelodyFromStart,
                             onToggleRecordStop = viewModel::toggleMelodyRecordStop,
+                            onScoreViewModeChange = viewModel::setMelodyScoreViewMode,
+                            onToggleMinimizeKeyboardForScore = viewModel::toggleMinimizeKeyboardForScore,
                             onTapCursorTick = viewModel::setMelodyCursorTick,
                             onSelectNote = viewModel::selectMelodyNote,
                             onSelectAnnotation = viewModel::selectMelodyAnnotation,
@@ -439,6 +442,11 @@ class MainActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         viewModel.onAppForegrounded()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        viewModel.onAppPaused()
     }
 
     override fun onStop() {

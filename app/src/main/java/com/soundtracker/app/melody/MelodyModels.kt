@@ -590,8 +590,15 @@ data class MelodySnapshot(
     val tempoEvents: List<ScoreTempoEvent> = emptyList()
 )
 
+enum class ScoreViewMode(val label: String) {
+    PAGE_SCROLL("整页谱"),
+    SINGLE_STRIP("单行谱")
+}
+
 data class MelodyStudioUiState(
     val scoreTitle: String = "未命名乐谱",
+    val scoreViewMode: ScoreViewMode = ScoreViewMode.PAGE_SCROLL,
+    val keyboardMinimizedForScore: Boolean = false,
     val instrument: StudioInstrument = StudioInstrument.GRAND_PIANO,
     val secondaryInstrument: StudioInstrument = StudioInstrument.GRAND_PIANO,
     val dualKeyboardEnabled: Boolean = false,
@@ -630,6 +637,7 @@ data class MelodyStudioUiState(
     val selectedAnnotation: SelectedScoreAnnotation? = null,
     val currentProjectId: String? = null,
     val isProjectDirty: Boolean = false,
+    val lastAutoSavedAtMs: Long = 0L,
     val savedProjects: List<MelodyProjectSummary> = emptyList(),
     val autoSaveDraftSummary: MelodyProjectSummary? = null,
     val isPlaying: Boolean = false,

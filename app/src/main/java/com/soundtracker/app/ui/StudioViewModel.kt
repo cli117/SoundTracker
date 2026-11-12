@@ -58,6 +58,7 @@ import com.soundtracker.app.melody.ScoreHairpin
 import com.soundtracker.app.melody.ScoreKeySignatureEvent
 import com.soundtracker.app.melody.ScoreTempoEvent
 import com.soundtracker.app.melody.ScoreTempoMap
+import com.soundtracker.app.melody.ScoreViewMode
 import com.soundtracker.app.melody.SelectedScoreAnnotation
 import com.soundtracker.app.melody.StaffScoreEngraver
 import com.soundtracker.app.melody.StudioInstrument
@@ -95,6 +96,7 @@ import java.time.format.DateTimeFormatter
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlin.math.roundToLong
@@ -271,14 +273,46 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     @Volatile
     private var latestMelodyTempoMap: ScoreTempoMap? = null
 
+    @Volatile
+    private var latestCompiledTotalFrames: Long = 0L
+
     private fun currentMelodyTempoMap(mel: MelodyStudioUiState = _uiState.value.melody): ScoreTempoMap {
         return latestMelodyTempoMap ?: ScoreExpressionCompiler.buildTempoMap(mel, MELODY_SAMPLE_RATE)
     }
 
-    private val melodyPlayer = MelodyRealtimePlayer(
+    private fun tickToSeekFrame(tempoMap: ScoreTempoMap, tick: Int): Long {
+        if (tick <= 0) return 0L
+        return (tempoMap.tickToFrame(tick.toDouble()) - 4L).coerceAtLeast(0L)
+    }
+
+    private fun stopAuditionAtScoreEnd() {
+        melodyPlayer.setTransportPlaying(false, 0L)
+        _uiState.update { st ->
+            st.copy(
+                melody = st.melody.copy(
+                    isPlaying = false,
+                    playheadBeat = st.melody.cursorTick.toFloat() / TICKS_PER_BEAT.toFloat()
+                )
+            )
+        }
+    }
+
+    private val melodyPlayer: MelodyRealtimePlayer = MelodyRealtimePlayer(
         sampleRate = MELODY_SAMPLE_RATE,
         onTransportState = { curFrame, playing ->
             val curMel = _uiState.value.melody
+            // Cleanly auto-stop audition (`试听`) at score end even when metronome is ON (while keeping live-record endless)
+            if (playing &&
+                !curMel.isRecording &&
+                !curMel.loopPlayback &&
+                curMel.hasPlayableNotes &&
+                latestCompiledTotalFrames > 0L &&
+                curFrame >= latestCompiledTotalFrames
+            ) {
+                stopAuditionAtScoreEnd()
+                return@MelodyRealtimePlayer
+            }
+
             val tempoMap = currentMelodyTempoMap(curMel)
             val curTick = tempoMap.frameToTick(curFrame)
             val beat = (curTick / TICKS_PER_BEAT.toDouble()).toFloat().coerceAtLeast(0f)
@@ -286,9 +320,14 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 finalizeAllActiveRecordedNotes(endBeatOverride = curMel.totalQuarterBeats)
             }
             _uiState.update { st ->
+                val resolvedBeat = if (!playing && !st.melody.isRecording) {
+                    st.melody.cursorTick.toFloat() / TICKS_PER_BEAT.toFloat()
+                } else {
+                    beat
+                }
                 st.copy(
                     melody = st.melody.copy(
-                        playheadBeat = beat,
+                        playheadBeat = resolvedBeat,
                         isPlaying = playing,
                         isRecording = if (!playing) false else st.melody.isRecording
                     )
@@ -325,53 +364,69 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     private var updateCheckJob: Job? = null
     private var updateDownloadJob: Job? = null
 
+    private val autoSaveExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "st-melody-autosave").apply { isDaemon = false }
+    }
+
+    @Volatile
     private var lastSavedMelodyFingerprint: Int =
         MelodyProjectRepository.computeContentFingerprint(MelodyStudioUiState())
-    private var lastObservedMelodyFingerprint: Int = lastSavedMelodyFingerprint
+
+    @Volatile
+    private var lastPersistedSessionFingerprint: Int =
+        MelodyProjectRepository.computeSessionPersistenceFingerprint(MelodyStudioUiState())
+
+    @Volatile
+    private var lastObservedMelodyFingerprint: Int = lastPersistedSessionFingerprint
+
+    @Volatile
+    private var hasPendingAutoSaveFlush: Boolean = false
+
     private var autoSaveDebounceJob: Job? = null
 
     init {
-        // Restore saved Melody Studio projects, touch-guard config & latest auto-save draft on cold start
+        // Restore saved Melody Studio projects, touch-guard config & latest auto-saved active score on cold start
         runCatching {
             val savedTouchGuard = KeyboardLayoutPreferences.loadTouchGuardConfig(appContext)
-            val savedProjects = MelodyProjectRepository.listProjects(appContext)
             val autoDraft = MelodyProjectRepository.readAutoSaveDraft(appContext)
-            val autoSummary = MelodyProjectRepository.readAutoSaveSummary(appContext)
-            if (autoDraft != null && MelodyProjectRepository.hasMeaningfulContent(autoDraft.state)) {
-                val linkedId = autoDraft.projectId
-                val baselineProject = linkedId?.let { MelodyProjectRepository.loadProject(appContext, it) }
-                val draftFp = MelodyProjectRepository.computeContentFingerprint(autoDraft.state)
-                lastSavedMelodyFingerprint = if (baselineProject != null) {
-                    MelodyProjectRepository.computeContentFingerprint(baselineProject.state)
-                } else {
-                    MelodyProjectRepository.computeContentFingerprint(MelodyStudioUiState())
-                }
-                lastObservedMelodyFingerprint = draftFp
-                val isDirty = if (baselineProject != null) {
-                    draftFp != lastSavedMelodyFingerprint
-                } else {
-                    MelodyProjectRepository.hasMeaningfulContent(autoDraft.state)
-                }
-                _uiState.update { st ->
-                    st.copy(
-                        melody = autoDraft.state.copy(
-                            touchGuardConfig = savedTouchGuard,
-                            currentProjectId = linkedId,
-                            isProjectDirty = isDirty,
-                            savedProjects = savedProjects,
-                            autoSaveDraftSummary = autoSummary
-                        )
-                    )
-                }
+            if (autoDraft != null &&
+                (MelodyProjectRepository.hasMeaningfulContent(autoDraft.state) || autoDraft.projectId != null)
+            ) {
+                // Ensure any pre-upgrade or unlinked draft is promoted to a durable `proj_<id>.stscore.json`
+                val restoredWithId = autoDraft.state.copy(
+                    touchGuardConfig = savedTouchGuard,
+                    currentProjectId = autoDraft.projectId ?: UUID.randomUUID().toString(),
+                    playheadBeat = autoDraft.state.cursorTick.toFloat() / TICKS_PER_BEAT.toFloat()
+                )
+                val persisted = MelodyProjectRepository.autoPersistActiveSession(appContext, restoredWithId)
+                val finalState = restoredWithId.copy(
+                    currentProjectId = persisted.projectId,
+                    isProjectDirty = false,
+                    lastAutoSavedAtMs = autoDraft.savedAtMs.takeIf { it > 0L } ?: persisted.savedAtMs,
+                    savedProjects = persisted.savedProjects,
+                    autoSaveDraftSummary = persisted.autoDraftSummary
+                )
+                lastSavedMelodyFingerprint = MelodyProjectRepository.computeContentFingerprint(finalState)
+                lastPersistedSessionFingerprint =
+                    MelodyProjectRepository.computeSessionPersistenceFingerprint(finalState)
+                lastObservedMelodyFingerprint = lastPersistedSessionFingerprint
+                hasPendingAutoSaveFlush = false
+                _uiState.update { st -> st.copy(melody = finalState) }
             } else {
+                val savedProjects = MelodyProjectRepository.listProjects(appContext)
+                val autoSummary = MelodyProjectRepository.readAutoSaveSummary(appContext)
                 _uiState.update { st ->
-                    st.copy(
-                        melody = st.melody.copy(
-                            touchGuardConfig = savedTouchGuard,
-                            savedProjects = savedProjects,
-                            autoSaveDraftSummary = autoSummary
-                        )
+                    val nextMel = st.melody.copy(
+                        touchGuardConfig = savedTouchGuard,
+                        savedProjects = savedProjects,
+                        autoSaveDraftSummary = autoSummary
                     )
+                    lastSavedMelodyFingerprint = MelodyProjectRepository.computeContentFingerprint(nextMel)
+                    lastPersistedSessionFingerprint =
+                        MelodyProjectRepository.computeSessionPersistenceFingerprint(nextMel)
+                    lastObservedMelodyFingerprint = lastPersistedSessionFingerprint
+                    hasPendingAutoSaveFlush = false
+                    st.copy(melody = nextMel)
                 }
             }
         }
@@ -520,8 +575,12 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun onAppPaused() {
+        flushMelodyAutoSaveImmediate()
+    }
+
     fun onAppBackgrounded() {
-        flushMelodyAutoSaveNow()
+        flushMelodyAutoSaveImmediate()
     }
 
     private fun backfillMissingTrackKeySignatures(tracksToCheck: List<SessionTrack>) {
@@ -3005,6 +3064,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     private fun syncMelodySequenceToEngine(mel: MelodyStudioUiState = _uiState.value.melody) {
         val compiled = mel.compileSchedule(MELODY_SAMPLE_RATE)
         latestMelodyTempoMap = compiled.tempoMap
+        latestCompiledTotalFrames = compiled.totalFrames
         melodyPlayer.setMetronome(
             enabled = mel.metronomeEnabled && (mel.isPlaying || mel.isRecording),
             bpm = compiled.tempoMap.tailBpm,
@@ -3213,27 +3273,28 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun loadMelodyDemoShowcase() {
-        if (_uiState.value.melody.isRecording) {
+        val cur = _uiState.value.melody
+        if (cur.isRecording) {
             finalizeAllActiveRecordedNotes()
+        }
+        // Safely auto-save any existing user score into local projects BEFORE loading the demo song
+        if (cur.currentProjectId != null || MelodyProjectRepository.hasMeaningfulContent(cur)) {
+            flushMelodyAutoSaveImmediate()
         }
         pushMelodyUndoSnapshot()
         val demo = MusicalNotationHelper.buildDemoShowcaseBundle()
         _uiState.update { st ->
-            val nextTitle = if (st.melody.scoreTitle.isBlank() || st.melody.scoreTitle == "未命名乐谱") {
-                "晨光序曲"
-            } else {
-                st.melody.scoreTitle
-            }
             st.copy(
                 melody = st.melody.copy(
-                    scoreTitle = nextTitle,
+                    scoreTitle = "晨光序曲",
+                    currentProjectId = UUID.randomUUID().toString(),
                     timeSignature = TimeSignature.FOUR_FOUR,
                     initialKeySignature = KeySignature.C_MAJOR,
                     keySignatureEvents = emptyList(),
                     bpm = 112,
                     totalBars = 4,
-                    cursorTick = 14 * TICKS_PER_BEAT,
-                    tupletAnchorTick = 14 * TICKS_PER_BEAT,
+                    cursorTick = 0,
+                    tupletAnchorTick = 0,
                     notes = demo.notes,
                     dynamicMarks = demo.dynamicMarks,
                     hairpins = demo.hairpins,
@@ -3257,6 +3318,37 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         syncMelodyInstrumentToEngine(updated)
         syncMelodySequenceToEngine(updated)
         melodyPlayer.setTransportPlaying(true, 0L)
+    }
+
+    fun setMelodyScoreViewMode(mode: ScoreViewMode) {
+        _uiState.update { st ->
+            if (st.melody.scoreViewMode == mode) st
+            else st.copy(melody = st.melody.copy(scoreViewMode = mode))
+        }
+    }
+
+    fun toggleMinimizeKeyboardForScore() {
+        _uiState.update { st ->
+            val next = !st.melody.keyboardMinimizedForScore
+            st.copy(
+                melody = st.melody.copy(
+                    keyboardMinimizedForScore = next,
+                    collapseScoreInDualMode = if (next) false else st.melody.collapseScoreInDualMode
+                )
+            )
+        }
+    }
+
+    fun setMinimizeKeyboardForScore(minimized: Boolean) {
+        _uiState.update { st ->
+            if (st.melody.keyboardMinimizedForScore == minimized) st
+            else st.copy(
+                melody = st.melody.copy(
+                    keyboardMinimizedForScore = minimized,
+                    collapseScoreInDualMode = if (minimized) false else st.melody.collapseScoreInDualMode
+                )
+            )
+        }
     }
 
     /**
@@ -4214,6 +4306,12 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         syncMelodySequenceToEngine()
     }
 
+    private fun resolveAuditionStartTick(cur: MelodyStudioUiState): Int {
+        val maxPlayableEndTick = cur.notes.filterNot { it.isRest }.maxOfOrNull { it.resolvedEndTick } ?: 0
+        val effectiveEndTick = if (cur.hasPlayableNotes) maxPlayableEndTick else cur.totalTicks
+        return if (cur.cursorTick in 1 until effectiveEndTick) cur.cursorTick else 0
+    }
+
     fun toggleMelodyPlayStop() {
         val cur = _uiState.value.melody
         if (cur.isPlaying || cur.isRecording) {
@@ -4227,7 +4325,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     melody = st.melody.copy(
                         isPlaying = false,
                         isRecording = false,
-                        playheadBeat = 0f
+                        playheadBeat = st.melody.cursorTick.toFloat() / TICKS_PER_BEAT.toFloat()
                     )
                 )
             }
@@ -4240,20 +4338,55 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             if (cur.soundFontLoaded) {
                 melodyPlayer.startAudioEngine()
             }
+            val startTick = resolveAuditionStartTick(cur)
+            val startBeat = startTick.toFloat() / TICKS_PER_BEAT.toFloat()
             _uiState.update { st ->
                 st.copy(
                     melody = st.melody.copy(
                         isPlaying = true,
                         isRecording = false,
-                        playheadBeat = 0f
+                        playheadBeat = startBeat
                     )
                 )
             }
             val updated = _uiState.value.melody
             syncMelodyInstrumentToEngine(updated)
             syncMelodySequenceToEngine(updated)
-            melodyPlayer.setTransportPlaying(true, 0L)
+            val startFrame = tickToSeekFrame(currentMelodyTempoMap(updated), startTick)
+            melodyPlayer.setTransportPlaying(true, startFrame)
         }
+    }
+
+    fun playMelodyFromStart() {
+        val cur = _uiState.value.melody
+        if (cur.isRecording) {
+            finalizeAllActiveRecordedNotes()
+        }
+        if (!cur.hasPlayableNotes && !cur.metronomeEnabled) {
+            setMelodyCursorTick(0)
+            sendMessage("已回到第 1 小节开头")
+            return
+        }
+        if (cur.soundFontLoaded) {
+            melodyPlayer.startAudioEngine()
+        }
+        _uiState.update { st ->
+            st.copy(
+                melody = st.melody.copy(
+                    cursorTick = 0,
+                    tupletAnchorTick = 0,
+                    selectedNoteId = null,
+                    selectedAnnotation = null,
+                    isPlaying = true,
+                    isRecording = false,
+                    playheadBeat = 0f
+                )
+            )
+        }
+        val updated = _uiState.value.melody
+        syncMelodyInstrumentToEngine(updated)
+        syncMelodySequenceToEngine(updated)
+        melodyPlayer.setTransportPlaying(true, 0L)
     }
 
     fun toggleMelodyRecordStop() {
@@ -4266,7 +4399,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 st.copy(
                     melody = st.melody.copy(
                         isRecording = false,
-                        isPlaying = false
+                        isPlaying = false,
+                        playheadBeat = st.melody.cursorTick.toFloat() / TICKS_PER_BEAT.toFloat()
                     )
                 )
             }
@@ -4277,13 +4411,16 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             if (cur.soundFontLoaded) {
                 melodyPlayer.startAudioEngine()
             }
+            val startTick = cur.cursorTick.coerceAtLeast(0)
+            val startBeat = startTick.toFloat() / TICKS_PER_BEAT.toFloat()
             _uiState.update { st ->
                 st.copy(
                     melody = st.melody.copy(
                         inputMode = MelodyInputMode.LIVE_RECORD,
+                        keyboardMinimizedForScore = false,
                         isRecording = true,
                         isPlaying = true,
-                        playheadBeat = 0f,
+                        playheadBeat = startBeat,
                         selectedNoteId = null,
                         selectedAnnotation = null
                     )
@@ -4292,7 +4429,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             val updated = _uiState.value.melody
             syncMelodyInstrumentToEngine(updated)
             syncMelodySequenceToEngine(updated)
-            melodyPlayer.setTransportPlaying(true, 0L)
+            val startFrame = tickToSeekFrame(currentMelodyTempoMap(updated), startTick)
+            melodyPlayer.setTransportPlaying(true, startFrame)
         }
     }
 
@@ -4300,35 +4438,51 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         val cur = _uiState.value.melody
         val minStepUnit = cur.activeTuplet?.noteTicks ?: TICKS_PER_STEP
         val clamped = tick.coerceIn(0, (cur.totalTicks - minStepUnit).coerceAtLeast(0))
+        val nextBeat = clamped.toFloat() / TICKS_PER_BEAT.toFloat()
         _uiState.update { st ->
             st.copy(
                 melody = st.melody.copy(
                     cursorTick = clamped,
-                    tupletAnchorTick = clamped
+                    tupletAnchorTick = clamped,
+                    playheadBeat = if (st.melody.isPlaying && !st.melody.isRecording) nextBeat else st.melody.playheadBeat
                 )
             )
         }
         if (cur.isPlaying && !cur.isRecording) {
-            val targetFrame = currentMelodyTempoMap(cur).tickToFrame(clamped.toDouble())
+            val targetFrame = tickToSeekFrame(currentMelodyTempoMap(cur), clamped)
             melodyPlayer.seekTransport(targetFrame)
         }
     }
 
     fun selectMelodyNote(noteId: String?) {
+        var seekToTick: Int? = null
         _uiState.update { st ->
             val note = noteId?.let { id -> st.melody.notes.firstOrNull { it.id == id } }
             val nextTick = note?.resolvedStartTick ?: st.melody.cursorTick
             val minStepUnit = st.melody.activeTuplet?.noteTicks ?: TICKS_PER_STEP
             val clampedTick = nextTick.coerceIn(0, (st.melody.totalTicks - minStepUnit).coerceAtLeast(0))
             val nextAnchor = note?.tuplet?.groupStartTick ?: st.melody.tupletAnchorTick
+            if (note != null && st.melody.isPlaying && !st.melody.isRecording) {
+                seekToTick = clampedTick
+            }
             st.copy(
                 melody = st.melody.copy(
                     selectedNoteId = noteId,
                     selectedAnnotation = if (noteId != null) null else st.melody.selectedAnnotation,
                     cursorTick = clampedTick,
-                    tupletAnchorTick = nextAnchor
+                    tupletAnchorTick = nextAnchor,
+                    playheadBeat = if (seekToTick != null) {
+                        clampedTick.toFloat() / TICKS_PER_BEAT.toFloat()
+                    } else {
+                        st.melody.playheadBeat
+                    }
                 )
             )
+        }
+        seekToTick?.let { targetTick ->
+            val cur = _uiState.value.melody
+            melodyPlayer.seekTransport(tickToSeekFrame(currentMelodyTempoMap(cur), targetTick))
+            return
         }
         val selected = noteId?.let { id -> _uiState.value.melody.notes.firstOrNull { it.id == id } }
         if (selected != null && !selected.isRest && !_uiState.value.melody.isPlaying && !_uiState.value.melody.isRecording) {
@@ -4343,6 +4497,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun selectMelodyAnnotation(annotation: SelectedScoreAnnotation?) {
+        var seekToTick: Int? = null
         _uiState.update { st ->
             val cur = st.melody
             val jumpTick = when (annotation) {
@@ -4361,14 +4516,26 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             val minStepUnit = cur.activeTuplet?.noteTicks ?: TICKS_PER_STEP
             val nextTick = (jumpTick ?: cur.cursorTick)
                 .coerceIn(0, (cur.totalTicks - minStepUnit).coerceAtLeast(0))
+            if (jumpTick != null && cur.isPlaying && !cur.isRecording) {
+                seekToTick = nextTick
+            }
             st.copy(
                 melody = cur.copy(
                     selectedAnnotation = annotation,
                     selectedNoteId = if (annotation != null) null else cur.selectedNoteId,
                     cursorTick = nextTick,
-                    tupletAnchorTick = if (jumpTick != null) nextTick else cur.tupletAnchorTick
+                    tupletAnchorTick = if (jumpTick != null) nextTick else cur.tupletAnchorTick,
+                    playheadBeat = if (seekToTick != null) {
+                        nextTick.toFloat() / TICKS_PER_BEAT.toFloat()
+                    } else {
+                        cur.playheadBeat
+                    }
                 )
             )
+        }
+        seekToTick?.let { targetTick ->
+            val cur = _uiState.value.melody
+            melodyPlayer.seekTransport(tickToSeekFrame(currentMelodyTempoMap(cur), targetTick))
         }
     }
 
@@ -4904,43 +5071,89 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     // ========================================================================
 
     private fun onMelodyStateObservedForAutoSave(mel: MelodyStudioUiState) {
-        val fp = MelodyProjectRepository.computeContentFingerprint(mel)
-        val isDirty = (fp != lastSavedMelodyFingerprint) &&
-            (mel.currentProjectId != null || MelodyProjectRepository.hasMeaningfulContent(mel))
-        if (mel.isProjectDirty != isDirty) {
+        // Automatically assign a permanent project ID the moment a blank score receives meaningful content
+        if (mel.currentProjectId == null && MelodyProjectRepository.hasMeaningfulContent(mel)) {
+            val assignedId = UUID.randomUUID().toString()
             _uiState.update { st ->
-                if (st.melody.isProjectDirty == isDirty) st
-                else st.copy(melody = st.melody.copy(isProjectDirty = isDirty))
+                if (st.melody.currentProjectId != null) st
+                else st.copy(melody = st.melody.copy(currentProjectId = assignedId, isProjectDirty = false))
             }
+            return
         }
-        if (fp == lastObservedMelodyFingerprint) return
-        lastObservedMelodyFingerprint = fp
+
+        val sessionFp = MelodyProjectRepository.computeSessionPersistenceFingerprint(mel)
+        if (sessionFp == lastObservedMelodyFingerprint) return
+        lastObservedMelodyFingerprint = sessionFp
+        hasPendingAutoSaveFlush = (sessionFp != lastPersistedSessionFingerprint)
 
         autoSaveDebounceJob?.cancel()
         autoSaveDebounceJob = viewModelScope.launch {
-            delay(650L)
+            delay(180L)
+            autoSaveExecutor.execute {
+                persistLatestMelodySnapshotSync()
+            }
+        }
+    }
+
+    private fun persistLatestMelodySnapshotSync() {
+        runCatching {
             val snapshot = _uiState.value.melody
-            val summary = withContext(Dispatchers.IO) {
-                MelodyProjectRepository.writeAutoSaveDraft(appContext, snapshot)
-                MelodyProjectRepository.readAutoSaveSummary(appContext)
+            val snapSessionFp = MelodyProjectRepository.computeSessionPersistenceFingerprint(snapshot)
+            if (!hasPendingAutoSaveFlush && snapSessionFp == lastPersistedSessionFingerprint) {
+                return
             }
+            val outcome = MelodyProjectRepository.autoPersistActiveSession(appContext, snapshot)
+            val contentFp = MelodyProjectRepository.computeContentFingerprint(snapshot)
+            lastSavedMelodyFingerprint = contentFp
+            lastPersistedSessionFingerprint = snapSessionFp
+            hasPendingAutoSaveFlush = false
+
             _uiState.update { st ->
-                if (st.melody.autoSaveDraftSummary == summary) st
-                else st.copy(melody = st.melody.copy(autoSaveDraftSummary = summary))
+                val cur = st.melody
+                if (cur.currentProjectId != snapshot.currentProjectId &&
+                    cur.currentProjectId != null &&
+                    outcome.projectId != cur.currentProjectId
+                ) {
+                    // User already switched to a different project in the meantime; only refresh list
+                    st.copy(
+                        melody = cur.copy(
+                            savedProjects = outcome.savedProjects,
+                            autoSaveDraftSummary = outcome.autoDraftSummary
+                        )
+                    )
+                } else {
+                    st.copy(
+                        melody = cur.copy(
+                            currentProjectId = outcome.projectId,
+                            isProjectDirty = false,
+                            lastAutoSavedAtMs = if (outcome.savedAtMs > 0L) outcome.savedAtMs else cur.lastAutoSavedAtMs,
+                            savedProjects = outcome.savedProjects,
+                            autoSaveDraftSummary = outcome.autoDraftSummary
+                        )
+                    )
+                }
             }
+        }
+    }
+
+    /**
+     * Immediately flushes any pending edits to disk (`tmp` + `fsync` + atomic `rename`) BEFORE
+     * `onPause()` / `onStop()` / `onCleared()` or project switching completes, guaranteeing zero data loss
+     * even if the user immediately kills the app from Android Recents.
+     */
+    fun flushMelodyAutoSaveImmediate() {
+        autoSaveDebounceJob?.cancel()
+        val cur = _uiState.value.melody
+        val curSessionFp = MelodyProjectRepository.computeSessionPersistenceFingerprint(cur)
+        if (hasPendingAutoSaveFlush || curSessionFp != lastPersistedSessionFingerprint) {
+            persistLatestMelodySnapshotSync()
         }
     }
 
     fun flushMelodyAutoSaveNow() {
         autoSaveDebounceJob?.cancel()
-        val snapshot = _uiState.value.melody
-        viewModelScope.launch(Dispatchers.IO) {
-            MelodyProjectRepository.writeAutoSaveDraft(appContext, snapshot)
-            val summary = MelodyProjectRepository.readAutoSaveSummary(appContext)
-            _uiState.update { st ->
-                if (st.melody.autoSaveDraftSummary == summary) st
-                else st.copy(melody = st.melody.copy(autoSaveDraftSummary = summary))
-            }
+        autoSaveExecutor.execute {
+            persistLatestMelodySnapshotSync()
         }
     }
 
@@ -4955,33 +5168,43 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             melodyPlayer.setTransportPlaying(false, 0L)
             melodyPlayer.allNotesOff()
         }
+        // Flush previous score's latest edits safely before switching
+        flushMelodyAutoSaveImmediate()
         pushMelodyUndoSnapshot()
 
-        val fp = MelodyProjectRepository.computeContentFingerprint(loadedState)
+        val resolvedId = projectId ?: if (MelodyProjectRepository.hasMeaningfulContent(loadedState)) {
+            UUID.randomUUID().toString()
+        } else {
+            null
+        }
+        val stateToApply = loadedState.copy(
+            touchGuardConfig = cur.touchGuardConfig,
+            currentProjectId = resolvedId,
+            isProjectDirty = false,
+            soundFontLoaded = cur.soundFontLoaded,
+            canUndo = melodyUndoStack.isNotEmpty(),
+            canRedo = melodyRedoStack.isNotEmpty(),
+            isPlaying = false,
+            isRecording = false,
+            playheadBeat = loadedState.cursorTick.toFloat() / TICKS_PER_BEAT.toFloat()
+        )
+        val outcome = MelodyProjectRepository.autoPersistActiveSession(appContext, stateToApply)
+        val finalState = stateToApply.copy(
+            currentProjectId = outcome.projectId,
+            lastAutoSavedAtMs = outcome.savedAtMs,
+            savedProjects = outcome.savedProjects,
+            autoSaveDraftSummary = outcome.autoDraftSummary
+        )
+        val contentFp = MelodyProjectRepository.computeContentFingerprint(finalState)
+        val sessionFp = MelodyProjectRepository.computeSessionPersistenceFingerprint(finalState)
         if (markClean) {
-            lastSavedMelodyFingerprint = fp
+            lastSavedMelodyFingerprint = contentFp
         }
-        lastObservedMelodyFingerprint = fp
+        lastPersistedSessionFingerprint = sessionFp
+        lastObservedMelodyFingerprint = sessionFp
+        hasPendingAutoSaveFlush = false
 
-        _uiState.update { st ->
-            val projects = MelodyProjectRepository.listProjects(appContext)
-            val autoSummary = MelodyProjectRepository.readAutoSaveSummary(appContext)
-            st.copy(
-                melody = loadedState.copy(
-                    touchGuardConfig = st.melody.touchGuardConfig,
-                    currentProjectId = projectId,
-                    isProjectDirty = !markClean && MelodyProjectRepository.hasMeaningfulContent(loadedState),
-                    savedProjects = projects,
-                    autoSaveDraftSummary = autoSummary,
-                    soundFontLoaded = st.melody.soundFontLoaded,
-                    canUndo = melodyUndoStack.isNotEmpty(),
-                    canRedo = melodyRedoStack.isNotEmpty(),
-                    isPlaying = false,
-                    isRecording = false,
-                    playheadBeat = 0f
-                )
-            )
-        }
+        _uiState.update { st -> st.copy(melody = finalState) }
 
         val updated = _uiState.value.melody
         if (updated.soundFontLoaded && _uiState.value.workspaceMode == AppWorkspaceMode.MELODY_STUDIO) {
@@ -4989,12 +5212,13 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         }
         syncMelodyInstrumentToEngine(updated)
         syncMelodySequenceToEngine(updated)
-        flushMelodyAutoSaveNow()
     }
 
     fun createNewBlankMelodyProject() {
+        flushMelodyAutoSaveImmediate()
         val cur = _uiState.value.melody
         val blank = MelodyStudioUiState(
+            scoreViewMode = cur.scoreViewMode,
             instrument = cur.instrument,
             secondaryInstrument = cur.secondaryInstrument,
             dualKeyboardEnabled = cur.dualKeyboardEnabled,
@@ -5009,7 +5233,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             metronomeEnabled = cur.metronomeEnabled
         )
         applyLoadedMelodyState(loadedState = blank, projectId = null, markClean = true)
-        sendMessage("已新建空白乐谱（支持随时撤销返回上一份草稿）")
+        sendMessage("已新建空白乐谱（上一份乐谱已自动保存至本地列表）")
     }
 
     fun saveCurrentMelodyProject(
@@ -5020,6 +5244,9 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         val cleanTitle = MelodyProjectRepository.sanitizeDisplayTitle(customTitle ?: cur.scoreTitle)
         val targetId = if (overwriteCurrent) cur.currentProjectId else null
         viewModelScope.launch {
+            if (!overwriteCurrent && (cur.currentProjectId != null || MelodyProjectRepository.hasMeaningfulContent(cur))) {
+                withContext(Dispatchers.IO) { flushMelodyAutoSaveImmediate() }
+            }
             val savedSummary = withContext(Dispatchers.IO) {
                 MelodyProjectRepository.saveProject(
                     context = appContext,
@@ -5032,26 +5259,35 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 sendMessage("保存乐谱失败")
                 return@launch
             }
-            val updatedList = withContext(Dispatchers.IO) {
-                MelodyProjectRepository.listProjects(appContext)
-            }
+            val nowMs = System.currentTimeMillis()
             val updatedMel = _uiState.value.melody.copy(
                 scoreTitle = cleanTitle,
                 currentProjectId = savedSummary.id,
                 isProjectDirty = false,
-                savedProjects = updatedList
+                lastAutoSavedAtMs = nowMs
             )
-            val fp = MelodyProjectRepository.computeContentFingerprint(updatedMel)
-            lastSavedMelodyFingerprint = fp
-            lastObservedMelodyFingerprint = fp
-            _uiState.update { st -> st.copy(melody = updatedMel) }
-            flushMelodyAutoSaveNow()
-            sendMessage("已保存乐谱「$cleanTitle」")
+            val outcome = withContext(Dispatchers.IO) {
+                MelodyProjectRepository.autoPersistActiveSession(appContext, updatedMel)
+            }
+            val finalMel = updatedMel.copy(
+                savedProjects = outcome.savedProjects,
+                autoSaveDraftSummary = outcome.autoDraftSummary
+            )
+            lastSavedMelodyFingerprint = MelodyProjectRepository.computeContentFingerprint(finalMel)
+            lastPersistedSessionFingerprint = MelodyProjectRepository.computeSessionPersistenceFingerprint(finalMel)
+            lastObservedMelodyFingerprint = lastPersistedSessionFingerprint
+            hasPendingAutoSaveFlush = false
+            _uiState.update { st -> st.copy(melody = finalMel) }
+            sendMessage(
+                if (overwriteCurrent) "已立即同步保存「$cleanTitle」"
+                else "已另存为新乐谱副本「$cleanTitle」"
+            )
         }
     }
 
     fun loadMelodyProject(projectId: String) {
         viewModelScope.launch {
+            withContext(Dispatchers.IO) { flushMelodyAutoSaveImmediate() }
             val loaded = withContext(Dispatchers.IO) {
                 MelodyProjectRepository.loadProject(appContext, projectId)
             }
@@ -5080,9 +5316,9 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             applyLoadedMelodyState(
                 loadedState = draft.state,
                 projectId = draft.projectId,
-                markClean = false
+                markClean = true
             )
-            sendMessage("已恢复自动保存草稿「${draft.state.scoreTitle}」")
+            sendMessage("已恢复乐谱「${draft.state.scoreTitle}」")
         }
     }
 
@@ -5106,11 +5342,16 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     savedProjects = projects
                 )
                 if (isCurrent) {
-                    val fp = MelodyProjectRepository.computeContentFingerprint(nextMel)
-                    lastSavedMelodyFingerprint = fp
-                    lastObservedMelodyFingerprint = fp
+                    lastSavedMelodyFingerprint = MelodyProjectRepository.computeContentFingerprint(nextMel)
+                    lastPersistedSessionFingerprint =
+                        MelodyProjectRepository.computeSessionPersistenceFingerprint(nextMel)
+                    lastObservedMelodyFingerprint = lastPersistedSessionFingerprint
+                    hasPendingAutoSaveFlush = false
                 }
                 st.copy(melody = nextMel)
+            }
+            if (_uiState.value.melody.currentProjectId == projectId) {
+                flushMelodyAutoSaveNow()
             }
             sendMessage("已重命名为「$clean」")
         }
@@ -5118,26 +5359,54 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     fun deleteMelodyProject(projectId: String) {
         viewModelScope.launch {
+            val wasCurrent = _uiState.value.melody.currentProjectId == projectId
+            if (wasCurrent) {
+                autoSaveDebounceJob?.cancel()
+                hasPendingAutoSaveFlush = false
+            }
             val ok = withContext(Dispatchers.IO) {
                 MelodyProjectRepository.deleteProject(appContext, projectId)
             }
             if (!ok) return@launch
-            val projects = withContext(Dispatchers.IO) {
-                MelodyProjectRepository.listProjects(appContext)
-            }
-            _uiState.update { st ->
-                val wasCurrent = st.melody.currentProjectId == projectId
-                st.copy(
-                    melody = st.melody.copy(
-                        currentProjectId = if (wasCurrent) null else st.melody.currentProjectId,
-                        isProjectDirty = if (wasCurrent) {
-                            MelodyProjectRepository.hasMeaningfulContent(st.melody)
-                        } else {
-                            st.melody.isProjectDirty
-                        },
-                        savedProjects = projects
-                    )
+            if (wasCurrent) {
+                val cur = _uiState.value.melody
+                val blank = MelodyStudioUiState(
+                    scoreViewMode = cur.scoreViewMode,
+                    instrument = cur.instrument,
+                    secondaryInstrument = cur.secondaryInstrument,
+                    dualKeyboardEnabled = cur.dualKeyboardEnabled,
+                    primaryScrollWhiteKey = cur.primaryScrollWhiteKey,
+                    secondaryScrollWhiteKey = cur.secondaryScrollWhiteKey,
+                    touchGuardConfig = cur.touchGuardConfig,
+                    sustainPedal = cur.sustainPedal,
+                    secondarySustainPedal = cur.secondarySustainPedal,
+                    sustainDurationSec = cur.sustainDurationSec,
+                    secondarySustainDurationSec = cur.secondarySustainDurationSec,
+                    reverbPreset = cur.reverbPreset,
+                    metronomeEnabled = cur.metronomeEnabled,
+                    soundFontLoaded = cur.soundFontLoaded
                 )
+                val outcome = withContext(Dispatchers.IO) {
+                    MelodyProjectRepository.autoPersistActiveSession(appContext, blank)
+                }
+                val resetState = blank.copy(
+                    savedProjects = outcome.savedProjects,
+                    autoSaveDraftSummary = outcome.autoDraftSummary
+                )
+                lastSavedMelodyFingerprint = MelodyProjectRepository.computeContentFingerprint(resetState)
+                lastPersistedSessionFingerprint =
+                    MelodyProjectRepository.computeSessionPersistenceFingerprint(resetState)
+                lastObservedMelodyFingerprint = lastPersistedSessionFingerprint
+                hasPendingAutoSaveFlush = false
+                _uiState.update { st -> st.copy(melody = resetState) }
+                syncMelodySequenceToEngine(resetState)
+            } else {
+                val projects = withContext(Dispatchers.IO) {
+                    MelodyProjectRepository.listProjects(appContext)
+                }
+                _uiState.update { st ->
+                    st.copy(melody = st.melody.copy(savedProjects = projects))
+                }
             }
             sendMessage("已删除已存乐谱")
         }
@@ -5531,6 +5800,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     override fun onCleared() {
         super.onCleared()
+        runCatching { flushMelodyAutoSaveImmediate() }
+        runCatching { autoSaveExecutor.shutdown() }
         previewNoteJob?.cancel()
         updateCheckJob?.cancel()
         updateDownloadJob?.cancel()
