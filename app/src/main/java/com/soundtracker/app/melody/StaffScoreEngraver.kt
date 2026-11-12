@@ -51,8 +51,8 @@ object StaffScoreEngraver {
     private const val BASS_MIDDLE_STEP = 22   // D3
     private const val BASS_BOTTOM_STEP = 18   // G2
 
-    // Notes below G3 (MIDI 55) automatically activate the connected Bass Staff (Grand Staff 大谱表)
-    const val BASS_SPLIT_MIDI = 55
+    // Legacy fallback pitch threshold (< G#3 / MIDI 56) for old archives without explicit StaffPart tags
+    const val BASS_SPLIT_MIDI = 56
 
     private val STANDARD_SLICE_STEPS = intArrayOf(16, 12, 8, 6, 4, 3, 2, 1)
 
@@ -138,12 +138,16 @@ object StaffScoreEngraver {
     private data class PendingFermataRender(
         val xCenter: Float,
         val staffTopY: Float,
+        val useBassStaff: Boolean,
         var minClearanceTopY: Float,
         val color: Int
     )
 
     fun needsGrandStaff(notes: List<MelodyScoreNote>): Boolean =
-        notes.any { !it.isRest && it.midiNote < BASS_SPLIT_MIDI }
+        notes.any { it.targetStaff == StaffPart.BASS || (!it.isRest && it.midiNote < BASS_SPLIT_MIDI) }
+
+    fun isEffectiveGrandStaff(melody: MelodyStudioUiState): Boolean =
+        melody.grandStaffEnabled
 
     /**
      * Computes sticky left header width in px so Clef + active Key Signature (`0..7` sharps/flats) + Time Signature
@@ -269,7 +273,7 @@ object StaffScoreEngraver {
         val symbols = mutableListOf<SlicedSymbol>()
 
         for (n in notes) {
-            val onBass = !n.isRest && grandStaff && n.midiNote < BASS_SPLIT_MIDI
+            val onBass = grandStaff && (n.resolvedStaffPart(true) == StaffPart.BASS)
             val tup = n.tuplet
 
             if (tup != null) {
@@ -351,7 +355,7 @@ object StaffScoreEngraver {
             }
         }
 
-        // Fill silent gaps (both inside incomplete tuplet groups and between regular beats)
+        // Fill silent gaps independently on Treble and Bass staves
         if (fillAutoRestsInActiveBars || fillAllBarsWithAutoRests) {
             val maxActiveBar = symbols.maxOfOrNull { it.barIndex } ?: -1
             for (bar in 0 until totalBars) {
@@ -359,24 +363,30 @@ object StaffScoreEngraver {
                 val shouldFill = fillAllBarsWithAutoRests || (barSyms.isNotEmpty() && bar <= maxActiveBar)
                 if (!shouldFill) continue
 
-                fillStaffGapsForMeasure(
-                    out = symbols,
-                    existingStaffBarSyms = barSyms.filter { !it.useBassStaff },
-                    barIndex = bar,
-                    timeSignature = timeSignature,
-                    useBassStaff = false,
-                    onlyBetweenOrFullPdf = fillAllBarsWithAutoRests
-                )
-
-                if (grandStaff && fillAllBarsWithAutoRests) {
+                val trebleSyms = barSyms.filter { !it.useBassStaff }
+                if (fillAllBarsWithAutoRests || trebleSyms.isNotEmpty()) {
                     fillStaffGapsForMeasure(
                         out = symbols,
-                        existingStaffBarSyms = barSyms.filter { it.useBassStaff },
+                        existingStaffBarSyms = trebleSyms,
                         barIndex = bar,
                         timeSignature = timeSignature,
-                        useBassStaff = true,
-                        onlyBetweenOrFullPdf = true
+                        useBassStaff = false,
+                        onlyBetweenOrFullPdf = fillAllBarsWithAutoRests
                     )
+                }
+
+                if (grandStaff) {
+                    val bassSyms = barSyms.filter { it.useBassStaff }
+                    if (fillAllBarsWithAutoRests || bassSyms.isNotEmpty()) {
+                        fillStaffGapsForMeasure(
+                            out = symbols,
+                            existingStaffBarSyms = bassSyms,
+                            barIndex = bar,
+                            timeSignature = timeSignature,
+                            useBassStaff = true,
+                            onlyBetweenOrFullPdf = fillAllBarsWithAutoRests
+                        )
+                    }
                 }
             }
         }
@@ -563,6 +573,79 @@ object StaffScoreEngraver {
         val playheadColor: Int = Color.rgb(190, 58, 48)
     )
 
+    private data class TimelineVerticalMetrics(
+        val grandStaff: Boolean,
+        val lineSpacing: Float,
+        val staffHeight: Float,
+        val grandGap: Float,
+        val trebleTopY: Float,
+        val bassTopY: Float,
+        val bottomStaffBottomY: Float
+    )
+
+    private fun computeTimelineVerticalMetrics(
+        viewportHeight: Float,
+        melody: MelodyStudioUiState
+    ): TimelineVerticalMetrics {
+        val grandStaff = isEffectiveGrandStaff(melody)
+        val hasChordMarks = melody.showChordSymbols && melody.chordSymbols.isNotEmpty()
+        val hasTempoOrMod = melody.tempoEvents.isNotEmpty() ||
+            melody.keySignatureEvents.isNotEmpty() ||
+            melody.notes.any { it.hasFermata || it.accent == NoteAccent.MARCATO }
+        val hasTopMarks = hasChordMarks || hasTempoOrMod
+        val hasDualTopLayers = hasChordMarks && melody.tempoEvents.isNotEmpty()
+        val hasBottomMarks = melody.dynamicMarks.isNotEmpty() || melody.hairpins.isNotEmpty()
+
+        val baseDivisor = when {
+            grandStaff && (hasTopMarks || hasBottomMarks) -> 17.6f
+            grandStaff -> 15.8f
+            hasTopMarks || hasBottomMarks -> 11.6f
+            else -> 9.6f
+        } + (if (hasDualTopLayers) 1.3f else 0f)
+
+        val lineSpacing = if (grandStaff) {
+            (viewportHeight / baseDivisor).coerceIn(5.4f, 11.6f)
+        } else {
+            (viewportHeight / baseDivisor).coerceIn(6.4f, 13.6f)
+        }
+        val staffHeight = lineSpacing * 4f
+        val grandGap = lineSpacing * 3.5f
+
+        val topBias = when {
+            hasDualTopLayers -> lineSpacing * 1.15f
+            hasTopMarks && !hasBottomMarks -> lineSpacing * 0.85f
+            !hasTopMarks && hasBottomMarks -> -lineSpacing * 0.45f
+            else -> lineSpacing * 0.25f
+        }
+        val minTopHeadroom = when {
+            hasDualTopLayers -> lineSpacing * 4.35f
+            hasChordMarks || melody.tempoEvents.isNotEmpty() -> lineSpacing * 3.25f
+            else -> lineSpacing * 2.85f
+        }
+        val trebleTopY: Float
+        val bassTopY: Float
+        if (grandStaff) {
+            val totalBlockH = staffHeight * 2f + grandGap
+            trebleTopY = ((viewportHeight - totalBlockH) * 0.5f + topBias)
+                .coerceAtLeast(minTopHeadroom)
+            bassTopY = trebleTopY + staffHeight + grandGap
+        } else {
+            trebleTopY = ((viewportHeight - staffHeight) * 0.5f + topBias)
+                .coerceAtLeast(minTopHeadroom)
+            bassTopY = trebleTopY
+        }
+        val bottomStaffBottomY = if (grandStaff) bassTopY + staffHeight else trebleTopY + staffHeight
+        return TimelineVerticalMetrics(
+            grandStaff = grandStaff,
+            lineSpacing = lineSpacing,
+            staffHeight = staffHeight,
+            grandGap = grandGap,
+            trebleTopY = trebleTopY,
+            bassTopY = bassTopY,
+            bottomStaffBottomY = bottomStaffBottomY
+        )
+    }
+
     fun drawInteractiveTimelineStaff(
         canvas: Canvas,
         viewportWidth: Float,
@@ -580,50 +663,22 @@ object StaffScoreEngraver {
         val ticksPerBar = timeSig.ticksPerBar
         val quarterBeatsPerBar = timeSig.quarterBeatsPerBar.coerceAtLeast(0.25f)
         val maxNoteBeat = melody.notes.maxOfOrNull { it.endBeat } ?: quarterBeatsPerBar
+        val maxChordBar = ((melody.chordSymbols.maxOfOrNull { it.safeTick } ?: 0) / ticksPerBar) + 1
         val maxKeyBar = (melody.keySignatureEvents.maxOfOrNull { it.safeBarIndex + 1 } ?: 1)
         val totalBars = maxOf(
             melody.totalBars,
             ceil(maxNoteBeat / quarterBeatsPerBar).toInt(),
+            maxChordBar,
             maxKeyBar
         ).coerceAtLeast(1)
-        val grandStaff = needsGrandStaff(melody.notes)
-        val hasTopMarks = melody.tempoEvents.isNotEmpty() ||
-            melody.keySignatureEvents.isNotEmpty() ||
-            melody.notes.any { it.hasFermata || it.accent == NoteAccent.MARCATO }
-        val hasBottomMarks = melody.dynamicMarks.isNotEmpty() || melody.hairpins.isNotEmpty()
 
-        val verticalDivisor = when {
-            grandStaff && (hasTopMarks || hasBottomMarks) -> 17.2f
-            grandStaff -> 15.6f
-            hasTopMarks || hasBottomMarks -> 11.2f
-            else -> 9.6f
-        }
-        val lineSpacing = if (grandStaff) {
-            (viewportHeight / verticalDivisor).coerceIn(5.6f, 11.8f)
-        } else {
-            (viewportHeight / verticalDivisor).coerceIn(6.6f, 13.8f)
-        }
-        val staffHeight = lineSpacing * 4f
-        val grandGap = lineSpacing * 3.5f
-
-        val topBias = when {
-            hasTopMarks && !hasBottomMarks -> lineSpacing * 0.75f
-            !hasTopMarks && hasBottomMarks -> -lineSpacing * 0.45f
-            else -> lineSpacing * 0.15f
-        }
-        val trebleTopY: Float
-        val bassTopY: Float
-        if (grandStaff) {
-            val totalBlockH = staffHeight * 2f + grandGap
-            trebleTopY = ((viewportHeight - totalBlockH) * 0.5f + topBias)
-                .coerceAtLeast(lineSpacing * 2.9f)
-            bassTopY = trebleTopY + staffHeight + grandGap
-        } else {
-            trebleTopY = ((viewportHeight - staffHeight) * 0.5f + topBias)
-                .coerceAtLeast(lineSpacing * 3.0f)
-            bassTopY = trebleTopY
-        }
-        val bottomStaffBottomY = if (grandStaff) bassTopY + staffHeight else trebleTopY + staffHeight
+        val vMetrics = computeTimelineVerticalMetrics(viewportHeight, melody)
+        val grandStaff = vMetrics.grandStaff
+        val lineSpacing = vMetrics.lineSpacing
+        val staffHeight = vMetrics.staffHeight
+        val trebleTopY = vMetrics.trebleTopY
+        val bassTopY = vMetrics.bassTopY
+        val bottomStaffBottomY = vMetrics.bottomStaffBottomY
 
         val symbols = buildBarSymbols(
             notes = melody.notes,
@@ -659,6 +714,21 @@ object StaffScoreEngraver {
             viewportWidth,
             clefHeaderWidth + totalBars * barWidth - scrollX + lineSpacing * 2f
         )
+
+        if (grandStaff && !melody.isRecording) {
+            val activeTopY = if (melody.activeStaff == StaffPart.BASS) bassTopY else trebleTopY
+            val activeBandPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.argb(18, 201, 100, 66)
+                style = Paint.Style.FILL
+            }
+            canvas.drawRect(
+                clefHeaderWidth,
+                activeTopY - lineSpacing * 0.42f,
+                contentRightX,
+                activeTopY + staffHeight + lineSpacing * 0.42f,
+                activeBandPaint
+            )
+        }
 
         drawFiveLines(canvas, clefHeaderWidth, contentRightX, trebleTopY, lineSpacing, palette.staffLineColor)
         if (grandStaff) {
@@ -836,10 +906,11 @@ object StaffScoreEngraver {
             }
         }
 
-        // System-level Multi-Note Phrase Slurs + Fermatas + Dynamics/Hairpins + Tempo Marks
+        // System-level Multi-Note Phrase Slurs + Fermatas + Chord Symbols + Dynamics/Hairpins + Tempo Marks
         renderSystemPhraseSlurs(
             canvas = canvas,
             allScoreNotes = melody.notes,
+            grandStaff = grandStaff,
             chordAnchors = chordAnchors,
             tupletObstacles = tupletObstacles,
             pendingFermatas = pendingFermatas,
@@ -895,6 +966,32 @@ object StaffScoreEngraver {
             outHitTargets = hitTargets
         )
 
+        val hasMidModInRenderSpan = (renderFirstBar..renderLastBar).any { b ->
+            b >= 1 && melody.keySignatureEventAtBar(b) != null
+        }
+        val chordLaneTopY = if (melody.showChordSymbols && melody.chordSymbols.isNotEmpty()) {
+            renderSystemChordSymbols(
+                canvas = canvas,
+                chordSymbols = melody.chordSymbols,
+                sysStartTick = renderFirstBar * ticksPerBar,
+                sysEndTick = (renderLastBar + 1) * ticksPerBar,
+                isContinuousTimeline = true,
+                tickToX = tickXMapper,
+                trebleTopY = trebleTopY,
+                hasModulationPills = hasMidModInRenderSpan,
+                chordAnchors = chordAnchors,
+                pendingFermatas = pendingFermatas,
+                viewportMinTopY = lineSpacing * 1.45f,
+                lineSpacing = lineSpacing,
+                inkColor = palette.inkColor,
+                selectedColor = palette.selectedColor,
+                selectedAnnotation = melody.selectedAnnotation,
+                outHitTargets = hitTargets
+            )
+        } else {
+            null
+        }
+
         renderSystemTempoEvents(
             canvas = canvas,
             tempoEvents = melody.tempoEvents,
@@ -907,7 +1004,8 @@ object StaffScoreEngraver {
             trebleTopY = trebleTopY,
             chordAnchors = chordAnchors,
             pendingFermatas = pendingFermatas,
-            viewportMinTopY = lineSpacing * 1.35f,
+            extraTopClearanceY = chordLaneTopY,
+            viewportMinTopY = lineSpacing * 1.25f,
             lineSpacing = lineSpacing,
             inkColor = palette.expressionInkColor,
             selectedColor = palette.selectedColor,
@@ -915,7 +1013,7 @@ object StaffScoreEngraver {
             outHitTargets = hitTargets
         )
 
-        // Draw Step Input Cursor at exact `cursorTick`
+        // Draw Step Input Cursor at exact `cursorTick` (emphasizing the currently active staff in Grand Staff mode!)
         if (!melody.isRecording) {
             val cursorBar = melody.cursorTick / ticksPerBar
             val tickInBar = melody.cursorTick % ticksPerBar
@@ -934,17 +1032,39 @@ object StaffScoreEngraver {
                     melody.activeTuplet != null -> palette.selectedColor
                     else -> palette.cursorColor
                 }
+                if (grandStaff) {
+                    val ghostGuidePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                        color = Color.argb(
+                            68,
+                            Color.red(cursorColorActual),
+                            Color.green(cursorColorActual),
+                            Color.blue(cursorColorActual)
+                        )
+                        strokeWidth = max(1.1f, lineSpacing * 0.11f)
+                        style = Paint.Style.STROKE
+                        pathEffect = DashPathEffect(floatArrayOf(lineSpacing * 0.45f, lineSpacing * 0.55f), 0f)
+                    }
+                    canvas.drawLine(
+                        cx,
+                        (trebleTopY - lineSpacing * 0.6f).coerceAtLeast(4f),
+                        cx,
+                        min(viewportHeight - 4f, bottomStaffBottomY + lineSpacing * 0.6f),
+                        ghostGuidePaint
+                    )
+                }
+                val activeStaffTopY = if (grandStaff && melody.activeStaff == StaffPart.BASS) bassTopY else trebleTopY
+                val activeStaffBotY = if (grandStaff) (activeStaffTopY + staffHeight) else bottomStaffBottomY
                 val cursorPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                     color = cursorColorActual
-                    strokeWidth = max(1.8f, lineSpacing * 0.16f)
+                    strokeWidth = max(1.9f, lineSpacing * 0.17f)
                     style = Paint.Style.STROKE
                     pathEffect = DashPathEffect(floatArrayOf(lineSpacing * 0.65f, lineSpacing * 0.45f), 0f)
                 }
                 canvas.drawLine(
                     cx,
-                    (trebleTopY - lineSpacing * 1.1f).coerceAtLeast(4f),
+                    (activeStaffTopY - lineSpacing * 1.05f).coerceAtLeast(4f),
                     cx,
-                    min(viewportHeight - 4f, bottomStaffBottomY + lineSpacing * 1.1f),
+                    min(viewportHeight - 4f, activeStaffBotY + lineSpacing * 1.05f),
                     cursorPaint
                 )
                 val triPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -952,7 +1072,7 @@ object StaffScoreEngraver {
                     style = Paint.Style.FILL
                 }
                 val tri = Path().apply {
-                    val topY = (trebleTopY - lineSpacing * 1.35f).coerceAtLeast(2f)
+                    val topY = (activeStaffTopY - lineSpacing * 1.32f).coerceAtLeast(2f)
                     val sz = lineSpacing * 0.48f
                     moveTo(cx - sz, topY)
                     lineTo(cx + sz, topY)
@@ -994,6 +1114,7 @@ object StaffScoreEngraver {
 
         // Empty Score Watermark
         if (melody.notes.isEmpty() &&
+            melody.chordSymbols.isEmpty() &&
             melody.dynamicMarks.isEmpty() &&
             melody.hairpins.isEmpty() &&
             melody.tempoEvents.isEmpty() &&
@@ -1001,11 +1122,16 @@ object StaffScoreEngraver {
         ) {
             val hintPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = Color.argb(145, 112, 102, 90)
-                textSize = max(20f, lineSpacing * 1.20f)
+                textSize = max(18f, lineSpacing * 1.18f)
                 textAlign = Paint.Align.CENTER
             }
+            val hintMsg = if (grandStaff) {
+                "触屏点上方高音谱写右手、点下方低音谱写左手 · 支持和弦标记/转调/连线，或点「示例曲」体验"
+            } else {
+                "点击下方琴键写五线谱音符（支持双行钢琴谱、和弦标记、调号/转调、连线），或点「示例曲」体验"
+            }
             canvas.drawText(
-                "点击下方琴键写五线谱音符（支持调号/转调、连线、力度/奏法/速度记号），或点右上角「示例曲」体验",
+                hintMsg,
                 clefHeaderWidth + (viewportWidth - clefHeaderWidth) * 0.5f,
                 viewportHeight - max(10f, lineSpacing * 0.70f),
                 hintPaint
@@ -1021,27 +1147,45 @@ object StaffScoreEngraver {
         }
         canvas.drawRect(0f, 0f, clefHeaderWidth, viewportHeight, headerBgPaint)
 
-        val leftMargin = lineSpacing * 0.65f
+        val leftMargin = if (grandStaff) lineSpacing * 1.12f else lineSpacing * 0.65f
         drawFiveLines(canvas, leftMargin, clefHeaderWidth, trebleTopY, lineSpacing, palette.staffLineColor)
         if (grandStaff) {
             drawFiveLines(canvas, leftMargin, clefHeaderWidth, bassTopY, lineSpacing, palette.staffLineColor)
             val bracePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = palette.inkColor
-                strokeWidth = max(2.0f, lineSpacing * 0.22f)
+                strokeWidth = max(1.8f, lineSpacing * 0.20f)
             }
             canvas.drawLine(leftMargin, trebleTopY, leftMargin, bottomStaffBottomY, bracePaint)
+            drawPianoGrandBrace(
+                canvas = canvas,
+                barLineX = leftMargin,
+                topY = trebleTopY,
+                bottomY = bottomStaffBottomY,
+                lineSpacing = lineSpacing,
+                color = palette.inkColor
+            )
         } else {
             canvas.drawLine(leftMargin, trebleTopY, leftMargin, trebleTopY + staffHeight, barLinePaint)
         }
 
-        drawTrebleClef(canvas, leftMargin + lineSpacing * 1.35f, trebleTopY, lineSpacing, palette.inkColor)
+        val trebleClefColor = if (grandStaff && !melody.isRecording && melody.activeStaff == StaffPart.TREBLE) {
+            palette.cursorColor
+        } else {
+            palette.inkColor
+        }
+        val bassClefColor = if (grandStaff && !melody.isRecording && melody.activeStaff == StaffPart.BASS) {
+            palette.cursorColor
+        } else {
+            palette.inkColor
+        }
+        drawTrebleClef(canvas, leftMargin + lineSpacing * 1.32f, trebleTopY, lineSpacing, trebleClefColor)
         if (grandStaff) {
-            drawBassClef(canvas, leftMargin + lineSpacing * 1.30f, bassTopY, lineSpacing, palette.inkColor)
+            drawBassClef(canvas, leftMargin + lineSpacing * 1.28f, bassTopY, lineSpacing, bassClefColor)
         }
 
         val headerKey = melody.keySignatureAtBar(visibleFirstBar)
         val keyRightX = if (headerKey.safeFifths != 0) {
-            val kStart = leftMargin + lineSpacing * 2.52f
+            val kStart = leftMargin + lineSpacing * 2.50f
             val endTreble = drawKeySignatureGroup(
                 canvas = canvas,
                 leftX = kStart,
@@ -1066,10 +1210,10 @@ object StaffScoreEngraver {
             }
             endTreble
         } else {
-            leftMargin + lineSpacing * 2.55f
+            leftMargin + lineSpacing * 2.52f
         }
 
-        val timeSigX = max(leftMargin + lineSpacing * 3.55f, keyRightX + lineSpacing * 0.85f)
+        val timeSigX = max(leftMargin + lineSpacing * 3.50f, keyRightX + lineSpacing * 0.82f)
         drawTimeSignature(
             canvas = canvas,
             centerX = timeSigX,
@@ -1098,6 +1242,37 @@ object StaffScoreEngraver {
         canvas.drawLine(clefHeaderWidth, trebleTopY, clefHeaderWidth, bottomStaffBottomY, sepPaint)
 
         return hitTargets
+    }
+
+    /**
+     * Maps an X/Y tap coordinate on the interactive single-strip staff back to both a 1/16th-aligned `cursorTick`
+     * AND the tapped [StaffPart] (`TREBLE` upper staff vs `BASS` lower staff when Grand Staff is enabled).
+     */
+    fun mapTouchToTickAndStaff(
+        touchX: Float,
+        touchY: Float,
+        viewportHeight: Float,
+        scrollX: Float,
+        clefHeaderWidth: Float,
+        barWidth: Float,
+        lineSpacingEstimate: Float,
+        totalBars: Int,
+        melody: MelodyStudioUiState
+    ): Pair<Int, StaffPart> {
+        val tick = mapTouchXToTick(
+            touchX = touchX,
+            scrollX = scrollX,
+            clefHeaderWidth = clefHeaderWidth,
+            barWidth = barWidth,
+            lineSpacingEstimate = lineSpacingEstimate,
+            totalBars = totalBars,
+            melody = melody
+        )
+        val vMetrics = computeTimelineVerticalMetrics(viewportHeight, melody)
+        if (!vMetrics.grandStaff) return tick to StaffPart.TREBLE
+        val splitY = (vMetrics.trebleTopY + vMetrics.staffHeight + vMetrics.bassTopY) * 0.5f
+        val staff = if (touchY >= splitY) StaffPart.BASS else StaffPart.TREBLE
+        return tick to staff
     }
 
     /**
@@ -1202,7 +1377,8 @@ object StaffScoreEngraver {
         val maxMarkTick = maxOf(
             melody.dynamicMarks.maxOfOrNull { it.tick } ?: 0,
             melody.hairpins.maxOfOrNull { it.safeEndTick } ?: 0,
-            melody.tempoEvents.maxOfOrNull { it.safeEndTick } ?: 0
+            melody.tempoEvents.maxOfOrNull { it.safeEndTick } ?: 0,
+            melody.chordSymbols.maxOfOrNull { it.safeTick + TICKS_PER_STEP } ?: 0
         )
         val maxKeyBar = (melody.keySignatureEvents.maxOfOrNull { it.safeBarIndex + 1 } ?: 1)
         val totalBars = maxOf(
@@ -1219,7 +1395,7 @@ object StaffScoreEngraver {
             else -> 2
         }
         val totalSystems = ceil(totalBars / barsPerSystem.toFloat()).toInt().coerceAtLeast(1)
-        val grandStaff = needsGrandStaff(melody.notes)
+        val grandStaff = isEffectiveGrandStaff(melody)
 
         val lineSpacingDp = when {
             viewportWidthDp >= 820f -> if (grandStaff) 7.4f else 8.4f
@@ -1231,15 +1407,17 @@ object StaffScoreEngraver {
         val grandGap = lineSpacing * 3.4f
         val systemBlockHeight = if (grandStaff) (staffHeight * 2f + grandGap) else staffHeight
 
+        val hasChordMarks = melody.showChordSymbols && melody.chordSymbols.isNotEmpty()
         val hasTopMarks = melody.tempoEvents.isNotEmpty() ||
             melody.keySignatureEvents.isNotEmpty() ||
             melody.notes.any { it.hasFermata || it.accent == NoteAccent.MARCATO }
         val hasBottomMarks = melody.dynamicMarks.isNotEmpty() || melody.hairpins.isNotEmpty()
+        val topExtra = (if (hasTopMarks) 1.0f else 0f) + (if (hasChordMarks) 1.45f else 0f)
 
-        val topPadding = lineSpacing * (if (hasTopMarks) 3.7f else 3.1f)
+        val topPadding = lineSpacing * (3.15f + topExtra)
         val interSystemGap = lineSpacing * (
             4.8f +
-                (if (hasTopMarks) 1.0f else 0f) +
+                topExtra +
                 (if (hasBottomMarks) 1.0f else 0f)
             )
         val systemRowStride = systemBlockHeight + interSystemGap
@@ -1249,7 +1427,7 @@ object StaffScoreEngraver {
             systemBlockHeight +
             bottomPadding
 
-        val marginLeftX = (if (viewportWidthDp >= 600f) 16f else 10f) * safeDensity
+        val marginLeftX = (if (viewportWidthDp >= 600f) 18f else 13f) * safeDensity
         val marginRightX = (if (viewportWidthDp >= 600f) 20f else 14f) * safeDensity
         val contentWidth = (safeWidth - marginLeftX - marginRightX).coerceAtLeast(lineSpacing * 18f)
 
@@ -1463,12 +1641,36 @@ object StaffScoreEngraver {
                         activePlayBarTintPaint
                     )
                 } else if (!melody.isRecording && bar == cursorBarIdx) {
-                    canvas.drawRoundRect(
-                        RectF(bLeft + 1f, trebleTopY - lineSpacing * 0.6f, bRight - 1f, sysBottomY + lineSpacing * 0.6f),
-                        lineSpacing * 0.45f,
-                        lineSpacing * 0.45f,
-                        activeCursorBarTintPaint
-                    )
+                    if (grandStaff) {
+                        val ghostBarPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                            color = Color.argb(9, 201, 100, 66)
+                            style = Paint.Style.FILL
+                        }
+                        canvas.drawRoundRect(
+                            RectF(bLeft + 1f, trebleTopY - lineSpacing * 0.55f, bRight - 1f, sysBottomY + lineSpacing * 0.55f),
+                            lineSpacing * 0.45f,
+                            lineSpacing * 0.45f,
+                            ghostBarPaint
+                        )
+                        val actTopY = if (melody.activeStaff == StaffPart.BASS) bassTopY else trebleTopY
+                        val actStaffPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                            color = Color.argb(28, 201, 100, 66)
+                            style = Paint.Style.FILL
+                        }
+                        canvas.drawRoundRect(
+                            RectF(bLeft + 1f, actTopY - lineSpacing * 0.55f, bRight - 1f, actTopY + staffH + lineSpacing * 0.55f),
+                            lineSpacing * 0.42f,
+                            lineSpacing * 0.42f,
+                            actStaffPaint
+                        )
+                    } else {
+                        canvas.drawRoundRect(
+                            RectF(bLeft + 1f, trebleTopY - lineSpacing * 0.6f, bRight - 1f, sysBottomY + lineSpacing * 0.6f),
+                            lineSpacing * 0.45f,
+                            lineSpacing * 0.45f,
+                            activeCursorBarTintPaint
+                        )
+                    }
                 }
             }
 
@@ -1478,10 +1680,31 @@ object StaffScoreEngraver {
                 drawFiveLines(canvas, marginX, marginX + hGeom.systemActualW, bassTopY, lineSpacing, palette.staffLineColor)
             }
             canvas.drawLine(marginX, trebleTopY, marginX, sysBottomY, leftBracePaint)
-
-            drawTrebleClef(canvas, marginX + lineSpacing * 1.30f, trebleTopY, lineSpacing, palette.inkColor)
             if (grandStaff) {
-                drawBassClef(canvas, marginX + lineSpacing * 1.25f, bassTopY, lineSpacing, palette.inkColor)
+                drawPianoGrandBrace(
+                    canvas = canvas,
+                    barLineX = marginX,
+                    topY = trebleTopY,
+                    bottomY = sysBottomY,
+                    lineSpacing = lineSpacing,
+                    color = palette.inkColor
+                )
+            }
+
+            val isCursorSystem = !melody.isRecording && (cursorBarIdx in hGeom.startBar..hGeom.endBar)
+            val trebleClefCol = if (grandStaff && isCursorSystem && melody.activeStaff == StaffPart.TREBLE) {
+                palette.cursorColor
+            } else {
+                palette.inkColor
+            }
+            val bassClefCol = if (grandStaff && isCursorSystem && melody.activeStaff == StaffPart.BASS) {
+                palette.cursorColor
+            } else {
+                palette.inkColor
+            }
+            drawTrebleClef(canvas, marginX + lineSpacing * 1.30f, trebleTopY, lineSpacing, trebleClefCol)
+            if (grandStaff) {
+                drawBassClef(canvas, marginX + lineSpacing * 1.25f, bassTopY, lineSpacing, bassClefCol)
             }
 
             val sysKeyEndX = if (hGeom.sysStartKey.safeFifths != 0) {
@@ -1736,6 +1959,7 @@ object StaffScoreEngraver {
             renderSystemPhraseSlurs(
                 canvas = canvas,
                 allScoreNotes = melody.notes,
+                grandStaff = grandStaff,
                 chordAnchors = sysChordAnchors,
                 tupletObstacles = sysTupletObstacles,
                 pendingFermatas = sysPendingFermatas,
@@ -1788,6 +2012,33 @@ object StaffScoreEngraver {
                 outHitTargets = hitTargets
             )
 
+            val sysTopRoomY = trebleTopY - (layout.systemRowStride - layout.systemBlockHeight) * 0.85f
+            val hasSysModPill = (hGeom.startBar..hGeom.endBar).any { b ->
+                b >= 1 && melody.keySignatureEventAtBar(b) != null
+            }
+            val sysChordTopY = if (melody.showChordSymbols && melody.chordSymbols.isNotEmpty()) {
+                renderSystemChordSymbols(
+                    canvas = canvas,
+                    chordSymbols = melody.chordSymbols,
+                    sysStartTick = sysStartTick,
+                    sysEndTick = sysEndTick,
+                    isContinuousTimeline = false,
+                    tickToX = sysTickToX,
+                    trebleTopY = trebleTopY,
+                    hasModulationPills = hasSysModPill,
+                    chordAnchors = sysChordAnchors,
+                    pendingFermatas = sysPendingFermatas,
+                    viewportMinTopY = sysTopRoomY,
+                    lineSpacing = lineSpacing,
+                    inkColor = palette.inkColor,
+                    selectedColor = palette.selectedColor,
+                    selectedAnnotation = melody.selectedAnnotation,
+                    outHitTargets = hitTargets
+                )
+            } else {
+                null
+            }
+
             renderSystemTempoEvents(
                 canvas = canvas,
                 tempoEvents = melody.tempoEvents,
@@ -1800,7 +2051,8 @@ object StaffScoreEngraver {
                 trebleTopY = trebleTopY,
                 chordAnchors = sysChordAnchors,
                 pendingFermatas = sysPendingFermatas,
-                viewportMinTopY = trebleTopY - lineSpacing * 3.2f,
+                extraTopClearanceY = sysChordTopY,
+                viewportMinTopY = sysTopRoomY - lineSpacing * 0.4f,
                 lineSpacing = lineSpacing,
                 inkColor = palette.expressionInkColor,
                 selectedColor = palette.selectedColor,
@@ -1808,7 +2060,7 @@ object StaffScoreEngraver {
                 outHitTargets = hitTargets
             )
 
-            // Draw Step Input Cursor on whichever row holds `cursorTick`
+            // Draw Step Input Cursor on whichever row holds `cursorTick` (highlighting active staff in Grand Staff mode!)
             if (!melody.isRecording && cursorBarIdx in hGeom.startBar..hGeom.endBar) {
                 val bOff = (cursorBarIdx - hGeom.startBar).coerceIn(0, sysMeasureGeoms.lastIndex)
                 val mg = sysMeasureGeoms[bOff]
@@ -1819,17 +2071,39 @@ object StaffScoreEngraver {
                     melody.activeTuplet != null -> palette.selectedColor
                     else -> palette.cursorColor
                 }
+                if (grandStaff) {
+                    val ghostPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                        color = Color.argb(
+                            68,
+                            Color.red(cursorColorActual),
+                            Color.green(cursorColorActual),
+                            Color.blue(cursorColorActual)
+                        )
+                        strokeWidth = max(1.1f, lineSpacing * 0.11f)
+                        style = Paint.Style.STROKE
+                        pathEffect = DashPathEffect(floatArrayOf(lineSpacing * 0.45f, lineSpacing * 0.55f), 0f)
+                    }
+                    canvas.drawLine(
+                        cx,
+                        trebleTopY - lineSpacing * 0.55f,
+                        cx,
+                        sysBottomY + lineSpacing * 0.55f,
+                        ghostPaint
+                    )
+                }
+                val activeTopY = if (grandStaff && melody.activeStaff == StaffPart.BASS) bassTopY else trebleTopY
+                val activeBotY = if (grandStaff) (activeTopY + staffH) else sysBottomY
                 val cursorPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                     color = cursorColorActual
-                    strokeWidth = max(1.8f, lineSpacing * 0.17f)
+                    strokeWidth = max(1.9f, lineSpacing * 0.17f)
                     style = Paint.Style.STROKE
                     pathEffect = DashPathEffect(floatArrayOf(lineSpacing * 0.65f, lineSpacing * 0.45f), 0f)
                 }
                 canvas.drawLine(
                     cx,
-                    trebleTopY - lineSpacing * 1.05f,
+                    activeTopY - lineSpacing * 1.05f,
                     cx,
-                    sysBottomY + lineSpacing * 1.05f,
+                    activeBotY + lineSpacing * 1.05f,
                     cursorPaint
                 )
                 val triPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -1837,7 +2111,7 @@ object StaffScoreEngraver {
                     style = Paint.Style.FILL
                 }
                 val tri = Path().apply {
-                    val topY = trebleTopY - lineSpacing * 1.32f
+                    val topY = activeTopY - lineSpacing * 1.32f
                     val sz = lineSpacing * 0.48f
                     moveTo(cx - sz, topY)
                     lineTo(cx + sz, topY)
@@ -1874,6 +2148,7 @@ object StaffScoreEngraver {
 
         // Empty Score Watermark
         if (melody.notes.isEmpty() &&
+            melody.chordSymbols.isEmpty() &&
             melody.dynamicMarks.isEmpty() &&
             melody.hairpins.isEmpty() &&
             melody.tempoEvents.isEmpty() &&
@@ -1888,8 +2163,13 @@ object StaffScoreEngraver {
                 viewportHeight - max(10f, lineSpacing * 0.75f),
                 layout.totalContentHeight - scrollY - lineSpacing * 0.4f
             ).coerceAtLeast(lineSpacing * 2.5f)
+            val pageHint = if (grandStaff) {
+                "点上方高音谱写右手、点下方低音谱写左手 · 支持和弦标记 · 上下滑动浏览整页乐谱"
+            } else {
+                "点击任意小节定位试听/打谱 · 支持双行钢琴谱与和弦标记 · 点右上角「全屏看谱」放大检阅"
+            }
             canvas.drawText(
-                "点击任意小节定位试听/打谱 · 上下滑动浏览整页乐谱 · 点右上角「全屏看谱」放大检阅",
+                pageHint,
                 viewportWidth * 0.5f,
                 hintY,
                 hintPaint
@@ -2047,6 +2327,29 @@ object StaffScoreEngraver {
         return rawTick.coerceIn(0, maxTick)
     }
 
+    fun mapPageTouchToTickAndStaff(
+        touchX: Float,
+        touchY: Float,
+        scrollY: Float,
+        layout: PageStaffLayout,
+        melody: MelodyStudioUiState
+    ): Pair<Int, StaffPart> {
+        val tick = mapPageTouchToTick(
+            touchX = touchX,
+            touchY = touchY,
+            scrollY = scrollY,
+            layout = layout,
+            melody = melody
+        )
+        if (!layout.grandStaff) return tick to StaffPart.TREBLE
+        val worldY = (touchY + scrollY).coerceAtLeast(0f)
+        val sysIdx = resolvePageSystemIndexAtWorldY(worldY, layout)
+        val trebleTopWorldY = layout.systemTrebleTopWorldY(sysIdx)
+        val splitWorldY = trebleTopWorldY + layout.staffHeight + layout.grandGap * 0.5f
+        val staff = if (worldY >= splitWorldY) StaffPart.BASS else StaffPart.TREBLE
+        return tick to staff
+    }
+
     // ========================================================================
     // 2. Multi-Page Vector A4 PDF Sheet Music Exporter
     // ========================================================================
@@ -2068,6 +2371,7 @@ object StaffScoreEngraver {
         val quarterBeatsPerBar = timeSig.quarterBeatsPerBar.coerceAtLeast(0.25f)
         val maxBeat = melody.notes.maxOfOrNull { it.endBeat } ?: 0f
         val maxMarkTick = maxOf(
+            melody.chordSymbols.maxOfOrNull { it.safeTick + TICKS_PER_STEP } ?: 0,
             melody.dynamicMarks.maxOfOrNull { it.tick } ?: 0,
             melody.hairpins.maxOfOrNull { it.safeEndTick } ?: 0,
             melody.tempoEvents.maxOfOrNull { it.safeEndTick } ?: 0
@@ -2079,11 +2383,12 @@ object StaffScoreEngraver {
             maxKeyBar
         )
         val totalBars = max(
-            if (melody.notes.isEmpty()) melody.totalBars else barsFromNotes,
+            if (melody.notes.isEmpty() && melody.chordSymbols.isEmpty()) melody.totalBars else barsFromNotes,
             min(melody.totalBars, max(1, barsFromNotes))
         ).coerceAtLeast(1)
 
-        val grandStaff = needsGrandStaff(melody.notes)
+        val grandStaff = isEffectiveGrandStaff(melody)
+        val hasPdfChords = melody.showChordSymbols && melody.chordSymbols.isNotEmpty()
         val barsPerSystem = if (ticksPerBar > 1200) 3 else 4
         val totalSystems = ceil(totalBars / barsPerSystem.toFloat()).toInt().coerceAtLeast(1)
 
@@ -2091,7 +2396,8 @@ object StaffScoreEngraver {
         val staffH = lineSpacing * 4f
         val grandGap = lineSpacing * 3.5f
         val systemBlockH = if (grandStaff) (staffH * 2f + grandGap) else staffH
-        val systemRowSpacing = if (grandStaff) (systemBlockH + 66f) else (systemBlockH + 62f)
+        val chordExtraGap = if (hasPdfChords) 14f else 0f
+        val systemRowSpacing = (if (grandStaff) (systemBlockH + 66f) else (systemBlockH + 62f)) + chordExtraGap
 
         val symbols = buildBarSymbols(
             notes = melody.notes,
@@ -2174,7 +2480,7 @@ object StaffScoreEngraver {
                         strokeWidth = 0.8f
                     }
                     canvas.drawLine(marginX, 86f, pageW - marginX, 86f, rulePaint)
-                    126f
+                    if (hasPdfChords) 134f else 126f
                 } else {
                     val runHeaderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                         color = mutedInk
@@ -2182,7 +2488,7 @@ object StaffScoreEngraver {
                         typeface = Typeface.create(Typeface.SERIF, Typeface.ITALIC)
                     }
                     canvas.drawText("$titleText（续）", marginX, 40f, runHeaderPaint)
-                    84f
+                    if (hasPdfChords) 92f else 84f
                 }
 
                 val bottomLimit = pageH - 58f
@@ -2255,6 +2561,16 @@ object StaffScoreEngraver {
                         strokeWidth = if (grandStaff) 1.5f else 0.9f
                     }
                     canvas.drawLine(marginX, trebleTopY, marginX, sysBottomY, leftBracePaint)
+                    if (grandStaff) {
+                        drawPianoGrandBrace(
+                            canvas = canvas,
+                            barLineX = marginX,
+                            topY = trebleTopY,
+                            bottomY = sysBottomY,
+                            lineSpacing = lineSpacing,
+                            color = ink
+                        )
+                    }
 
                     drawTrebleClef(canvas, marginX + lineSpacing * 1.30f, trebleTopY, lineSpacing, ink)
                     if (grandStaff) {
@@ -2464,6 +2780,7 @@ object StaffScoreEngraver {
                     renderSystemPhraseSlurs(
                         canvas = canvas,
                         allScoreNotes = melody.notes,
+                        grandStaff = grandStaff,
                         chordAnchors = sysChordAnchors,
                         tupletObstacles = sysTupletObstacles,
                         pendingFermatas = sysPendingFermatas,
@@ -2516,6 +2833,32 @@ object StaffScoreEngraver {
                         outHitTargets = null
                     )
 
+                    val hasPdfSysModLabel = (startBar..endBar).any { b ->
+                        b >= 1 && melody.keySignatureEventAtBar(b) != null
+                    }
+                    val pdfChordTopY = if (hasPdfChords) {
+                        renderSystemChordSymbols(
+                            canvas = canvas,
+                            chordSymbols = melody.chordSymbols,
+                            sysStartTick = sysStartTick,
+                            sysEndTick = sysEndTick,
+                            isContinuousTimeline = false,
+                            tickToX = pdfTickToX,
+                            trebleTopY = trebleTopY,
+                            hasModulationPills = hasPdfSysModLabel,
+                            chordAnchors = sysChordAnchors,
+                            pendingFermatas = sysPendingFermatas,
+                            viewportMinTopY = trebleTopY - 38f,
+                            lineSpacing = lineSpacing,
+                            inkColor = ink,
+                            selectedColor = ink,
+                            selectedAnnotation = null,
+                            outHitTargets = null
+                        )
+                    } else {
+                        null
+                    }
+
                     renderSystemTempoEvents(
                         canvas = canvas,
                         tempoEvents = melody.tempoEvents,
@@ -2528,7 +2871,8 @@ object StaffScoreEngraver {
                         trebleTopY = trebleTopY,
                         chordAnchors = sysChordAnchors,
                         pendingFermatas = sysPendingFermatas,
-                        viewportMinTopY = trebleTopY - 26f,
+                        extraTopClearanceY = pdfChordTopY,
+                        viewportMinTopY = trebleTopY - 42f,
                         lineSpacing = lineSpacing,
                         inkColor = ink,
                         selectedColor = ink,
@@ -2634,6 +2978,7 @@ object StaffScoreEngraver {
                     outPendingFermatas += PendingFermataRender(
                         xCenter = rx,
                         staffTopY = staffTopY,
+                        useBassStaff = isBass,
                         minClearanceTopY = staffTopY - lineSpacing * 0.45f,
                         color = if (isSelected) selectedColor else slot0Color
                     )
@@ -3165,6 +3510,7 @@ object StaffScoreEngraver {
                         outPendingFermatas += PendingFermataRender(
                             xCenter = sg.cx,
                             staffTopY = staffTopY,
+                            useBassStaff = isBass,
                             minClearanceTopY = min(curTopExt, staffTopY - lineSpacing * 0.35f),
                             color = sg.color
                         )
@@ -3314,6 +3660,7 @@ object StaffScoreEngraver {
     private fun renderSystemPhraseSlurs(
         canvas: Canvas,
         allScoreNotes: List<MelodyScoreNote>,
+        grandStaff: Boolean,
         chordAnchors: MutableList<RenderedChordAnchor>,
         tupletObstacles: List<RenderedTupletObstacle>,
         pendingFermatas: MutableList<PendingFermataRender>,
@@ -3336,9 +3683,10 @@ object StaffScoreEngraver {
         val slurredGroups = allScoreNotes
             .asSequence()
             .filter { !it.isRest && it.slurGroupId != null }
-            .groupBy { it.slurGroupId!! }
+            .groupBy { it.slurGroupId!! to it.resolvedStaffPart(grandStaff) }
 
-        for ((slurId, groupNotes) in slurredGroups) {
+        for ((slurStaffKey, groupNotes) in slurredGroups) {
+            val (slurId, staffPart) = slurStaffKey
             val distinctOnsets = groupNotes.map { it.resolvedStartTick }.distinct().sorted()
             if (distinctOnsets.size < 2) continue
 
@@ -3348,19 +3696,19 @@ object StaffScoreEngraver {
             if (phraseMaxEndTick <= sysStartTick || phraseFirstTick >= sysEndTick) continue
 
             val groupNoteIds = groupNotes.map { it.id }.toSet()
+            val onBass = grandStaff && (staffPart == StaffPart.BASS)
             val matchingAnchors = chordAnchors
-                .filter { anchor -> slurId in anchor.slurGroupIds || anchor.sourceNoteIds.any { it in groupNoteIds } }
+                .filter { anchor ->
+                    anchor.useBassStaff == onBass &&
+                        (slurId in anchor.slurGroupIds || anchor.sourceNoteIds.any { it in groupNoteIds })
+                }
                 .sortedBy { it.absStartTick }
 
-            // Choose predominant staff (`treble` vs `bass`) for this phrase
-            val onBass = matchingAnchors.count { it.useBassStaff } * 2 > matchingAnchors.size
             val staffTopY = if (onBass) bassTopY else trebleTopY
             val staffAnchors = chordAnchors
                 .filter { it.useBassStaff == onBass }
                 .sortedBy { it.xCenter }
             val phraseStaffAnchors = matchingAnchors
-                .filter { it.useBassStaff == onBass }
-                .ifEmpty { matchingAnchors }
                 .sortedBy { it.xCenter }
 
             val continuedFromPrevSystem = !isContinuousTimeline && phraseFirstTick < sysStartTick
@@ -3529,7 +3877,9 @@ object StaffScoreEngraver {
             }
             if (curveAbove) {
                 for (pf in pendingFermatas) {
-                    if (pf.xCenter in (x1 - lineSpacing * 0.5f)..(x2 + lineSpacing * 0.5f)) {
+                    if (pf.useBassStaff == onBass &&
+                        pf.xCenter in (x1 - lineSpacing * 0.5f)..(x2 + lineSpacing * 0.5f)
+                    ) {
                         val t = ((pf.xCenter - x1) / spanW).coerceIn(0f, 1f)
                         val curveY = y1 + (y2 - y1) * t - (3f * t * (1f - t) * clampedArchMag)
                         pf.minClearanceTopY = min(pf.minClearanceTopY, curveY - lineSpacing * 0.25f)
@@ -3708,6 +4058,181 @@ object StaffScoreEngraver {
     }
 
     // ========================================================================
+    // System-Level Above-Staff Letter Chord Symbols (`Cmaj7`, `G/B`, `F#m7-5`)
+    // ========================================================================
+
+    private data class ChordDisplayParts(
+        val root: String,
+        val quality: String,
+        val slashBass: String
+    )
+
+    private fun splitChordDisplayParts(rawSymbol: String): ChordDisplayParts {
+        val clean = rawSymbol.trim()
+            .replace("♯", "#")
+            .replace("♭", "b")
+        if (clean.isEmpty()) return ChordDisplayParts("", "", "")
+        val first = clean[0]
+        if (first !in 'A'..'G' && first !in 'a'..'g') {
+            return ChordDisplayParts(clean, "", "")
+        }
+        var rootEnd = 1
+        while (rootEnd < clean.length && (clean[rootEnd] == '#' || clean[rootEnd] == 'b')) {
+            rootEnd++
+        }
+        val root = clean[0].uppercaseChar() + clean.substring(1, rootEnd)
+        val rest = clean.substring(rootEnd)
+
+        val lastSlash = rest.lastIndexOf('/')
+        if (lastSlash >= 0) {
+            val before = rest.substring(0, lastSlash)
+            val after = rest.substring(lastSlash + 1)
+            val isSixNine = after == "9" && (before.endsWith("6") || before.endsWith("m6"))
+            if (!isSixNine && after.isNotEmpty() && (after[0] in 'A'..'G' || after[0] in 'a'..'g')) {
+                val normBass = after[0].uppercaseChar() + after.substring(1)
+                return ChordDisplayParts(root, before, "/$normBass")
+            }
+        }
+        return ChordDisplayParts(root, rest, "")
+    }
+
+    private fun renderSystemChordSymbols(
+        canvas: Canvas,
+        chordSymbols: List<ScoreChordSymbol>,
+        sysStartTick: Int,
+        sysEndTick: Int,
+        isContinuousTimeline: Boolean,
+        tickToX: (Int) -> Float,
+        trebleTopY: Float,
+        hasModulationPills: Boolean,
+        chordAnchors: List<RenderedChordAnchor>,
+        pendingFermatas: List<PendingFermataRender>,
+        viewportMinTopY: Float,
+        lineSpacing: Float,
+        inkColor: Int,
+        selectedColor: Int,
+        selectedAnnotation: SelectedScoreAnnotation?,
+        outHitTargets: MutableList<StaffHitTarget>?
+    ): Float? {
+        val visible = chordSymbols.filter { cs ->
+            val t = cs.safeTick
+            if (isContinuousTimeline) t in sysStartTick..sysEndTick else (t >= sysStartTick && t < sysEndTick)
+        }.sortedBy { it.safeTick }
+        if (visible.isEmpty()) return null
+
+        var minAboveY = trebleTopY - lineSpacing * (if (hasModulationPills) 2.68f else 2.18f)
+        for (anchor in chordAnchors) {
+            if (!anchor.useBassStaff) {
+                minAboveY = min(minAboveY, anchor.topExtremeY - lineSpacing * 0.72f)
+            }
+        }
+        for (pf in pendingFermatas) {
+            if (!pf.useBassStaff) {
+                minAboveY = min(minAboveY, pf.minClearanceTopY - lineSpacing * 0.58f)
+            }
+        }
+        val baselineY = max(viewportMinTopY, minAboveY)
+
+        val rootTextSize = max(10.2f, lineSpacing * 1.34f)
+        val qualTextSize = max(8.4f, lineSpacing * 1.04f)
+        val slashTextSize = max(9.4f, lineSpacing * 1.20f)
+
+        val rootPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            textSize = rootTextSize
+            typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+            textAlign = Paint.Align.LEFT
+        }
+        val qualPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            textSize = qualTextSize
+            typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+            textAlign = Paint.Align.LEFT
+        }
+        val slashPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            textSize = slashTextSize
+            typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+            textAlign = Paint.Align.LEFT
+        }
+
+        val defaultChordInk = if (outHitTargets == null) {
+            // PDF crisp dark ink
+            inkColor
+        } else {
+            // Warm studio teal-slate accent so chord symbols stand out legibly from bar numbers & tempo text
+            Color.rgb(26, 92, 108)
+        }
+
+        var lastRightX = -10_000f
+        for (cs in visible) {
+            val parts = splitChordDisplayParts(cs.symbol)
+            if (parts.root.isEmpty()) continue
+
+            val isSel = (selectedAnnotation as? SelectedScoreAnnotation.ChordSymbol)?.id == cs.id
+            val drawColor = if (isSel) selectedColor else defaultChordInk
+            rootPaint.color = drawColor
+            qualPaint.color = drawColor
+            slashPaint.color = drawColor
+
+            val rootW = rootPaint.measureText(parts.root)
+            val qualW = if (parts.quality.isNotEmpty()) qualPaint.measureText(parts.quality) else 0f
+            val slashW = if (parts.slashBass.isNotEmpty()) slashPaint.measureText(parts.slashBass) else 0f
+            val totalW = rootW + qualW + slashW
+
+            val anchorX = tickToX(cs.safeTick)
+            val rawLeftX = anchorX - min(rootW * 0.36f, lineSpacing * 0.45f)
+            val drawLeftX = max(rawLeftX, lastRightX + lineSpacing * 0.36f)
+            val drawRightX = drawLeftX + totalW
+
+            val padX = lineSpacing * 0.38f
+            val hitHalfExtra = max(0f, (lineSpacing * 2.1f - (totalW + padX * 2f)) * 0.5f)
+            val pillRect = RectF(
+                drawLeftX - padX,
+                baselineY - rootTextSize * 1.02f,
+                drawRightX + padX,
+                baselineY + lineSpacing * 0.34f
+            )
+            val hitRect = RectF(
+                pillRect.left - hitHalfExtra,
+                pillRect.top - lineSpacing * 0.22f,
+                pillRect.right + hitHalfExtra,
+                pillRect.bottom + lineSpacing * 0.25f
+            )
+
+            if (isSel) {
+                drawSelectionPillBg(canvas, pillRect, lineSpacing, selectedColor)
+            } else if (outHitTargets != null) {
+                // Very subtle warm-cream backing pill on interactive screen so chords pop cleanly and invite tapping
+                val subtleBg = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = Color.argb(30, 26, 92, 108)
+                    style = Paint.Style.FILL
+                }
+                canvas.drawRoundRect(pillRect, lineSpacing * 0.32f, lineSpacing * 0.32f, subtleBg)
+            }
+
+            var cx = drawLeftX
+            canvas.drawText(parts.root, cx, baselineY, rootPaint)
+            cx += rootW
+            if (parts.quality.isNotEmpty()) {
+                canvas.drawText(parts.quality, cx, baselineY - lineSpacing * 0.08f, qualPaint)
+                cx += qualW
+            }
+            if (parts.slashBass.isNotEmpty()) {
+                canvas.drawText(parts.slashBass, cx, baselineY, slashPaint)
+            }
+
+            lastRightX = drawRightX + lineSpacing * 0.15f
+            outHitTargets?.add(
+                StaffHitTarget(
+                    annotation = SelectedScoreAnnotation.ChordSymbol(cs.id),
+                    bounds = hitRect,
+                    startTick = cs.safeTick
+                )
+            )
+        }
+
+        return baselineY - rootTextSize * 1.08f
+    }
+
+    // ========================================================================
     // System-Level Tempo Map Marks (`Allegro ♩=xx`, `rit.`, `accel.`, `a tempo`)
     // ========================================================================
 
@@ -3723,6 +4248,7 @@ object StaffScoreEngraver {
         trebleTopY: Float,
         chordAnchors: List<RenderedChordAnchor>,
         pendingFermatas: List<PendingFermataRender>,
+        extraTopClearanceY: Float? = null,
         viewportMinTopY: Float,
         lineSpacing: Float,
         inkColor: Int,
@@ -3739,7 +4265,12 @@ object StaffScoreEngraver {
             }
         }
         for (pf in pendingFermatas) {
-            minAboveY = min(minAboveY, pf.minClearanceTopY - lineSpacing * 0.65f)
+            if (!pf.useBassStaff) {
+                minAboveY = min(minAboveY, pf.minClearanceTopY - lineSpacing * 0.65f)
+            }
+        }
+        if (extraTopClearanceY != null) {
+            minAboveY = min(minAboveY, extraTopClearanceY - lineSpacing * 0.52f)
         }
         val baselineY = max(viewportMinTopY, minAboveY)
 
@@ -4767,5 +5298,62 @@ object StaffScoreEngraver {
         val padX = lineSpacing * 0.85f
         val padY = lineSpacing * 1.45f
         return RectF(x - padX, midY - padY, x + padX, midY + padY)
+    }
+
+    /**
+     * Classical engraved Piano Grand Staff curly brace (`{`) spanning [topY]..[bottomY]
+     * immediately to the left of [barLineX].
+     */
+    private fun drawPianoGrandBrace(
+        canvas: Canvas,
+        barLineX: Float,
+        topY: Float,
+        bottomY: Float,
+        lineSpacing: Float,
+        color: Int
+    ) {
+        val totalH = bottomY - topY
+        if (totalH <= lineSpacing * 4f) return
+
+        val midY = (topY + bottomY) * 0.5f
+        val halfH = totalH * 0.5f
+        val rightEdgeX = barLineX - lineSpacing * 0.16f
+        val tipLeftX = rightEdgeX - lineSpacing * 0.78f
+        val outerBellyX = rightEdgeX - lineSpacing * 0.56f
+        val innerBellyX = rightEdgeX - lineSpacing * 0.24f
+
+        val path = Path().apply {
+            // Top tip -> outer upper S-curve -> left-pointing center nib
+            moveTo(rightEdgeX, topY)
+            cubicTo(
+                outerBellyX, topY + halfH * 0.14f,
+                rightEdgeX - lineSpacing * 0.04f, midY - halfH * 0.28f,
+                tipLeftX, midY
+            )
+            // Left-pointing center nib -> outer lower S-curve -> bottom tip
+            cubicTo(
+                rightEdgeX - lineSpacing * 0.04f, midY + halfH * 0.28f,
+                outerBellyX, bottomY - halfH * 0.14f,
+                rightEdgeX, bottomY
+            )
+            // Return up along the inner tapered contour -> inner center -> top tip
+            cubicTo(
+                innerBellyX, bottomY - halfH * 0.18f,
+                rightEdgeX - lineSpacing * 0.26f, midY + halfH * 0.20f,
+                tipLeftX + lineSpacing * 0.24f, midY
+            )
+            cubicTo(
+                rightEdgeX - lineSpacing * 0.26f, midY - halfH * 0.20f,
+                innerBellyX, topY + halfH * 0.18f,
+                rightEdgeX, topY
+            )
+            close()
+        }
+
+        val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.color = color
+            style = Paint.Style.FILL
+        }
+        canvas.drawPath(path, fillPaint)
     }
 }

@@ -531,6 +531,22 @@ data class NoteTupletTag(
     val groupKey: String get() = "${groupStartTick}_${spanTicks}_${count}_${writtenBaseDenom}"
 }
 
+/**
+ * Explicit staff part assignment (`目标谱表归属`) in Dual-Row Piano Grand Staff (`双行钢琴大谱表`) mode.
+ */
+enum class StaffPart(val label: String, val shortLabel: String) {
+    TREBLE("上行高音谱 𝄞", "上行𝄞"),
+    BASS("下行低音谱 𝄢", "下行𝄢")
+}
+
+/**
+ * Routing behavior when BOTH Dual-Row Piano Grand Staff (`双行钢琴谱`) AND Dual Piano Keyboard (`双排键盘`) are enabled.
+ */
+enum class DualKeyboardStaffRouting(val label: String, val shortLabel: String) {
+    SPLIT_BY_DECK("上排写上行 · 下排写下行", "分排写入"),
+    FOLLOW_ACTIVE_STAFF("双排均写当前选中行", "跟随选中行")
+}
+
 data class MelodyScoreNote(
     val id: String = UUID.randomUUID().toString(),
     val midiNote: Int,
@@ -545,7 +561,8 @@ data class MelodyScoreNote(
     val slurGroupId: String? = null,
     val articulation: NoteArticulation? = null,
     val accent: NoteAccent? = null,
-    val hasFermata: Boolean = false
+    val hasFermata: Boolean = false,
+    val targetStaff: StaffPart? = null
 ) {
     val endBeat: Float get() = startBeat + durationBeats
     val resolvedStartTick: Int
@@ -554,6 +571,16 @@ data class MelodyScoreNote(
         get() = durationTicksExact ?: (durationBeats * TICKS_PER_BEAT).roundToInt().coerceAtLeast(1)
     val resolvedEndTick: Int
         get() = resolvedStartTick + resolvedDurationTicks
+
+    /**
+     * Resolves which staff (`TREBLE` vs `BASS`) owns this note/rest when [grandStaffEnabled] is active.
+     * Uses explicit [targetStaff] whenever present, falling back to `midiNote < 56` (`G#3`) only for legacy archives.
+     */
+    fun resolvedStaffPart(grandStaffEnabled: Boolean): StaffPart {
+        if (!grandStaffEnabled) return StaffPart.TREBLE
+        targetStaff?.let { return it }
+        return if (!isRest && midiNote < 56) StaffPart.BASS else StaffPart.TREBLE
+    }
 }
 
 data class MelodyProjectSummary(
@@ -572,6 +599,9 @@ data class MelodySnapshot(
     val cursorTick: Int,
     val totalBars: Int,
     val scoreTitle: String = "未命名乐谱",
+    val grandStaffEnabled: Boolean = false,
+    val activeStaff: StaffPart = StaffPart.TREBLE,
+    val dualKeyboardStaffRouting: DualKeyboardStaffRouting = DualKeyboardStaffRouting.SPLIT_BY_DECK,
     val timeSignature: TimeSignature = TimeSignature.FOUR_FOUR,
     val initialKeySignature: KeySignature = KeySignature.C_MAJOR,
     val keySignatureEvents: List<ScoreKeySignatureEvent> = emptyList(),
@@ -587,7 +617,10 @@ data class MelodySnapshot(
     val secondarySustainDurationSec: Float = DEFAULT_SUSTAIN_DURATION_SEC,
     val dynamicMarks: List<ScoreDynamicMark> = emptyList(),
     val hairpins: List<ScoreHairpin> = emptyList(),
-    val tempoEvents: List<ScoreTempoEvent> = emptyList()
+    val tempoEvents: List<ScoreTempoEvent> = emptyList(),
+    val chordSymbols: List<ScoreChordSymbol> = emptyList(),
+    val showChordSymbols: Boolean = true,
+    val chordPlaybackEnabled: Boolean = true
 )
 
 enum class ScoreViewMode(val label: String) {
@@ -599,6 +632,9 @@ data class MelodyStudioUiState(
     val scoreTitle: String = "未命名乐谱",
     val scoreViewMode: ScoreViewMode = ScoreViewMode.PAGE_SCROLL,
     val keyboardMinimizedForScore: Boolean = false,
+    val grandStaffEnabled: Boolean = false,
+    val activeStaff: StaffPart = StaffPart.TREBLE,
+    val dualKeyboardStaffRouting: DualKeyboardStaffRouting = DualKeyboardStaffRouting.SPLIT_BY_DECK,
     val instrument: StudioInstrument = StudioInstrument.GRAND_PIANO,
     val secondaryInstrument: StudioInstrument = StudioInstrument.GRAND_PIANO,
     val dualKeyboardEnabled: Boolean = false,
@@ -633,6 +669,9 @@ data class MelodyStudioUiState(
     val dynamicMarks: List<ScoreDynamicMark> = emptyList(),
     val hairpins: List<ScoreHairpin> = emptyList(),
     val tempoEvents: List<ScoreTempoEvent> = emptyList(),
+    val chordSymbols: List<ScoreChordSymbol> = emptyList(),
+    val showChordSymbols: Boolean = true,
+    val chordPlaybackEnabled: Boolean = true,
     val selectedNoteId: String? = null,
     val selectedAnnotation: SelectedScoreAnnotation? = null,
     val currentProjectId: String? = null,
@@ -654,8 +693,30 @@ data class MelodyStudioUiState(
     val totalSteps: Int get() = totalBars * stepsPerBar
     val totalTicks: Int get() = totalBars * ticksPerBar
     val cursorStep: Int get() = cursorTick / TICKS_PER_STEP
-    val hasPlayableNotes: Boolean get() = notes.any { !it.isRest }
+    val hasPlayableNotes: Boolean
+        get() = notes.any { !it.isRest } || (chordPlaybackEnabled && chordSymbols.isNotEmpty())
     val hasMidKeyChanges: Boolean get() = keySignatureEvents.isNotEmpty()
+
+    val maxPlayableEndTick: Int
+        get() {
+            val maxNoteEnd = notes.filterNot { it.isRest }.maxOfOrNull { it.resolvedEndTick } ?: 0
+            val maxChordEnd = if (chordPlaybackEnabled && chordSymbols.isNotEmpty()) {
+                val sorted = chordSymbols.sortedBy { it.safeTick }
+                val tpb = ticksPerBar.coerceAtLeast(1)
+                sorted.indices.maxOf { idx ->
+                    val cStart = sorted[idx].safeTick
+                    val barEnd = ((cStart / tpb) + 1) * tpb
+                    val nextTick = sorted.getOrNull(idx + 1)?.safeTick ?: Int.MAX_VALUE
+                    minOf(nextTick, barEnd).coerceAtLeast(cStart + TICKS_PER_STEP)
+                }
+            } else {
+                0
+            }
+            return maxOf(maxNoteEnd, maxChordEnd)
+        }
+
+    fun chordSymbolAtTick(tick: Int = cursorTick): ScoreChordSymbol? =
+        chordSymbols.lastOrNull { kotlin.math.abs(it.safeTick - tick) <= 10 }
 
     val selectedNote: MelodyScoreNote?
         get() = selectedNoteId?.let { id -> notes.firstOrNull { it.id == id } }
@@ -816,12 +877,13 @@ object MusicalNotationHelper {
         val notes: List<MelodyScoreNote>,
         val dynamicMarks: List<ScoreDynamicMark>,
         val hairpins: List<ScoreHairpin>,
-        val tempoEvents: List<ScoreTempoEvent>
+        val tempoEvents: List<ScoreTempoEvent>,
+        val chordSymbols: List<ScoreChordSymbol>
     )
 
     /**
-     * Built-in expressive 4-bar studio audition melody (warm I - V - vi - IV arpeggio + singing melody,
-     * phrase slurs, dynamics, hairpins, triplet flourish & final rit. + Fermata) for instant audition & PDF test.
+     * Built-in expressive 4-bar studio audition melody (Grand Staff I - V - vi - IV arpeggio + singing melody,
+     * above-staff letter chord symbols, phrase slurs, dynamics, hairpins, triplet flourish & final rit. + Fermata).
      */
     fun buildDemoShowcaseBundle(): DemoScoreShowcase {
         val slurBar1 = "demo_slur_1"
@@ -830,37 +892,39 @@ object MusicalNotationHelper {
         val slurTriplet = "demo_slur_4"
 
         val items = mutableListOf<MelodyScoreNote>()
-        // Bar 1 (C Major: C3-G3-C4 accompaniment + slurred E5-D5-C5-G4 melody)
-        items += MelodyScoreNote(midiNote = 48, startBeat = 0.0f, durationBeats = 2.0f, velocity = 0.72f, keyboardSlot = 1)
-        items += MelodyScoreNote(midiNote = 55, startBeat = 0.5f, durationBeats = 1.5f, velocity = 0.66f, keyboardSlot = 1)
-        items += MelodyScoreNote(midiNote = 60, startBeat = 1.0f, durationBeats = 1.5f, velocity = 0.68f, keyboardSlot = 1)
-        items += MelodyScoreNote(midiNote = 76, startBeat = 0.0f, durationBeats = 1.5f, velocity = 0.88f, keyboardSlot = 0, slurGroupId = slurBar1)
-        items += MelodyScoreNote(midiNote = 74, startBeat = 1.5f, durationBeats = 0.5f, velocity = 0.80f, keyboardSlot = 0, slurGroupId = slurBar1)
-        items += MelodyScoreNote(midiNote = 72, startBeat = 2.0f, durationBeats = 1.0f, velocity = 0.85f, keyboardSlot = 0, slurGroupId = slurBar1)
-        items += MelodyScoreNote(midiNote = 67, startBeat = 3.0f, durationBeats = 1.0f, velocity = 0.78f, keyboardSlot = 0, slurGroupId = slurBar1)
+        // Bar 1 (C Major: C3-G3-C4 left-hand bass accompaniment + slurred E5-D5-C5-G4 right-hand melody)
+        items += MelodyScoreNote(midiNote = 48, startBeat = 0.0f, durationBeats = 2.0f, velocity = 0.72f, keyboardSlot = 1, targetStaff = StaffPart.BASS)
+        items += MelodyScoreNote(midiNote = 55, startBeat = 0.5f, durationBeats = 1.5f, velocity = 0.66f, keyboardSlot = 1, targetStaff = StaffPart.BASS)
+        items += MelodyScoreNote(midiNote = 60, startBeat = 1.0f, durationBeats = 1.5f, velocity = 0.68f, keyboardSlot = 1, targetStaff = StaffPart.BASS)
+        items += MelodyScoreNote(midiNote = 76, startBeat = 0.0f, durationBeats = 1.5f, velocity = 0.88f, keyboardSlot = 0, slurGroupId = slurBar1, targetStaff = StaffPart.TREBLE)
+        items += MelodyScoreNote(midiNote = 74, startBeat = 1.5f, durationBeats = 0.5f, velocity = 0.80f, keyboardSlot = 0, slurGroupId = slurBar1, targetStaff = StaffPart.TREBLE)
+        items += MelodyScoreNote(midiNote = 72, startBeat = 2.0f, durationBeats = 1.0f, velocity = 0.85f, keyboardSlot = 0, slurGroupId = slurBar1, targetStaff = StaffPart.TREBLE)
+        items += MelodyScoreNote(midiNote = 67, startBeat = 3.0f, durationBeats = 1.0f, velocity = 0.78f, keyboardSlot = 0, slurGroupId = slurBar1, targetStaff = StaffPart.TREBLE)
 
-        // Bar 2 (G Major: G2-D3-B3 + slurred D5-E5-B4)
-        items += MelodyScoreNote(midiNote = 43, startBeat = 4.0f, durationBeats = 2.0f, velocity = 0.72f, keyboardSlot = 1)
-        items += MelodyScoreNote(midiNote = 50, startBeat = 4.5f, durationBeats = 1.5f, velocity = 0.66f, keyboardSlot = 1)
-        items += MelodyScoreNote(midiNote = 59, startBeat = 5.0f, durationBeats = 1.5f, velocity = 0.68f, keyboardSlot = 1)
-        items += MelodyScoreNote(midiNote = 74, startBeat = 4.0f, durationBeats = 1.5f, velocity = 0.86f, keyboardSlot = 0, slurGroupId = slurBar2)
-        items += MelodyScoreNote(midiNote = 76, startBeat = 5.5f, durationBeats = 0.5f, velocity = 0.82f, keyboardSlot = 0, slurGroupId = slurBar2)
-        items += MelodyScoreNote(midiNote = 71, startBeat = 6.0f, durationBeats = 2.0f, velocity = 0.84f, keyboardSlot = 0, slurGroupId = slurBar2, articulation = NoteArticulation.TENUTO)
+        // Bar 2 (G/B: B2-D3-G3 + slurred D5-E5-B4)
+        items += MelodyScoreNote(midiNote = 47, startBeat = 4.0f, durationBeats = 2.0f, velocity = 0.72f, keyboardSlot = 1, targetStaff = StaffPart.BASS)
+        items += MelodyScoreNote(midiNote = 50, startBeat = 4.5f, durationBeats = 1.5f, velocity = 0.66f, keyboardSlot = 1, targetStaff = StaffPart.BASS)
+        items += MelodyScoreNote(midiNote = 55, startBeat = 5.0f, durationBeats = 1.5f, velocity = 0.68f, keyboardSlot = 1, targetStaff = StaffPart.BASS)
+        items += MelodyScoreNote(midiNote = 74, startBeat = 4.0f, durationBeats = 1.5f, velocity = 0.86f, keyboardSlot = 0, slurGroupId = slurBar2, targetStaff = StaffPart.TREBLE)
+        items += MelodyScoreNote(midiNote = 76, startBeat = 5.5f, durationBeats = 0.5f, velocity = 0.82f, keyboardSlot = 0, slurGroupId = slurBar2, targetStaff = StaffPart.TREBLE)
+        items += MelodyScoreNote(midiNote = 71, startBeat = 6.0f, durationBeats = 2.0f, velocity = 0.84f, keyboardSlot = 0, slurGroupId = slurBar2, articulation = NoteArticulation.TENUTO, targetStaff = StaffPart.TREBLE)
 
         // Bar 3 (A Minor: A2-E3-C4 + rising C5-D5-E5-G5 crescendo phrase)
-        items += MelodyScoreNote(midiNote = 45, startBeat = 8.0f, durationBeats = 2.0f, velocity = 0.72f, keyboardSlot = 1)
-        items += MelodyScoreNote(midiNote = 52, startBeat = 8.5f, durationBeats = 1.5f, velocity = 0.66f, keyboardSlot = 1)
-        items += MelodyScoreNote(midiNote = 60, startBeat = 9.0f, durationBeats = 1.5f, velocity = 0.68f, keyboardSlot = 1)
-        items += MelodyScoreNote(midiNote = 72, startBeat = 8.0f, durationBeats = 1.0f, velocity = 0.85f, keyboardSlot = 0, slurGroupId = slurBar3)
-        items += MelodyScoreNote(midiNote = 74, startBeat = 9.0f, durationBeats = 1.0f, velocity = 0.86f, keyboardSlot = 0, slurGroupId = slurBar3)
-        items += MelodyScoreNote(midiNote = 76, startBeat = 10.0f, durationBeats = 1.0f, velocity = 0.90f, keyboardSlot = 0, slurGroupId = slurBar3)
-        items += MelodyScoreNote(midiNote = 79, startBeat = 11.0f, durationBeats = 1.0f, velocity = 0.88f, keyboardSlot = 0, slurGroupId = slurBar3, accent = NoteAccent.ACCENT)
+        items += MelodyScoreNote(midiNote = 45, startBeat = 8.0f, durationBeats = 2.0f, velocity = 0.72f, keyboardSlot = 1, targetStaff = StaffPart.BASS)
+        items += MelodyScoreNote(midiNote = 52, startBeat = 8.5f, durationBeats = 1.5f, velocity = 0.66f, keyboardSlot = 1, targetStaff = StaffPart.BASS)
+        items += MelodyScoreNote(midiNote = 60, startBeat = 9.0f, durationBeats = 1.5f, velocity = 0.68f, keyboardSlot = 1, targetStaff = StaffPart.BASS)
+        items += MelodyScoreNote(midiNote = 72, startBeat = 8.0f, durationBeats = 1.0f, velocity = 0.85f, keyboardSlot = 0, slurGroupId = slurBar3, targetStaff = StaffPart.TREBLE)
+        items += MelodyScoreNote(midiNote = 74, startBeat = 9.0f, durationBeats = 1.0f, velocity = 0.86f, keyboardSlot = 0, slurGroupId = slurBar3, targetStaff = StaffPart.TREBLE)
+        items += MelodyScoreNote(midiNote = 76, startBeat = 10.0f, durationBeats = 1.0f, velocity = 0.90f, keyboardSlot = 0, slurGroupId = slurBar3, targetStaff = StaffPart.TREBLE)
+        items += MelodyScoreNote(midiNote = 79, startBeat = 11.0f, durationBeats = 1.0f, velocity = 0.88f, keyboardSlot = 0, slurGroupId = slurBar3, accent = NoteAccent.ACCENT, targetStaff = StaffPart.TREBLE)
 
-        // Bar 4 (F Major -> Triplet flourish G5-E5-D5 on Beat 2 -> C resolution with rit. & Fermata)
-        items += MelodyScoreNote(midiNote = 41, startBeat = 12.0f, durationBeats = 2.0f, velocity = 0.74f, keyboardSlot = 1)
-        items += MelodyScoreNote(midiNote = 48, startBeat = 12.5f, durationBeats = 1.5f, velocity = 0.66f, keyboardSlot = 1)
-        items += MelodyScoreNote(midiNote = 57, startBeat = 13.0f, durationBeats = 1.0f, velocity = 0.68f, keyboardSlot = 1)
-        items += MelodyScoreNote(midiNote = 77, startBeat = 12.0f, durationBeats = 1.0f, velocity = 0.90f, keyboardSlot = 0)
+        // Bar 4 (Fmaj7 -> Triplet flourish G5-E5-D5 on Beat 2 -> C resolution with rit. & Fermata)
+        items += MelodyScoreNote(midiNote = 41, startBeat = 12.0f, durationBeats = 2.0f, velocity = 0.74f, keyboardSlot = 1, targetStaff = StaffPart.BASS)
+        items += MelodyScoreNote(midiNote = 48, startBeat = 12.5f, durationBeats = 1.5f, velocity = 0.66f, keyboardSlot = 1, targetStaff = StaffPart.BASS)
+        items += MelodyScoreNote(midiNote = 57, startBeat = 13.0f, durationBeats = 1.0f, velocity = 0.68f, keyboardSlot = 1, targetStaff = StaffPart.BASS)
+        items += MelodyScoreNote(midiNote = 48, startBeat = 14.0f, durationBeats = 2.0f, velocity = 0.74f, keyboardSlot = 1, hasFermata = true, targetStaff = StaffPart.BASS)
+        items += MelodyScoreNote(midiNote = 55, startBeat = 14.0f, durationBeats = 2.0f, velocity = 0.68f, keyboardSlot = 1, hasFermata = true, targetStaff = StaffPart.BASS)
+        items += MelodyScoreNote(midiNote = 77, startBeat = 12.0f, durationBeats = 1.0f, velocity = 0.90f, keyboardSlot = 0, targetStaff = StaffPart.TREBLE)
         // Beat 13.0..14.0 (tick 3120..3360): Expressive Eighth-Note Triplet (G5 - E5 - D5)
         val demoTripletTag = NoteTupletTag(
             count = 3,
@@ -878,7 +942,8 @@ object MusicalNotationHelper {
             startTickExact = 13 * TICKS_PER_BEAT,
             durationTicksExact = 80,
             tuplet = demoTripletTag,
-            slurGroupId = slurTriplet
+            slurGroupId = slurTriplet,
+            targetStaff = StaffPart.TREBLE
         )
         items += MelodyScoreNote(
             midiNote = 76,
@@ -889,7 +954,8 @@ object MusicalNotationHelper {
             startTickExact = 13 * TICKS_PER_BEAT + 80,
             durationTicksExact = 80,
             tuplet = demoTripletTag,
-            slurGroupId = slurTriplet
+            slurGroupId = slurTriplet,
+            targetStaff = StaffPart.TREBLE
         )
         items += MelodyScoreNote(
             midiNote = 74,
@@ -900,11 +966,11 @@ object MusicalNotationHelper {
             startTickExact = 13 * TICKS_PER_BEAT + 160,
             durationTicksExact = 80,
             tuplet = demoTripletTag,
-            slurGroupId = slurTriplet
+            slurGroupId = slurTriplet,
+            targetStaff = StaffPart.TREBLE
         )
-        items += MelodyScoreNote(midiNote = 60, startBeat = 14.0f, durationBeats = 2.0f, velocity = 0.75f, keyboardSlot = 0, hasFermata = true)
-        items += MelodyScoreNote(midiNote = 64, startBeat = 14.0f, durationBeats = 2.0f, velocity = 0.74f, keyboardSlot = 0, hasFermata = true)
-        items += MelodyScoreNote(midiNote = 72, startBeat = 14.0f, durationBeats = 2.0f, velocity = 0.90f, keyboardSlot = 0, hasFermata = true)
+        items += MelodyScoreNote(midiNote = 64, startBeat = 14.0f, durationBeats = 2.0f, velocity = 0.74f, keyboardSlot = 0, hasFermata = true, targetStaff = StaffPart.TREBLE)
+        items += MelodyScoreNote(midiNote = 72, startBeat = 14.0f, durationBeats = 2.0f, velocity = 0.90f, keyboardSlot = 0, hasFermata = true, targetStaff = StaffPart.TREBLE)
 
         val dynamics = listOf(
             ScoreDynamicMark(tick = 0, level = DynamicLevel.MP),
@@ -936,11 +1002,20 @@ object MusicalNotationHelper {
                 targetBpm = 84
             )
         )
+        val chords = listOf(
+            ScoreChordSymbol(tick = 0, symbol = "Cmaj7"),
+            ScoreChordSymbol(tick = 4 * TICKS_PER_BEAT, symbol = "G/B"),
+            ScoreChordSymbol(tick = 8 * TICKS_PER_BEAT, symbol = "Am7"),
+            ScoreChordSymbol(tick = 12 * TICKS_PER_BEAT, symbol = "Fmaj7"),
+            ScoreChordSymbol(tick = 13 * TICKS_PER_BEAT, symbol = "G7sus4"),
+            ScoreChordSymbol(tick = 14 * TICKS_PER_BEAT, symbol = "C")
+        )
         return DemoScoreShowcase(
             notes = items,
             dynamicMarks = dynamics,
             hairpins = hairpins,
-            tempoEvents = tempos
+            tempoEvents = tempos,
+            chordSymbols = chords
         )
     }
 

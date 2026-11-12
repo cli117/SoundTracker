@@ -107,10 +107,12 @@ object MelodyProjectRepository {
      */
     fun hasMeaningfulContent(state: MelodyStudioUiState): Boolean {
         return state.notes.isNotEmpty() ||
+            state.chordSymbols.isNotEmpty() ||
             state.dynamicMarks.isNotEmpty() ||
             state.hairpins.isNotEmpty() ||
             state.tempoEvents.isNotEmpty() ||
             state.keySignatureEvents.isNotEmpty() ||
+            state.grandStaffEnabled ||
             state.initialKeySignature != KeySignature.C_MAJOR ||
             state.scoreTitle.trim().let { it.isNotEmpty() && it != "未命名乐谱" }
     }
@@ -121,6 +123,8 @@ object MelodyProjectRepository {
     fun computeContentFingerprint(state: MelodyStudioUiState): Int {
         var h = 17
         h = 31 * h + state.scoreTitle.hashCode()
+        h = 31 * h + state.grandStaffEnabled.hashCode()
+        h = 31 * h + state.dualKeyboardStaffRouting.ordinal
         h = 31 * h + state.timeSignature.hashCode()
         h = 31 * h + state.initialKeySignature.hashCode()
         h = 31 * h + state.keySignatureEvents.hashCode()
@@ -144,6 +148,9 @@ object MelodyProjectRepository {
         h = 31 * h + state.dynamicMarks.hashCode()
         h = 31 * h + state.hairpins.hashCode()
         h = 31 * h + state.tempoEvents.hashCode()
+        h = 31 * h + state.chordSymbols.hashCode()
+        h = 31 * h + state.showChordSymbols.hashCode()
+        h = 31 * h + state.chordPlaybackEnabled.hashCode()
         return h
     }
 
@@ -154,6 +161,7 @@ object MelodyProjectRepository {
     fun computeSessionPersistenceFingerprint(state: MelodyStudioUiState): Int {
         var h = computeContentFingerprint(state)
         h = 31 * h + state.cursorTick
+        h = 31 * h + state.activeStaff.ordinal
         h = 31 * h + state.scoreViewMode.ordinal
         h = 31 * h + (state.currentProjectId?.hashCode() ?: 0)
         return h
@@ -176,6 +184,11 @@ object MelodyProjectRepository {
         root.put("savedAtMs", savedAtMs)
         root.put("scoreTitle", sanitizeDisplayTitle(state.scoreTitle))
         root.put("scoreViewMode", state.scoreViewMode.name)
+        root.put("grandStaffEnabled", state.grandStaffEnabled)
+        root.put("activeStaff", state.activeStaff.name)
+        root.put("dualKeyboardStaffRouting", state.dualKeyboardStaffRouting.name)
+        root.put("showChordSymbols", state.showChordSymbols)
+        root.put("chordPlaybackEnabled", state.chordPlaybackEnabled)
 
         // Time signature
         root.put("timeSignature", JSONObject().apply {
@@ -253,6 +266,18 @@ object MelodyProjectRepository {
                     if (n.articulation != null) put("articulation", n.articulation.name)
                     if (n.accent != null) put("accent", n.accent.name)
                     if (n.hasFermata) put("hasFermata", true)
+                    if (n.targetStaff != null) put("targetStaff", n.targetStaff.name)
+                })
+            }
+        })
+
+        // Above-staff letter chord symbols (`谱表上方字母和弦标记`)
+        root.put("chordSymbols", JSONArray().apply {
+            for (cs in state.chordSymbols.sortedBy { it.safeTick }) {
+                put(JSONObject().apply {
+                    put("id", cs.id)
+                    put("tick", cs.safeTick)
+                    put("symbol", cs.cleanSymbol)
                 })
             }
         })
@@ -421,6 +446,12 @@ object MelodyProjectRepository {
                     } else {
                         null
                     }
+                    val staffName = obj.optString("targetStaff", "")
+                    val targetStaff = if (staffName.isNotBlank()) {
+                        runCatching { StaffPart.valueOf(staffName) }.getOrNull()
+                    } else {
+                        null
+                    }
                     notes.add(
                         MelodyScoreNote(
                             id = obj.optString("id").ifBlank { UUID.randomUUID().toString() },
@@ -436,12 +467,31 @@ object MelodyProjectRepository {
                             slurGroupId = obj.optString("slurGroupId", "").takeIf { it.isNotBlank() },
                             articulation = articulation,
                             accent = accent,
-                            hasFermata = obj.optBoolean("hasFermata", false)
+                            hasFermata = obj.optBoolean("hasFermata", false),
+                            targetStaff = targetStaff
                         )
                     )
                 }
             }
             notes.sortWith(compareBy<MelodyScoreNote> { it.resolvedStartTick }.thenBy { it.midiNote })
+
+            val chordSymbols = mutableListOf<ScoreChordSymbol>()
+            val csArr = root.optJSONArray("chordSymbols")
+            if (csArr != null) {
+                for (i in 0 until csArr.length()) {
+                    val obj = csArr.optJSONObject(i) ?: continue
+                    val sym = obj.optString("symbol", "").trim()
+                    if (sym.isEmpty()) continue
+                    chordSymbols.add(
+                        ScoreChordSymbol(
+                            id = obj.optString("id").ifBlank { UUID.randomUUID().toString() },
+                            tick = obj.optInt("tick", 0).coerceAtLeast(0),
+                            symbol = sym
+                        )
+                    )
+                }
+            }
+            chordSymbols.sortBy { it.safeTick }
 
             val dynamicMarks = mutableListOf<ScoreDynamicMark>()
             val dmArr = root.optJSONArray("dynamicMarks")
@@ -515,8 +565,11 @@ object MelodyProjectRepository {
             }
             tempoEvents.sortBy { it.startTick }
 
-            // Ensure totalBars covers all notes & mid-score key changes
-            val maxNoteEndTick = notes.maxOfOrNull { it.resolvedEndTick } ?: 0
+            // Ensure totalBars covers all notes, chord symbols & mid-score key changes
+            val maxNoteEndTick = maxOf(
+                notes.maxOfOrNull { it.resolvedEndTick } ?: 0,
+                chordSymbols.maxOfOrNull { it.safeTick + TICKS_PER_STEP } ?: 0
+            )
             val minBarsForNotes = if (maxNoteEndTick > 0) {
                 ((maxNoteEndTick + timeSignature.ticksPerBar - 1) / timeSignature.ticksPerBar).coerceAtLeast(1)
             } else {
@@ -532,10 +585,27 @@ object MelodyProjectRepository {
                 root.optString("scoreViewMode"),
                 ScoreViewMode.PAGE_SCROLL
             )
+            // Backward compatibility with legacy archives: if `grandStaffEnabled` was not stored yet,
+            // auto-enable Dual-Row Piano Grand Staff when the archive contains low bass notes (< G#3)
+            val grandStaffEnabled = if (root.has("grandStaffEnabled")) {
+                root.optBoolean("grandStaffEnabled", false)
+            } else {
+                notes.any { it.targetStaff == StaffPart.BASS || (!it.isRest && it.midiNote < 56) }
+            }
+            val activeStaff = safeEnumValueOf(root.optString("activeStaff"), StaffPart.TREBLE)
+            val dualKeyboardStaffRouting = safeEnumValueOf(
+                root.optString("dualKeyboardStaffRouting"),
+                DualKeyboardStaffRouting.SPLIT_BY_DECK
+            )
+            val showChordSymbols = root.optBoolean("showChordSymbols", true)
+            val chordPlaybackEnabled = root.optBoolean("chordPlaybackEnabled", true)
 
             val restoredState = MelodyStudioUiState(
                 scoreTitle = title,
                 scoreViewMode = scoreViewMode,
+                grandStaffEnabled = grandStaffEnabled,
+                activeStaff = activeStaff,
+                dualKeyboardStaffRouting = dualKeyboardStaffRouting,
                 instrument = instrument,
                 secondaryInstrument = secondaryInstrument,
                 dualKeyboardEnabled = dualKeyboardEnabled,
@@ -564,7 +634,10 @@ object MelodyProjectRepository {
                 notes = notes,
                 dynamicMarks = dynamicMarks,
                 hairpins = hairpins,
-                tempoEvents = tempoEvents
+                tempoEvents = tempoEvents,
+                chordSymbols = chordSymbols,
+                showChordSymbols = showChordSymbols,
+                chordPlaybackEnabled = chordPlaybackEnabled
             )
             LoadedMelodyProject(
                 projectId = rawProjectId?.takeIf { it != AUTOSAVE_PROJECT_ID },

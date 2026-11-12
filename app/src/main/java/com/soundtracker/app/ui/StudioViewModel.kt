@@ -30,12 +30,14 @@ import com.soundtracker.app.dsp.NativeAudioEngine
 import com.soundtracker.app.dsp.VocalEngineMode
 import com.soundtracker.app.dsp.VocalSeparationOutcome
 import com.soundtracker.app.melody.DEFAULT_REST_MIDI
+import com.soundtracker.app.melody.DualKeyboardStaffRouting
 import com.soundtracker.app.melody.DynamicLevel
 import com.soundtracker.app.melody.HairpinType
 import com.soundtracker.app.melody.KeySignature
 import com.soundtracker.app.melody.KeyboardLayoutPreferences
 import com.soundtracker.app.melody.MAX_MELODY_BARS
 import com.soundtracker.app.melody.MELODY_SAMPLE_RATE
+import com.soundtracker.app.melody.MelodyChordHelper
 import com.soundtracker.app.melody.MelodyInputMode
 import com.soundtracker.app.melody.MelodyProjectRepository
 import com.soundtracker.app.melody.MelodyRealtimePlayer
@@ -52,6 +54,7 @@ import com.soundtracker.app.melody.PIANO_MIN_MIDI
 import com.soundtracker.app.melody.PianoTouchGuardConfig
 import com.soundtracker.app.melody.ReverbPreset
 import com.soundtracker.app.melody.STEPS_PER_BEAT
+import com.soundtracker.app.melody.ScoreChordSymbol
 import com.soundtracker.app.melody.ScoreDynamicMark
 import com.soundtracker.app.melody.ScoreExpressionCompiler
 import com.soundtracker.app.melody.ScoreHairpin
@@ -60,6 +63,7 @@ import com.soundtracker.app.melody.ScoreTempoEvent
 import com.soundtracker.app.melody.ScoreTempoMap
 import com.soundtracker.app.melody.ScoreViewMode
 import com.soundtracker.app.melody.SelectedScoreAnnotation
+import com.soundtracker.app.melody.StaffPart
 import com.soundtracker.app.melody.StaffScoreEngraver
 import com.soundtracker.app.melody.StudioInstrument
 import com.soundtracker.app.melody.SwingPreset
@@ -339,7 +343,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         val startBeat: Float,
         val velocity: Float,
         val downWallMs: Long,
-        val isGlissando: Boolean
+        val isGlissando: Boolean,
+        val targetStaff: StaffPart?
     )
 
     private data class RecentLiveStrike(
@@ -3085,6 +3090,9 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         cursorTick = mel.cursorTick,
         totalBars = mel.totalBars,
         scoreTitle = mel.scoreTitle,
+        grandStaffEnabled = mel.grandStaffEnabled,
+        activeStaff = mel.activeStaff,
+        dualKeyboardStaffRouting = mel.dualKeyboardStaffRouting,
         timeSignature = mel.timeSignature,
         initialKeySignature = mel.initialKeySignature,
         keySignatureEvents = mel.keySignatureEvents,
@@ -3098,6 +3106,9 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         secondarySustainPedal = mel.secondarySustainPedal,
         sustainDurationSec = mel.sustainDurationSec,
         secondarySustainDurationSec = mel.secondarySustainDurationSec,
+        chordSymbols = mel.chordSymbols,
+        showChordSymbols = mel.showChordSymbols,
+        chordPlaybackEnabled = mel.chordPlaybackEnabled,
         dynamicMarks = mel.dynamicMarks,
         hairpins = mel.hairpins,
         tempoEvents = mel.tempoEvents
@@ -3105,21 +3116,28 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     private fun sanitizeOrphanSlurGroups(
         notes: List<MelodyScoreNote>,
-        activeSlurGroupId: String?
+        activeSlurGroupId: String?,
+        grandStaffEnabled: Boolean = _uiState.value.melody.grandStaffEnabled
     ): List<MelodyScoreNote> {
-        val onsetCounts = HashMap<String, MutableSet<Int>>()
+        val onsetCounts = HashMap<Pair<String, StaffPart>, MutableSet<Int>>()
         for (n in notes) {
             val gid = n.slurGroupId ?: continue
             if (n.isRest) continue
-            onsetCounts.getOrPut(gid) { HashSet() }.add(n.resolvedStartTick)
+            val key = gid to n.resolvedStaffPart(grandStaffEnabled)
+            onsetCounts.getOrPut(key) { HashSet() }.add(n.resolvedStartTick)
         }
-        val orphanIds = onsetCounts.entries
-            .filter { (gid, onsets) -> gid != activeSlurGroupId && onsets.size < 2 }
+        val orphanPairs = onsetCounts.entries
+            .filter { (key, onsets) -> key.first != activeSlurGroupId && onsets.size < 2 }
             .map { it.key }
             .toSet()
-        if (orphanIds.isEmpty()) return notes
+        if (orphanPairs.isEmpty()) return notes
         return notes.map { n ->
-            if (n.slurGroupId != null && n.slurGroupId in orphanIds) n.copy(slurGroupId = null) else n
+            val gid = n.slurGroupId
+            if (gid != null && (gid to n.resolvedStaffPart(grandStaffEnabled)) in orphanPairs) {
+                n.copy(slurGroupId = null)
+            } else {
+                n
+            }
         }
     }
 
@@ -3154,6 +3172,9 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     cursorTick = snap.cursorTick,
                     totalBars = snap.totalBars,
                     scoreTitle = snap.scoreTitle,
+                    grandStaffEnabled = snap.grandStaffEnabled,
+                    activeStaff = snap.activeStaff,
+                    dualKeyboardStaffRouting = snap.dualKeyboardStaffRouting,
                     timeSignature = snap.timeSignature,
                     initialKeySignature = snap.initialKeySignature,
                     keySignatureEvents = snap.keySignatureEvents,
@@ -3167,6 +3188,9 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     secondarySustainPedal = snap.secondarySustainPedal,
                     sustainDurationSec = snap.sustainDurationSec,
                     secondarySustainDurationSec = snap.secondarySustainDurationSec,
+                    chordSymbols = snap.chordSymbols,
+                    showChordSymbols = snap.showChordSymbols,
+                    chordPlaybackEnabled = snap.chordPlaybackEnabled,
                     dynamicMarks = snap.dynamicMarks,
                     hairpins = snap.hairpins,
                     tempoEvents = snap.tempoEvents,
@@ -3196,6 +3220,9 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     cursorTick = snap.cursorTick,
                     totalBars = snap.totalBars,
                     scoreTitle = snap.scoreTitle,
+                    grandStaffEnabled = snap.grandStaffEnabled,
+                    activeStaff = snap.activeStaff,
+                    dualKeyboardStaffRouting = snap.dualKeyboardStaffRouting,
                     timeSignature = snap.timeSignature,
                     initialKeySignature = snap.initialKeySignature,
                     keySignatureEvents = snap.keySignatureEvents,
@@ -3209,6 +3236,9 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     secondarySustainPedal = snap.secondarySustainPedal,
                     sustainDurationSec = snap.sustainDurationSec,
                     secondarySustainDurationSec = snap.secondarySustainDurationSec,
+                    chordSymbols = snap.chordSymbols,
+                    showChordSymbols = snap.showChordSymbols,
+                    chordPlaybackEnabled = snap.chordPlaybackEnabled,
                     dynamicMarks = snap.dynamicMarks,
                     hairpins = snap.hairpins,
                     tempoEvents = snap.tempoEvents,
@@ -3234,6 +3264,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     fun clearMelodyScore() {
         val cur = _uiState.value.melody
         if (cur.notes.isEmpty() &&
+            cur.chordSymbols.isEmpty() &&
             cur.dynamicMarks.isEmpty() &&
             cur.hairpins.isEmpty() &&
             cur.tempoEvents.isEmpty() &&
@@ -3250,6 +3281,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             st.copy(
                 melody = st.melody.copy(
                     notes = emptyList(),
+                    chordSymbols = emptyList(),
                     dynamicMarks = emptyList(),
                     hairpins = emptyList(),
                     tempoEvents = emptyList(),
@@ -3288,6 +3320,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 melody = st.melody.copy(
                     scoreTitle = "晨光序曲",
                     currentProjectId = UUID.randomUUID().toString(),
+                    grandStaffEnabled = true,
+                    activeStaff = StaffPart.TREBLE,
                     timeSignature = TimeSignature.FOUR_FOUR,
                     initialKeySignature = KeySignature.C_MAJOR,
                     keySignatureEvents = emptyList(),
@@ -3296,6 +3330,9 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     cursorTick = 0,
                     tupletAnchorTick = 0,
                     notes = demo.notes,
+                    chordSymbols = demo.chordSymbols,
+                    showChordSymbols = true,
+                    chordPlaybackEnabled = true,
                     dynamicMarks = demo.dynamicMarks,
                     hairpins = demo.hairpins,
                     tempoEvents = demo.tempoEvents,
@@ -3318,6 +3355,82 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         syncMelodyInstrumentToEngine(updated)
         syncMelodySequenceToEngine(updated)
         melodyPlayer.setTransportPlaying(true, 0L)
+    }
+
+    fun toggleMelodyGrandStaff() {
+        pushMelodyUndoSnapshot()
+        var notesChanged = false
+        _uiState.update { st ->
+            val cur = st.melody
+            val nextGrand = !cur.grandStaffEnabled
+            val cleanedNotes = if (cur.activeSlurGroupId != null) {
+                sanitizeOrphanSlurGroups(cur.notes, activeSlurGroupId = null, grandStaffEnabled = nextGrand)
+            } else {
+                cur.notes
+            }
+            notesChanged = (cleanedNotes != cur.notes)
+            st.copy(
+                melody = cur.copy(
+                    grandStaffEnabled = nextGrand,
+                    activeStaff = if (nextGrand) cur.activeStaff else StaffPart.TREBLE,
+                    activeSlurGroupId = if (!nextGrand) null else cur.activeSlurGroupId,
+                    notes = cleanedNotes
+                )
+            )
+        }
+        syncMelodySequenceToEngine()
+    }
+
+    fun setMelodyActiveStaff(staff: StaffPart) {
+        var notesChanged = false
+        _uiState.update { st ->
+            val cur = st.melody
+            if (!cur.grandStaffEnabled || cur.activeStaff == staff) return@update st
+            val cleanedNotes = if (cur.activeSlurGroupId != null) {
+                sanitizeOrphanSlurGroups(cur.notes, activeSlurGroupId = null, grandStaffEnabled = true)
+            } else {
+                cur.notes
+            }
+            notesChanged = (cleanedNotes != cur.notes)
+            st.copy(
+                melody = cur.copy(
+                    activeStaff = staff,
+                    activeSlurGroupId = null,
+                    selectedNoteId = null,
+                    notes = cleanedNotes
+                )
+            )
+        }
+        if (notesChanged) {
+            syncMelodySequenceToEngine()
+        }
+    }
+
+    fun toggleDualKeyboardStaffRouting() {
+        _uiState.update { st ->
+            val nextRouting = when (st.melody.dualKeyboardStaffRouting) {
+                DualKeyboardStaffRouting.SPLIT_BY_DECK -> DualKeyboardStaffRouting.FOLLOW_ACTIVE_STAFF
+                DualKeyboardStaffRouting.FOLLOW_ACTIVE_STAFF -> DualKeyboardStaffRouting.SPLIT_BY_DECK
+            }
+            st.copy(melody = st.melody.copy(dualKeyboardStaffRouting = nextRouting))
+        }
+        val mode = _uiState.value.melody.dualKeyboardStaffRouting
+        sendMessage(
+            if (mode == DualKeyboardStaffRouting.SPLIT_BY_DECK) {
+                "双排键盘联动：上排默认写上行高音谱 · 下排默认写下行低音谱"
+            } else {
+                "双排键盘联动：上下两排键盘均写入当前选中的谱表行"
+            }
+        )
+    }
+
+    private fun resolveInputStaffForSlot(cur: MelodyStudioUiState, slot: Int): StaffPart {
+        if (!cur.grandStaffEnabled) return StaffPart.TREBLE
+        return if (cur.dualKeyboardEnabled && cur.dualKeyboardStaffRouting == DualKeyboardStaffRouting.SPLIT_BY_DECK) {
+            if (slot == 1) StaffPart.BASS else StaffPart.TREBLE
+        } else {
+            cur.activeStaff
+        }
     }
 
     fun setMelodyScoreViewMode(mode: ScoreViewMode) {
@@ -3539,6 +3652,14 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             st.copy(melody = st.melody.copy(swingPreset = preset))
         }
         syncMelodySequenceToEngine()
+    }
+
+    fun setMelodyReverbPreset(preset: ReverbPreset) {
+        if (_uiState.value.melody.reverbPreset == preset) return
+        _uiState.update { st ->
+            st.copy(melody = st.melody.copy(reverbPreset = preset))
+        }
+        melodyPlayer.setReverbWet(_uiState.value.melody.effectiveReverbSend)
     }
 
     fun cycleMelodyReverb() {
@@ -3782,6 +3903,9 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         }
         melodyPlayer.noteOn(safeSlot, safeMidi, safeVel)
 
+        val inputStaff = resolveInputStaffForSlot(cur, safeSlot)
+        val noteTargetStaff = if (cur.grandStaffEnabled) inputStaff else null
+
         if (cur.isRecording) {
             val curTick = currentMelodyTempoMap(cur).frameToTick(melodyPlayer.currentTransportFrame())
             val curBeat = (curTick / TICKS_PER_BEAT.toDouble()).toFloat().coerceAtLeast(0f)
@@ -3789,7 +3913,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 startBeat = curBeat,
                 velocity = safeVel,
                 downWallMs = nowMs,
-                isGlissando = isGlissando
+                isGlissando = isGlissando,
+                targetStaff = noteTargetStaff
             )
             return
         }
@@ -3822,7 +3947,13 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
             val startBeat = targetTick.toFloat() / TICKS_PER_BEAT.toFloat()
             val durBeats = durTicks.toFloat() / TICKS_PER_BEAT.toFloat()
-            val chordMate = cur.notes.firstOrNull { !it.isRest && abs(it.resolvedStartTick - targetTick) <= 6 }
+            val chordMate = cur.notes.firstOrNull {
+                !it.isRest &&
+                    abs(it.resolvedStartTick - targetTick) <= 6 &&
+                    (!cur.grandStaffEnabled || it.resolvedStaffPart(true) == inputStaff)
+            }
+            val switchedStaffOnDeck = cur.grandStaffEnabled && (cur.activeStaff != inputStaff)
+            val effectiveActiveSlurId = if (switchedStaffOnDeck) null else cur.activeSlurGroupId
 
             val newNote = MelodyScoreNote(
                 midiNote = safeMidi,
@@ -3831,10 +3962,11 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 velocity = safeVel,
                 keyboardSlot = safeSlot,
                 isRest = false,
+                targetStaff = noteTargetStaff,
                 startTickExact = targetTick,
                 durationTicksExact = durTicks,
                 tuplet = tupletTag,
-                slurGroupId = cur.activeSlurGroupId ?: chordMate?.slurGroupId,
+                slurGroupId = effectiveActiveSlurId ?: chordMate?.slurGroupId,
                 articulation = cur.pendingArticulation ?: chordMate?.articulation,
                 accent = cur.pendingAccent ?: chordMate?.accent,
                 hasFermata = cur.pendingFermata || (chordMate?.hasFermata == true)
@@ -3866,25 +3998,39 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
             _uiState.update { st ->
                 val filtered = st.melody.notes.filterNot { existing ->
-                    val exStart = existing.resolvedStartTick
-                    val exEnd = existing.resolvedEndTick
-                    if (existing.isRest) {
-                        exStart < (targetTick + durTicks) && exEnd > targetTick
+                    val sameStaff = !st.melody.grandStaffEnabled ||
+                        existing.resolvedStaffPart(true) == inputStaff
+                    if (!sameStaff) {
+                        false
                     } else {
-                        abs(exStart - targetTick) <= 6 &&
-                            existing.midiNote == safeMidi &&
-                            existing.keyboardSlot == safeSlot
+                        val exStart = existing.resolvedStartTick
+                        val exEnd = existing.resolvedEndTick
+                        if (existing.isRest) {
+                            exStart < (targetTick + durTicks) && exEnd > targetTick
+                        } else {
+                            abs(exStart - targetTick) <= 6 &&
+                                existing.midiNote == safeMidi &&
+                                existing.keyboardSlot == safeSlot
+                        }
                     }
                 }
-                val updatedNotes = (filtered + newNote).sortedWith(
+                val rawNotes = (filtered + newNote).sortedWith(
                     compareBy<MelodyScoreNote> { it.resolvedStartTick }
+                        .thenBy { it.resolvedStaffPart(st.melody.grandStaffEnabled).ordinal }
                         .thenBy { it.isRest }
                         .thenBy { it.keyboardSlot }
                         .thenBy { it.midiNote }
                 )
+                val updatedNotes = if (switchedStaffOnDeck && st.melody.activeSlurGroupId != null) {
+                    sanitizeOrphanSlurGroups(rawNotes, activeSlurGroupId = null, grandStaffEnabled = st.melody.grandStaffEnabled)
+                } else {
+                    rawNotes
+                }
                 st.copy(
                     melody = st.melody.copy(
                         notes = updatedNotes,
+                        activeStaff = if (st.melody.grandStaffEnabled) inputStaff else st.melody.activeStaff,
+                        activeSlurGroupId = effectiveActiveSlurId,
                         selectedNoteId = newNote.id,
                         selectedAnnotation = null,
                         pendingArticulation = if (cursorAdvances) null else st.melody.pendingArticulation,
@@ -3950,12 +4096,14 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             velocity = vel,
             keyboardSlot = safeSlot,
             isRest = false,
+            targetStaff = recordedStart.targetStaff,
             slurGroupId = cur.activeSlurGroupId
         )
 
         _uiState.update { st ->
             val updated = (st.melody.notes + recordedNote).sortedWith(
                 compareBy<MelodyScoreNote> { it.resolvedStartTick }
+                    .thenBy { it.resolvedStaffPart(st.melody.grandStaffEnabled).ordinal }
                     .thenBy { it.isRest }
                     .thenBy { it.keyboardSlot }
                     .thenBy { it.midiNote }
@@ -3996,6 +4144,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     velocity = vel,
                     keyboardSlot = slot,
                     isRest = false,
+                    targetStaff = rec.targetStaff,
                     slurGroupId = cur.activeSlurGroupId
                 )
             )
@@ -4004,6 +4153,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             _uiState.update { st ->
                 val updated = (st.melody.notes + finalized).sortedWith(
                     compareBy<MelodyScoreNote> { it.resolvedStartTick }
+                        .thenBy { it.resolvedStaffPart(st.melody.grandStaffEnabled).ordinal }
                         .thenBy { it.isRest }
                         .thenBy { it.keyboardSlot }
                         .thenBy { it.midiNote }
@@ -4053,6 +4203,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         val startBeat = targetTick.toFloat() / TICKS_PER_BEAT.toFloat()
         val durBeats = durTicks.toFloat() / TICKS_PER_BEAT.toFloat()
 
+        val restStaff = if (cur.grandStaffEnabled) cur.activeStaff else null
         val restNote = MelodyScoreNote(
             midiNote = DEFAULT_REST_MIDI,
             startBeat = startBeat,
@@ -4060,6 +4211,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             velocity = 0f,
             keyboardSlot = 0,
             isRest = true,
+            targetStaff = restStaff,
             startTickExact = targetTick,
             durationTicksExact = durTicks,
             tuplet = tupletTag,
@@ -4078,10 +4230,13 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
         _uiState.update { st ->
             val filtered = st.melody.notes.filterNot { existing ->
-                existing.isRest && abs(existing.resolvedStartTick - targetTick) <= 6
+                val sameStaff = !st.melody.grandStaffEnabled ||
+                    existing.resolvedStaffPart(true) == st.melody.activeStaff
+                existing.isRest && sameStaff && abs(existing.resolvedStartTick - targetTick) <= 6
             }
             val updated = (filtered + restNote).sortedWith(
                 compareBy<MelodyScoreNote> { it.resolvedStartTick }
+                    .thenBy { it.resolvedStaffPart(st.melody.grandStaffEnabled).ordinal }
                     .thenBy { it.isRest }
                     .thenBy { it.keyboardSlot }
                     .thenBy { it.midiNote }
@@ -4105,15 +4260,21 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     fun extendPreviousMelodyNote() {
         val cur = _uiState.value.melody
-        if (cur.notes.isEmpty()) {
-            sendMessage("请先弹入一个音符或休止符，再点「延音连线」拉长时值")
+        val staffNotes = cur.notes.filter { !cur.grandStaffEnabled || it.resolvedStaffPart(true) == cur.activeStaff }
+        if (staffNotes.isEmpty()) {
+            val staffLabel = if (cur.grandStaffEnabled) {
+                if (cur.activeStaff == StaffPart.BASS) "下行低音谱" else "上行高音谱"
+            } else {
+                "谱面"
+            }
+            sendMessage("${staffLabel}还没有音符或休止符，请先弹入后再点「延音连线」拉长时值")
             return
         }
-        val endingAtCursor = cur.notes.filter { abs(it.resolvedEndTick - cur.cursorTick) <= 12 }
+        val endingAtCursor = staffNotes.filter { abs(it.resolvedEndTick - cur.cursorTick) <= 12 }
         val targetIds: Set<String> = when {
             endingAtCursor.isNotEmpty() -> endingAtCursor.map { it.id }.toSet()
-            cur.selectedNoteId != null && cur.notes.any { it.id == cur.selectedNoteId } -> setOf(cur.selectedNoteId)
-            else -> setOf(cur.notes.last().id)
+            cur.selectedNoteId != null && staffNotes.any { it.id == cur.selectedNoteId } -> setOf(cur.selectedNoteId)
+            else -> setOf(staffNotes.last().id)
         }
 
         pushMelodyUndoSnapshot()
@@ -4123,7 +4284,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         val rawNextTick = if (endingAtCursor.isNotEmpty()) {
             cur.cursorTick + addTicks
         } else {
-            cur.notes.filter { it.id in targetIds }.maxOf { it.resolvedEndTick + addTicks }
+            staffNotes.filter { it.id in targetIds }.maxOf { it.resolvedEndTick + addTicks }
         }
 
         val ticksPerBar = cur.ticksPerBar
@@ -4161,7 +4322,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     fun backspaceMelodyNote() {
         val cur = _uiState.value.melody
-        if (cur.notes.isEmpty()) {
+        val staffNotes = cur.notes.filter { !cur.grandStaffEnabled || it.resolvedStaffPart(true) == cur.activeStaff }
+        if (staffNotes.isEmpty()) {
             if (cur.cursorTick > 0) {
                 val stepBack = cur.activeTuplet?.noteTicks ?: cur.noteDuration.ticks
                 val prev = (cur.cursorTick - stepBack).coerceAtLeast(0)
@@ -4171,13 +4333,14 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         }
 
         pushMelodyUndoSnapshot()
-        val candidates = cur.notes.filter { it.resolvedStartTick <= cur.cursorTick + 6 }
-        val targetStartTick = (if (candidates.isNotEmpty()) candidates else cur.notes)
+        val candidates = staffNotes.filter { it.resolvedStartTick <= cur.cursorTick + 6 }
+        val targetStartTick = (if (candidates.isNotEmpty()) candidates else staffNotes)
             .maxOf { it.resolvedStartTick }
 
-        val deletedNotes = cur.notes.filter { abs(it.resolvedStartTick - targetStartTick) <= 6 }
-        val rawRemaining = cur.notes.filterNot { abs(it.resolvedStartTick - targetStartTick) <= 6 }
-        val remaining = sanitizeOrphanSlurGroups(rawRemaining, cur.activeSlurGroupId)
+        val deletedNotes = staffNotes.filter { abs(it.resolvedStartTick - targetStartTick) <= 6 }
+        val deletedIds = deletedNotes.map { it.id }.toSet()
+        val rawRemaining = cur.notes.filterNot { it.id in deletedIds }
+        val remaining = sanitizeOrphanSlurGroups(rawRemaining, cur.activeSlurGroupId, cur.grandStaffEnabled)
         val deletedTupletGroupAnchor = deletedNotes.firstNotNullOfOrNull { it.tuplet?.groupStartTick }
 
         _uiState.update { st ->
@@ -4202,7 +4365,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         val backTick = target.resolvedStartTick.coerceAtLeast(0)
         _uiState.update { st ->
             val rawRemaining = st.melody.notes.filterNot { it.id == targetId }
-            val remaining = sanitizeOrphanSlurGroups(rawRemaining, st.melody.activeSlurGroupId)
+            val remaining = sanitizeOrphanSlurGroups(rawRemaining, st.melody.activeSlurGroupId, st.melody.grandStaffEnabled)
             st.copy(
                 melody = st.melody.copy(
                     notes = remaining,
@@ -4226,6 +4389,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             is SelectedScoreAnnotation.Hairpin -> deleteMelodyHairpin(ann.id)
             is SelectedScoreAnnotation.Tempo -> deleteMelodyTempoEvent(ann.id)
             is SelectedScoreAnnotation.KeyChange -> deleteMelodyKeySignatureEvent(ann.id)
+            is SelectedScoreAnnotation.ChordSymbol -> deleteMelodyChordSymbol(ann.id)
             null -> Unit
         }
     }
@@ -4254,6 +4418,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         val deduped = quantized
             .groupBy {
                 listOf(
+                    it.resolvedStaffPart(cur.grandStaffEnabled),
                     it.isRest,
                     it.keyboardSlot,
                     it.midiNote,
@@ -4264,6 +4429,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             .map { group -> group.maxBy { it.resolvedDurationTicks } }
             .sortedWith(
                 compareBy<MelodyScoreNote> { it.resolvedStartTick }
+                    .thenBy { it.resolvedStaffPart(cur.grandStaffEnabled).ordinal }
                     .thenBy { it.isRest }
                     .thenBy { it.keyboardSlot }
                     .thenBy { it.midiNote }
@@ -4307,8 +4473,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun resolveAuditionStartTick(cur: MelodyStudioUiState): Int {
-        val maxPlayableEndTick = cur.notes.filterNot { it.isRest }.maxOfOrNull { it.resolvedEndTick } ?: 0
-        val effectiveEndTick = if (cur.hasPlayableNotes) maxPlayableEndTick else cur.totalTicks
+        val effectiveEndTick = if (cur.hasPlayableNotes) cur.maxPlayableEndTick else cur.totalTicks
         return if (cur.cursorTick in 1 until effectiveEndTick) cur.cursorTick else 0
     }
 
@@ -4435,18 +4600,39 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun setMelodyCursorTick(tick: Int) {
+        setMelodyCursorTickAndStaff(tick = tick, staff = null)
+    }
+
+    fun setMelodyCursorTickAndStaff(tick: Int, staff: StaffPart?) {
         val cur = _uiState.value.melody
         val minStepUnit = cur.activeTuplet?.noteTicks ?: TICKS_PER_STEP
         val clamped = tick.coerceIn(0, (cur.totalTicks - minStepUnit).coerceAtLeast(0))
         val nextBeat = clamped.toFloat() / TICKS_PER_BEAT.toFloat()
+        var notesChanged = false
         _uiState.update { st ->
+            val m = st.melody
+            val nextStaff = if (m.grandStaffEnabled && staff != null) staff else m.activeStaff
+            val switchedStaff = m.grandStaffEnabled && (nextStaff != m.activeStaff)
+            val cleanedNotes = if (switchedStaff && m.activeSlurGroupId != null) {
+                sanitizeOrphanSlurGroups(m.notes, activeSlurGroupId = null, grandStaffEnabled = true)
+            } else {
+                m.notes
+            }
+            notesChanged = (cleanedNotes != m.notes)
             st.copy(
-                melody = st.melody.copy(
+                melody = m.copy(
                     cursorTick = clamped,
                     tupletAnchorTick = clamped,
-                    playheadBeat = if (st.melody.isPlaying && !st.melody.isRecording) nextBeat else st.melody.playheadBeat
+                    activeStaff = nextStaff,
+                    activeSlurGroupId = if (switchedStaff) null else m.activeSlurGroupId,
+                    selectedNoteId = if (switchedStaff) null else m.selectedNoteId,
+                    notes = cleanedNotes,
+                    playheadBeat = if (m.isPlaying && !m.isRecording) nextBeat else m.playheadBeat
                 )
             )
+        }
+        if (notesChanged) {
+            syncMelodySequenceToEngine()
         }
         if (cur.isPlaying && !cur.isRecording) {
             val targetFrame = tickToSeekFrame(currentMelodyTempoMap(cur), clamped)
@@ -4456,28 +4642,48 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     fun selectMelodyNote(noteId: String?) {
         var seekToTick: Int? = null
+        var notesChanged = false
         _uiState.update { st ->
-            val note = noteId?.let { id -> st.melody.notes.firstOrNull { it.id == id } }
-            val nextTick = note?.resolvedStartTick ?: st.melody.cursorTick
-            val minStepUnit = st.melody.activeTuplet?.noteTicks ?: TICKS_PER_STEP
-            val clampedTick = nextTick.coerceIn(0, (st.melody.totalTicks - minStepUnit).coerceAtLeast(0))
-            val nextAnchor = note?.tuplet?.groupStartTick ?: st.melody.tupletAnchorTick
-            if (note != null && st.melody.isPlaying && !st.melody.isRecording) {
+            val m = st.melody
+            val note = noteId?.let { id -> m.notes.firstOrNull { it.id == id } }
+            val nextTick = note?.resolvedStartTick ?: m.cursorTick
+            val minStepUnit = m.activeTuplet?.noteTicks ?: TICKS_PER_STEP
+            val clampedTick = nextTick.coerceIn(0, (m.totalTicks - minStepUnit).coerceAtLeast(0))
+            val nextAnchor = note?.tuplet?.groupStartTick ?: m.tupletAnchorTick
+            val nextStaff = if (note != null && m.grandStaffEnabled) {
+                note.resolvedStaffPart(true)
+            } else {
+                m.activeStaff
+            }
+            val switchedStaff = m.grandStaffEnabled && (nextStaff != m.activeStaff)
+            val cleanedNotes = if (switchedStaff && m.activeSlurGroupId != null) {
+                sanitizeOrphanSlurGroups(m.notes, activeSlurGroupId = null, grandStaffEnabled = true)
+            } else {
+                m.notes
+            }
+            notesChanged = (cleanedNotes != m.notes)
+            if (note != null && m.isPlaying && !m.isRecording) {
                 seekToTick = clampedTick
             }
             st.copy(
-                melody = st.melody.copy(
+                melody = m.copy(
                     selectedNoteId = noteId,
-                    selectedAnnotation = if (noteId != null) null else st.melody.selectedAnnotation,
+                    selectedAnnotation = if (noteId != null) null else m.selectedAnnotation,
+                    activeStaff = nextStaff,
+                    activeSlurGroupId = if (switchedStaff) null else m.activeSlurGroupId,
+                    notes = cleanedNotes,
                     cursorTick = clampedTick,
                     tupletAnchorTick = nextAnchor,
                     playheadBeat = if (seekToTick != null) {
                         clampedTick.toFloat() / TICKS_PER_BEAT.toFloat()
                     } else {
-                        st.melody.playheadBeat
+                        m.playheadBeat
                     }
                 )
             )
+        }
+        if (notesChanged) {
+            syncMelodySequenceToEngine()
         }
         seekToTick?.let { targetTick ->
             val cur = _uiState.value.melody
@@ -4511,6 +4717,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     cur.keySignatureEvents.firstOrNull { it.id == annotation.id }?.let {
                         it.safeBarIndex * cur.ticksPerBar
                     }
+                is SelectedScoreAnnotation.ChordSymbol ->
+                    cur.chordSymbols.firstOrNull { it.id == annotation.id }?.safeTick
                 null -> null
             }
             val minStepUnit = cur.activeTuplet?.noteTicks ?: TICKS_PER_STEP
@@ -4536,6 +4744,15 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         seekToTick?.let { targetTick ->
             val cur = _uiState.value.melody
             melodyPlayer.seekTransport(tickToSeekFrame(currentMelodyTempoMap(cur), targetTick))
+            return
+        }
+        if (annotation is SelectedScoreAnnotation.ChordSymbol) {
+            val cur = _uiState.value.melody
+            if (!cur.isPlaying && !cur.isRecording) {
+                cur.chordSymbols.firstOrNull { it.id == annotation.id }?.let { cs ->
+                    previewMelodyChordSymbol(cs.symbol)
+                }
+            }
         }
     }
 
@@ -4576,15 +4793,22 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
      */
     fun slurSelectedOrExtendNext() {
         val cur = _uiState.value.melody
+        val selPitched = cur.selectedNote?.takeIf { !it.isRest }
+        val targetStaffPart = if (cur.grandStaffEnabled) {
+            selPitched?.resolvedStaffPart(true) ?: cur.activeStaff
+        } else {
+            StaffPart.TREBLE
+        }
         val pitchedNotes = cur.notes
             .filterNot { it.isRest }
+            .filter { !cur.grandStaffEnabled || it.resolvedStaffPart(true) == targetStaffPart }
             .sortedBy { it.resolvedStartTick }
         if (pitchedNotes.isEmpty()) {
             toggleMelodyPhraseSlurMode()
             return
         }
 
-        val anchorNote = cur.selectedNote?.takeIf { !it.isRest }
+        val anchorNote = selPitched
             ?: pitchedNotes.firstOrNull { abs(it.resolvedStartTick - cur.cursorTick) <= 6 }
             ?: pitchedNotes.lastOrNull { it.resolvedStartTick <= cur.cursorTick + 6 }
             ?: pitchedNotes.first()
@@ -4599,7 +4823,12 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 ?.resolvedStartTick
             if (nextOnset == null) {
                 _uiState.update { st ->
-                    st.copy(melody = st.melody.copy(activeSlurGroupId = existingGid))
+                    st.copy(
+                        melody = st.melody.copy(
+                            activeSlurGroupId = existingGid,
+                            activeStaff = if (st.melody.grandStaffEnabled) targetStaffPart else st.melody.activeStaff
+                        )
+                    )
                 }
                 sendMessage("已激活当前乐句连线，继续弹奏下一个音符将自动连入本乐句")
                 return
@@ -4613,7 +4842,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 val rawUpdated = st.melody.notes.map { n ->
                     if (n.id in absorbIds) n.copy(slurGroupId = existingGid) else n
                 }
-                val cleaned = sanitizeOrphanSlurGroups(rawUpdated, st.melody.activeSlurGroupId)
+                val cleaned = sanitizeOrphanSlurGroups(rawUpdated, st.melody.activeSlurGroupId, st.melody.grandStaffEnabled)
                 st.copy(melody = st.melody.copy(notes = cleaned))
             }
             syncMelodySequenceToEngine()
@@ -4639,7 +4868,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 st.copy(
                     melody = st.melody.copy(
                         notes = updated,
-                        activeSlurGroupId = newSlurId
+                        activeSlurGroupId = newSlurId,
+                        activeStaff = if (st.melody.grandStaffEnabled) targetStaffPart else st.melody.activeStaff
                     )
                 )
             }
@@ -4664,23 +4894,28 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             val rawUpdated = st.melody.notes.map { n ->
                 if (n.id in joinIds) n.copy(slurGroupId = mergedGroupId) else n
             }
-            val cleaned = sanitizeOrphanSlurGroups(rawUpdated, st.melody.activeSlurGroupId)
+            val cleaned = sanitizeOrphanSlurGroups(rawUpdated, st.melody.activeSlurGroupId, st.melody.grandStaffEnabled)
             st.copy(melody = st.melody.copy(notes = cleaned))
         }
         syncMelodySequenceToEngine()
     }
 
     /**
-     * Wraps all pitched notes starting within `[startTick, endTick]` into a single Phrase Slur (`乐句连线`).
+     * Wraps all pitched notes starting within `[startTick, endTick]` on the active staff into a single Phrase Slur (`乐句连线`).
      */
     fun applyMelodySlurSpan(startTick: Int, endTick: Int) {
         val cur = _uiState.value.melody
         val lo = minOf(startTick, endTick).coerceAtLeast(0)
         val hi = maxOf(startTick, endTick).coerceAtLeast(lo + TICKS_PER_STEP)
-        val matching = cur.notes.filter { !it.isRest && it.resolvedStartTick >= lo - 6 && it.resolvedStartTick < hi - 4 }
+        val matching = cur.notes.filter {
+            !it.isRest &&
+                (!cur.grandStaffEnabled || it.resolvedStaffPart(true) == cur.activeStaff) &&
+                it.resolvedStartTick >= lo - 6 &&
+                it.resolvedStartTick < hi - 4
+        }
         val distinctOnsets = matching.map { it.resolvedStartTick }.distinct()
         if (distinctOnsets.size < 2) {
-            sendMessage("所选区间内至少需要 2 个发声音符才能添加乐句连线")
+            sendMessage("当前谱表行所选区间内至少需要 2 个发声音符才能添加乐句连线")
             return
         }
         pushMelodyUndoSnapshot()
@@ -4690,7 +4925,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             val rawUpdated = st.melody.notes.map { n ->
                 if (n.id in targetIds) n.copy(slurGroupId = newSlurId) else n
             }
-            val cleaned = sanitizeOrphanSlurGroups(rawUpdated, st.melody.activeSlurGroupId)
+            val cleaned = sanitizeOrphanSlurGroups(rawUpdated, st.melody.activeSlurGroupId, st.melody.grandStaffEnabled)
             st.copy(melody = st.melody.copy(notes = cleaned))
         }
         syncMelodySequenceToEngine()
@@ -4701,7 +4936,11 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         val cur = _uiState.value.melody
         val targetGroupId = slurGroupIdOverride
             ?: cur.selectedNote?.slurGroupId
-            ?: cur.notes.firstOrNull { !it.isRest && abs(it.resolvedStartTick - cur.cursorTick) <= 6 }?.slurGroupId
+            ?: cur.notes.firstOrNull {
+                !it.isRest &&
+                    (!cur.grandStaffEnabled || it.resolvedStaffPart(true) == cur.activeStaff) &&
+                    abs(it.resolvedStartTick - cur.cursorTick) <= 6
+            }?.slurGroupId
         if (targetGroupId == null) {
             if (cur.activeSlurGroupId != null) {
                 toggleMelodyPhraseSlurMode()
@@ -4731,8 +4970,14 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         if (sel != null) {
             pushMelodyUndoSnapshot()
             val nextArt = if (articulation == null || sel.articulation == articulation) null else articulation
+            val selStaff = sel.resolvedStaffPart(cur.grandStaffEnabled)
             val chordIds = cur.notes
-                .filter { !it.isRest && abs(it.resolvedStartTick - sel.resolvedStartTick) <= 6 && it.keyboardSlot == sel.keyboardSlot }
+                .filter {
+                    !it.isRest &&
+                        abs(it.resolvedStartTick - sel.resolvedStartTick) <= 6 &&
+                        it.resolvedStaffPart(cur.grandStaffEnabled) == selStaff &&
+                        it.keyboardSlot == sel.keyboardSlot
+                }
                 .map { it.id }
                 .toSet()
             _uiState.update { st ->
@@ -4756,8 +5001,14 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         if (sel != null) {
             pushMelodyUndoSnapshot()
             val nextAcc = if (accent == null || sel.accent == accent) null else accent
+            val selStaff = sel.resolvedStaffPart(cur.grandStaffEnabled)
             val chordIds = cur.notes
-                .filter { !it.isRest && abs(it.resolvedStartTick - sel.resolvedStartTick) <= 6 && it.keyboardSlot == sel.keyboardSlot }
+                .filter {
+                    !it.isRest &&
+                        abs(it.resolvedStartTick - sel.resolvedStartTick) <= 6 &&
+                        it.resolvedStaffPart(cur.grandStaffEnabled) == selStaff &&
+                        it.keyboardSlot == sel.keyboardSlot
+                }
                 .map { it.id }
                 .toSet()
             _uiState.update { st ->
@@ -4781,8 +5032,12 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         if (sel != null) {
             pushMelodyUndoSnapshot()
             val nextFermata = !sel.hasFermata
+            val selStaff = sel.resolvedStaffPart(cur.grandStaffEnabled)
             val onsetIds = cur.notes
-                .filter { abs(it.resolvedStartTick - sel.resolvedStartTick) <= 6 }
+                .filter {
+                    abs(it.resolvedStartTick - sel.resolvedStartTick) <= 6 &&
+                        (!cur.grandStaffEnabled || it.resolvedStaffPart(true) == selStaff)
+                }
                 .map { it.id }
                 .toSet()
             _uiState.update { st ->
@@ -5067,6 +5322,122 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     // ========================================================================
+    // Above-Staff Letter Chord Symbols (`谱表上方字母和弦标记` + Real Audio Voicing)
+    // ========================================================================
+
+    fun upsertMelodyChordSymbol(
+        tick: Int,
+        rawSymbol: String,
+        editingId: String? = null
+    ): Boolean {
+        val parsed = MelodyChordHelper.parseChordSymbol(rawSymbol)
+        if (parsed == null) {
+            sendMessage("无法识别和弦「${rawSymbol.trim()}」，请输入如 C、Dm7、F#m7-5、Bbadd9、Dsus4、G/B")
+            return false
+        }
+        val cur = _uiState.value.melody
+        pushMelodyUndoSnapshot()
+
+        val cleanTick = ((tick.coerceAtLeast(0) / TICKS_PER_STEP) * TICKS_PER_STEP)
+        val ticksPerBar = cur.ticksPerBar
+        var nextBars = cur.totalBars
+        if (cleanTick >= nextBars * ticksPerBar && nextBars < MAX_MELODY_BARS) {
+            nextBars = ((cleanTick / ticksPerBar) + 1).coerceIn(cur.totalBars, MAX_MELODY_BARS)
+        }
+        val clampedTick = cleanTick.coerceAtMost((nextBars * ticksPerBar - TICKS_PER_STEP).coerceAtLeast(0))
+
+        val item = ScoreChordSymbol(
+            id = editingId ?: UUID.randomUUID().toString(),
+            tick = clampedTick,
+            symbol = parsed.canonicalSymbol
+        )
+        _uiState.update { st ->
+            val filtered = st.melody.chordSymbols.filterNot {
+                it.id == item.id || abs(it.safeTick - clampedTick) <= 10
+            }
+            val updated = (filtered + item).sortedBy { it.safeTick }
+            st.copy(
+                melody = st.melody.copy(
+                    chordSymbols = updated,
+                    showChordSymbols = true,
+                    totalBars = nextBars,
+                    cursorTick = clampedTick,
+                    tupletAnchorTick = clampedTick,
+                    selectedAnnotation = SelectedScoreAnnotation.ChordSymbol(item.id),
+                    selectedNoteId = null
+                )
+            )
+        }
+        syncMelodySequenceToEngine()
+        return true
+    }
+
+    fun deleteMelodyChordSymbol(id: String) {
+        val cur = _uiState.value.melody
+        if (cur.chordSymbols.none { it.id == id }) return
+        pushMelodyUndoSnapshot()
+        _uiState.update { st ->
+            val clearedSel = if ((st.melody.selectedAnnotation as? SelectedScoreAnnotation.ChordSymbol)?.id == id) {
+                null
+            } else {
+                st.melody.selectedAnnotation
+            }
+            st.copy(
+                melody = st.melody.copy(
+                    chordSymbols = st.melody.chordSymbols.filterNot { it.id == id },
+                    selectedAnnotation = clearedSel
+                )
+            )
+        }
+        syncMelodySequenceToEngine()
+    }
+
+    fun toggleShowMelodyChordSymbols() {
+        _uiState.update { st ->
+            st.copy(melody = st.melody.copy(showChordSymbols = !st.melody.showChordSymbols))
+        }
+    }
+
+    fun toggleMelodyChordPlayback() {
+        _uiState.update { st ->
+            st.copy(melody = st.melody.copy(chordPlaybackEnabled = !st.melody.chordPlaybackEnabled))
+        }
+        syncMelodySequenceToEngine()
+    }
+
+    fun previewMelodyChordSymbol(rawSymbol: String) {
+        val parsed = MelodyChordHelper.parseChordSymbol(rawSymbol) ?: return
+        val cur = _uiState.value.melody
+        if (cur.isPlaying || cur.isRecording || !cur.soundFontLoaded) return
+
+        val voiced = MelodyChordHelper.voiceChordForAccompaniment(parsed)
+        if (voiced.isEmpty()) return
+
+        melodyPlayer.startAudioEngine()
+        val slot = when {
+            cur.dualKeyboardEnabled -> 1
+            cur.instrument == StudioInstrument.SOLO_FLUTE ||
+                cur.instrument == StudioInstrument.ALTO_SAX ||
+                cur.instrument == StudioInstrument.MUSIC_BOX -> 1
+            else -> 0
+        }
+
+        previewNoteJob?.cancel()
+        melodyPlayer.allNotesOff()
+        previewNoteJob = viewModelScope.launch {
+            for ((idx, pair) in voiced.withIndex()) {
+                val (midi, weight) = pair
+                if (idx > 0) delay(12L) // gentle natural piano roll feel
+                melodyPlayer.noteOn(slot, midi, (weight * 1.18f).coerceIn(0.30f, 0.72f))
+            }
+            delay(460L)
+            for ((midi, _) in voiced) {
+                melodyPlayer.noteOff(slot, midi)
+            }
+        }
+    }
+
+    // ========================================================================
     // Score Draft Serialization, Multi-Project CRUD, Auto-Save & File I/O
     // ========================================================================
 
@@ -5219,6 +5590,10 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         val cur = _uiState.value.melody
         val blank = MelodyStudioUiState(
             scoreViewMode = cur.scoreViewMode,
+            grandStaffEnabled = cur.grandStaffEnabled,
+            dualKeyboardStaffRouting = cur.dualKeyboardStaffRouting,
+            showChordSymbols = cur.showChordSymbols,
+            chordPlaybackEnabled = cur.chordPlaybackEnabled,
             instrument = cur.instrument,
             secondaryInstrument = cur.secondaryInstrument,
             dualKeyboardEnabled = cur.dualKeyboardEnabled,
@@ -5372,6 +5747,10 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 val cur = _uiState.value.melody
                 val blank = MelodyStudioUiState(
                     scoreViewMode = cur.scoreViewMode,
+                    grandStaffEnabled = cur.grandStaffEnabled,
+                    dualKeyboardStaffRouting = cur.dualKeyboardStaffRouting,
+                    showChordSymbols = cur.showChordSymbols,
+                    chordPlaybackEnabled = cur.chordPlaybackEnabled,
                     instrument = cur.instrument,
                     secondaryInstrument = cur.secondaryInstrument,
                     dualKeyboardEnabled = cur.dualKeyboardEnabled,
@@ -5665,8 +6044,12 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         val inst0 = snapshotMel.instrument
         val inst1 = snapshotMel.secondaryInstrument
         val pitchedNotes = snapshotMel.notes.filterNot { it.isRest }
-        val hasSlot0 = pitchedNotes.any { it.keyboardSlot == 0 }
-        val hasSlot1 = pitchedNotes.any { it.keyboardSlot == 1 }
+        val compiledSchedule = snapshotMel.compileSchedule(MELODY_SAMPLE_RATE)
+        val nativeNotes = compiledSchedule.notes
+        val seqFrames = compiledSchedule.totalFrames
+        val openingBpm = compiledSchedule.tempoMap.bpmAtTick(0)
+        val hasSlot0 = nativeNotes.any { it.slot == 0 }
+        val hasSlot1 = nativeNotes.any { it.slot == 1 }
         val instSummaryTitle = when {
             hasSlot0 && hasSlot1 && inst0 != inst1 -> "${inst0.displayName}+${inst1.displayName}"
             !hasSlot0 && hasSlot1 -> inst1.displayName
@@ -5677,10 +6060,6 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             !hasSlot0 && hasSlot1 -> inst1.shortName
             else -> inst0.shortName
         }
-        val compiledSchedule = snapshotMel.compileSchedule(MELODY_SAMPLE_RATE)
-        val nativeNotes = compiledSchedule.notes
-        val seqFrames = compiledSchedule.totalFrames
-        val openingBpm = compiledSchedule.tempoMap.bpmAtTick(0)
 
         activeProcessingJob = viewModelScope.launch {
             val outWav = SessionWorkspaceManager.createSessionTrackFile(appContext, "melody", "wav")
@@ -5771,12 +6150,17 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 }
                 val displayName = AudioCodecHelper.sanitizeFileName(rawTrackName)
                 val swingNote = if (snapshotMel.swingPreset.isEnabled) " · ${snapshotMel.swingPreset.shortBadge}" else ""
+                val chordNote = if (snapshotMel.chordPlaybackEnabled && snapshotMel.chordSymbols.isNotEmpty()) {
+                    " · ${snapshotMel.chordSymbols.size}和弦"
+                } else {
+                    ""
+                }
                 val timeSigLabel = snapshotMel.timeSignature.label
                 val bpmInt = openingBpm.roundToInt()
                 val newTrack = SessionTrack(
                     displayName = displayName,
                     badge = "打谱 · $instShortSummary · ${timeSigLabel}拍 · ${bpmInt}BPM$swingNote",
-                    detailNote = "${pitchedNotes.size}音 · ${timeSigLabel}拍$swingNote · ${snapshotMel.reverbPreset.label} · ${formatMetricsSummary(exactMetrics)}",
+                    detailNote = "${pitchedNotes.size}音$chordNote · ${timeSigLabel}拍$swingNote · ${snapshotMel.reverbPreset.label} · ${formatMetricsSummary(exactMetrics)}",
                     audioFile = outWav,
                     originTrackId = null,
                     metrics = exactMetrics

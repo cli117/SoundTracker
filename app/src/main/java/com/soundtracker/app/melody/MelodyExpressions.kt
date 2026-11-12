@@ -229,6 +229,7 @@ sealed class SelectedScoreAnnotation {
     data class Hairpin(override val id: String) : SelectedScoreAnnotation()
     data class Tempo(override val id: String) : SelectedScoreAnnotation()
     data class KeyChange(override val id: String) : SelectedScoreAnnotation()
+    data class ChordSymbol(override val id: String) : SelectedScoreAnnotation()
 }
 
 /**
@@ -373,7 +374,10 @@ object ScoreExpressionCompiler {
     ): ScoreTempoMap {
         val sr = sampleRate.coerceAtLeast(22050)
         val ticksPerBar = melody.ticksPerBar.coerceAtLeast(60)
-        val maxNoteEndTick = melody.notes.maxOfOrNull { it.resolvedEndTick } ?: 0
+        val maxNoteEndTick = maxOf(
+            melody.notes.maxOfOrNull { it.resolvedEndTick } ?: 0,
+            melody.maxPlayableEndTick
+        )
         val maxTempoEndTick = melody.tempoEvents.maxOfOrNull { it.safeEndTick } ?: 0
         val horizonTicks = maxOf(
             melody.totalTicks,
@@ -704,20 +708,20 @@ object ScoreExpressionCompiler {
 
         val pitchedNotes = melody.notes.filterNot { it.isRest }
 
-        // Precompute multi-note Slur groups (`slurGroupId -> sorted distinct onset ticks`)
+        // Precompute multi-note Slur groups scoped per staff (`(slurGroupId, StaffPart) -> sorted distinct onset ticks`)
         data class SlurPhraseMeta(
             val firstTick: Int,
             val lastOnsetTick: Int,
             val onsetTicks: List<Int>
         )
-        val slurMetaMap = HashMap<String, SlurPhraseMeta>()
+        val slurMetaMap = HashMap<Pair<String, StaffPart>, SlurPhraseMeta>()
         pitchedNotes
             .filter { it.slurGroupId != null }
-            .groupBy { it.slurGroupId!! }
-            .forEach { (gid, list) ->
+            .groupBy { it.slurGroupId!! to it.resolvedStaffPart(melody.grandStaffEnabled) }
+            .forEach { (key, list) ->
                 val distinctOnsets = list.map { it.resolvedStartTick }.distinct().sorted()
                 if (distinctOnsets.size >= 2) {
-                    slurMetaMap[gid] = SlurPhraseMeta(
+                    slurMetaMap[key] = SlurPhraseMeta(
                         firstTick = distinctOnsets.first(),
                         lastOnsetTick = distinctOnsets.last(),
                         onsetTicks = distinctOnsets
@@ -725,7 +729,7 @@ object ScoreExpressionCompiler {
                 }
             }
 
-        val nativeNotes = ArrayList<NativeSynthNote>(pitchedNotes.size)
+        val nativeNotes = ArrayList<NativeSynthNote>(pitchedNotes.size + melody.chordSymbols.size * 4)
         for (n in pitchedNotes) {
             val rawStartTick = n.resolvedStartTick
             val rawDurTicks = n.resolvedDurationTicks
@@ -755,7 +759,8 @@ object ScoreExpressionCompiler {
             }
 
             // 2. Slur (`圆滑线`) Legato Phrasing vs Articulations (`奏法`)
-            val slurMeta = n.slurGroupId?.let { slurMetaMap[it] }
+            val staffPart = n.resolvedStaffPart(melody.grandStaffEnabled)
+            val slurMeta = n.slurGroupId?.let { slurMetaMap[it to staffPart] }
             val isInteriorSlurNote = slurMeta != null && rawStartTick < slurMeta.lastOnsetTick
             val isPhraseEndSlurNote = slurMeta != null && rawStartTick == slurMeta.lastOnsetTick
             val isAfterSlurAttack = slurMeta != null && rawStartTick > slurMeta.firstTick
@@ -837,12 +842,111 @@ object ScoreExpressionCompiler {
         }
 
         val ticksPerBar = melody.ticksPerBar.coerceAtLeast(60)
+
+        // 4. Optional Above-Staff Chord Symbol Accompaniment (`和弦真实发声`)
+        if (melody.chordPlaybackEnabled && melody.chordSymbols.isNotEmpty()) {
+            val chordSlot = when {
+                melody.dualKeyboardEnabled -> 1
+                melody.instrument == StudioInstrument.SOLO_FLUTE ||
+                    melody.instrument == StudioInstrument.ALTO_SAX ||
+                    melody.instrument == StudioInstrument.MUSIC_BOX -> 1
+                else -> 0
+            }
+            val hasScoreDyn = melody.dynamicMarks.isNotEmpty() || melody.hairpins.isNotEmpty()
+            val sortedChords = melody.chordSymbols
+                .sortedBy { it.safeTick }
+                .fold(mutableListOf<ScoreChordSymbol>()) { acc, cs ->
+                    val prev = acc.lastOrNull()
+                    if (prev != null && abs(prev.safeTick - cs.safeTick) <= 8) {
+                        acc[acc.lastIndex] = cs
+                    } else {
+                        acc += cs
+                    }
+                    acc
+                }
+
+            for (idx in sortedChords.indices) {
+                val chord = sortedChords[idx]
+                val parsed = MelodyChordHelper.parseChordSymbol(chord.symbol) ?: continue
+                val cStartTick = chord.safeTick
+                val barEndTick = ((cStartTick / ticksPerBar) + 1) * ticksPerBar
+                val nextChordTick = sortedChords.getOrNull(idx + 1)?.safeTick ?: Int.MAX_VALUE
+                val baseEndTick = min(nextChordTick, barEndTick).coerceAtLeast(cStartTick + TICKS_PER_STEP)
+
+                val dynScale = if (hasScoreDyn) {
+                    (dynEval.evaluateAtTick(cStartTick, 0.85f).velocity / DynamicLevel.MF.targetVelocity)
+                        .coerceIn(0.55f, 1.25f)
+                } else {
+                    1.0f
+                }
+
+                val voiced = MelodyChordHelper.voiceChordForAccompaniment(parsed)
+                for ((midi, baseWeight) in voiced) {
+                    // Avoid double-striking if an explicit score note on the same slot attacks this exact pitch
+                    val duplicateAtStart = pitchedNotes.any { other ->
+                        other.keyboardSlot.coerceIn(0, 1) == chordSlot &&
+                            other.midiNote == midi &&
+                            abs(other.resolvedStartTick - cStartTick) <= 15
+                    }
+                    if (duplicateAtStart) continue
+
+                    val nextCollisionTick = pitchedNotes
+                        .asSequence()
+                        .filter { other ->
+                            other.keyboardSlot.coerceIn(0, 1) == chordSlot &&
+                                other.midiNote == midi &&
+                                other.resolvedStartTick in (cStartTick + 16) until baseEndTick
+                        }
+                        .minOfOrNull { it.resolvedStartTick - 6 }
+                    val voiceEndTick = (nextCollisionTick ?: baseEndTick)
+                        .coerceAtLeast(cStartTick + TICKS_PER_STEP / 2)
+
+                    val startBeat = cStartTick.toDouble() / TICKS_PER_BEAT.toDouble()
+                    val endBeat = voiceEndTick.toDouble() / TICKS_PER_BEAT.toDouble()
+                    val wStartTick = if (melody.swingPreset.isEnabled) {
+                        melody.swingPreset.warpBeat(startBeat, barBeatsD) * TICKS_PER_BEAT.toDouble()
+                    } else {
+                        cStartTick.toDouble()
+                    }
+                    val wEndTick = if (melody.swingPreset.isEnabled) {
+                        melody.swingPreset.warpBeat(endBeat, barBeatsD) * TICKS_PER_BEAT.toDouble()
+                    } else {
+                        voiceEndTick.toDouble()
+                    }
+
+                    val startFrame = tempoMap.tickToFrame(wStartTick)
+                    val endFrame = tempoMap.tickToFrame(wEndTick)
+                    val durFrames = ((endFrame - startFrame).toDouble() * 0.94)
+                        .roundToLong()
+                        .coerceAtLeast(640L)
+                    val vel = (baseWeight * dynScale).coerceIn(0.18f, 0.66f)
+
+                    nativeNotes += NativeSynthNote(
+                        startFrame = startFrame,
+                        durationFrames = durFrames,
+                        midiNote = midi.coerceIn(12, 108),
+                        velocity = vel,
+                        slot = chordSlot,
+                        flags = NoteSynthFlags.PORTATO_RELEASE
+                    )
+                }
+            }
+        }
+
+        if (nativeNotes.size > 1) {
+            nativeNotes.sortBy { it.startFrame }
+        }
+
         val activeTicks = if (melody.isRecording) {
             melody.totalTicks
         } else {
-            val maxNoteTick = melody.notes.maxOfOrNull { it.resolvedEndTick } ?: melody.totalTicks
-            val barsNeeded = ceil(maxNoteTick.toDouble() / ticksPerBar.toDouble()).toInt().coerceAtLeast(1)
-            val effectiveBars = maxOf(barsNeeded, if (melody.notes.isEmpty()) melody.totalBars else barsNeeded)
+            val maxContentTick = maxOf(
+                melody.notes.maxOfOrNull { it.resolvedEndTick } ?: 0,
+                melody.maxPlayableEndTick
+            )
+            val refTick = if (maxContentTick > 0) maxContentTick else melody.totalTicks
+            val barsNeeded = ceil(refTick.toDouble() / ticksPerBar.toDouble()).toInt().coerceAtLeast(1)
+            val effectiveBars = maxOf(barsNeeded, if (maxContentTick == 0) melody.totalBars else barsNeeded)
             effectiveBars * ticksPerBar
         }
         val totalFrames = tempoMap.tickToFrame(activeTicks.toDouble()).coerceAtLeast(sr.toLong())

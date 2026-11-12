@@ -58,6 +58,7 @@ import androidx.compose.material.icons.rounded.Piano
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.SaveAlt
+import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material.icons.rounded.SkipPrevious
@@ -123,12 +124,14 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import android.os.SystemClock
 import com.soundtracker.app.melody.DynamicLevel
+import com.soundtracker.app.melody.DualKeyboardStaffRouting
 import com.soundtracker.app.melody.HairpinType
 import com.soundtracker.app.melody.KeySignature
 import com.soundtracker.app.melody.KeyboardDeckGeometry
 import com.soundtracker.app.melody.KeyboardLayoutPreferences
 import com.soundtracker.app.melody.KeyboardLayoutProfile
 import com.soundtracker.app.melody.MAX_MELODY_BARS
+import com.soundtracker.app.melody.MelodyChordHelper
 import com.soundtracker.app.melody.MelodyInputMode
 import com.soundtracker.app.melody.MelodyProjectSummary
 import com.soundtracker.app.melody.MelodyStudioUiState
@@ -137,10 +140,13 @@ import com.soundtracker.app.melody.NoteAccent
 import com.soundtracker.app.melody.NoteArticulation
 import com.soundtracker.app.melody.NoteDurationPreset
 import com.soundtracker.app.melody.PianoTouchGuardConfig
+import com.soundtracker.app.melody.ReverbPreset
+import com.soundtracker.app.melody.ScoreChordSymbol
 import com.soundtracker.app.melody.ScoreTempoEvent
 import com.soundtracker.app.melody.ScoreViewMode
 import com.soundtracker.app.melody.SelectedScoreAnnotation
 import com.soundtracker.app.melody.StaffHitTarget
+import com.soundtracker.app.melody.StaffPart
 import com.soundtracker.app.melody.StaffScoreEngraver
 import com.soundtracker.app.melody.StudioInstrument
 import com.soundtracker.app.melody.SwingPreset
@@ -156,6 +162,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
+import kotlinx.coroutines.delay
 import com.soundtracker.app.ui.theme.AmberMastering
 import com.soundtracker.app.ui.theme.CyanPrimary
 import com.soundtracker.app.ui.theme.DangerRed
@@ -205,7 +212,7 @@ fun MelodyStudioScreen(
     onDeleteKeySignatureEvent: (String) -> Unit,
     onBpmChange: (Int) -> Unit,
     onSwingPresetChange: (SwingPreset) -> Unit,
-    onCycleReverb: () -> Unit,
+    onSelectReverb: (ReverbPreset) -> Unit,
     onTogglePrimarySustain: () -> Unit,
     onToggleSecondarySustain: () -> Unit,
     onPrimarySustainDurationChange: (Float) -> Unit,
@@ -226,10 +233,19 @@ fun MelodyStudioScreen(
     onPlayFromStart: () -> Unit,
     onToggleRecordStop: () -> Unit,
     onScoreViewModeChange: (ScoreViewMode) -> Unit,
+    onToggleGrandStaff: () -> Unit,
+    onSetActiveStaff: (StaffPart) -> Unit,
+    onToggleDualKeyboardStaffRouting: () -> Unit,
     onToggleMinimizeKeyboardForScore: () -> Unit,
     onTapCursorTick: (Int) -> Unit,
+    onTapCursorTickAndStaff: (Int, StaffPart?) -> Unit,
     onSelectNote: (String?) -> Unit,
     onSelectAnnotation: (SelectedScoreAnnotation?) -> Unit,
+    onUpsertChordSymbol: (tick: Int, rawSymbol: String, editingId: String?) -> Boolean,
+    onDeleteChordSymbol: (String) -> Unit,
+    onToggleShowChordSymbols: () -> Unit,
+    onToggleChordPlayback: () -> Unit,
+    onPreviewChordSymbol: (String) -> Unit,
     onTogglePhraseSlurMode: () -> Unit,
     onSlurSelectedOrExtendNext: () -> Unit,
     onApplySlurSpan: (Int, Int) -> Unit,
@@ -268,8 +284,10 @@ fun MelodyStudioScreen(
     var showCustomTimeSigDialog by remember { mutableStateOf(false) }
     var showBpmQuickDialog by remember { mutableStateOf(false) }
     var showKeySigDialog by remember { mutableStateOf(false) }
+    var showChordSymbolDialog by remember { mutableStateOf(false) }
     var showProjectManagerDialog by remember { mutableStateOf(false) }
     var showTouchGuardDialog by remember { mutableStateOf(false) }
+    var showMelodySettingsDialog by remember { mutableStateOf(false) }
     // null = closed, 0 = 奏法·连线, 1 = 力度·渐变, 2 = 速度·变速
     var expressionDialogTab by remember { mutableStateOf<Int?>(null) }
     // null = closed, 0 = primary keyboard sustain dialog, 1 = secondary keyboard sustain dialog
@@ -287,6 +305,9 @@ fun MelodyStudioScreen(
 
     val openSmartExpressionDialog: () -> Unit = {
         when (melody.selectedAnnotation) {
+            is SelectedScoreAnnotation.ChordSymbol -> {
+                showChordSymbolDialog = true
+            }
             is SelectedScoreAnnotation.KeyChange -> {
                 showKeySigDialog = true
             }
@@ -366,13 +387,13 @@ fun MelodyStudioScreen(
         val scoreCollapsed = (isCompactDualPhone && melody.collapseScoreInDualMode) ||
             (isShortLandscape && melody.dualKeyboardEnabled && melody.collapseScoreInDualMode)
 
-        // Reserve space for top toolbars & minimum staff view so user resizing never traps the UI
+        // Reserve space for unified top bar & minimum staff view so user resizing never traps the UI
         val chromeAndMinStaffDp = when {
-            scoreCollapsed -> 166f
-            isShortLandscape -> 208f
-            isCompactDualPhone -> 252f
-            isWideTablet -> 280f
-            else -> 276f
+            scoreCollapsed -> 112f
+            isShortLandscape -> 162f
+            isCompactDualPhone -> 204f
+            isWideTablet -> 212f
+            else -> 218f
         }
         val maxTotalKeyboardDp = (availHeight.value - chromeAndMinStaffDp)
             .coerceAtLeast(if (melody.dualKeyboardEnabled) 184f else 96f)
@@ -393,440 +414,35 @@ fun MelodyStudioScreen(
 
         Column(modifier = Modifier.fillMaxSize()) {
             // ================================================================
-            // 1. Top Header Bar (Project & Export Actions; Undo/Redo moved to Thumb Dock!)
+            // 1. Unified Single-Row Top Bar (Score Title, Drafts, Timbre, Key/Time,
+            //    BPM/Metronome, Full-Screen Score, Secondary Settings ⚙️ & Export)
             // ================================================================
-            Surface(
-                color = StudioSurface,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(if (isShortLandscape) 42.dp else 46.dp)
-                        .padding(horizontal = if (isTablet) 18.dp else 10.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        Text(
-                            text = "乐器打谱",
-                            fontFamily = FontFamily.Serif,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = if (isTablet) 18.sp else 15.sp,
-                            color = TextPrimary,
-                            maxLines = 1
-                        )
-                        MelodyHeaderIconBtn(
-                            icon = Icons.Rounded.DeleteOutline,
-                            contentDescription = "清空乐谱",
-                            enabled = melody.notes.isNotEmpty() ||
-                                melody.dynamicMarks.isNotEmpty() ||
-                                melody.hairpins.isNotEmpty() ||
-                                melody.tempoEvents.isNotEmpty() ||
-                                melody.keySignatureEvents.isNotEmpty(),
-                            onClick = { showClearConfirm = true }
-                        )
-                    }
-
-                    val compactHeaderLabels = availWidth < 430.dp
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(if (compactHeaderLabels) 4.dp else 5.dp)
-                    ) {
-                        // Score Drafts & Local Multi-Project Auto-Save / Load (`草稿/工程`)
-                        val projShape = RoundedCornerShape(9.dp)
-                        val isAutoSavedProject = melody.currentProjectId != null
-                        Surface(
-                            shape = projShape,
-                            color = if (isAutoSavedProject) {
-                                EmeraldLossless.copy(alpha = 0.13f)
-                            } else {
-                                StudioSurfaceElevated
-                            },
-                            border = BorderStroke(
-                                1.dp,
-                                if (isAutoSavedProject) EmeraldLossless.copy(alpha = 0.48f) else StudioBorder
-                            ),
-                            modifier = Modifier
-                                .height(31.dp)
-                                .clip(projShape)
-                                .clickable { showProjectManagerDialog = true }
-                        ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier.padding(horizontal = if (compactHeaderLabels) 6.dp else 8.dp)
-                            ) {
-                                Icon(
-                                    imageVector = if (isAutoSavedProject) Icons.Rounded.Check else Icons.Rounded.FolderOpen,
-                                    contentDescription = null,
-                                    tint = if (isAutoSavedProject) EmeraldLossless else CyanPrimary,
-                                    modifier = Modifier.size(13.dp)
-                                )
-                                Spacer(modifier = Modifier.width(3.dp))
-                                Text(
-                                    text = when {
-                                        compactHeaderLabels && isAutoSavedProject -> "已存·草稿"
-                                        compactHeaderLabels -> "草稿"
-                                        isAutoSavedProject -> "已自动存·工程"
-                                        else -> "草稿/工程"
-                                    },
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = if (isAutoSavedProject) EmeraldLossless else TextPrimary,
-                                    maxLines = 1
-                                )
-                            }
-                        }
-
-                        val demoShape = RoundedCornerShape(9.dp)
-                        Surface(
-                            shape = demoShape,
-                            color = AmberMastering.copy(alpha = 0.13f),
-                            border = BorderStroke(1.dp, AmberMastering.copy(alpha = 0.45f)),
-                            modifier = Modifier
-                                .height(31.dp)
-                                .clip(demoShape)
-                                .clickable(onClick = onLoadDemoMelody)
-                        ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier.padding(horizontal = if (compactHeaderLabels) 6.dp else 8.dp)
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Rounded.AutoAwesome,
-                                    contentDescription = null,
-                                    tint = AmberMastering,
-                                    modifier = Modifier.size(13.dp)
-                                )
-                                Spacer(modifier = Modifier.width(3.dp))
-                                Text(
-                                    text = if (compactHeaderLabels) "示例" else "示例曲",
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = AmberMastering,
-                                    maxLines = 1
-                                )
-                            }
-                        }
-
-                        // Export 5-Line Staff to PDF (WeChat or Save Locally)
-                        val pdfShape = RoundedCornerShape(9.dp)
-                        Surface(
-                            shape = pdfShape,
-                            color = VioletAccent.copy(alpha = 0.13f),
-                            border = BorderStroke(1.dp, VioletAccent.copy(alpha = 0.48f)),
-                            modifier = Modifier
-                                .height(31.dp)
-                                .clip(pdfShape)
-                                .clickable { showExportPdfDialog = true }
-                        ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier.padding(horizontal = if (compactHeaderLabels) 6.dp else 8.dp)
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Rounded.Share,
-                                    contentDescription = null,
-                                    tint = VioletAccent,
-                                    modifier = Modifier.size(13.dp)
-                                )
-                                Spacer(modifier = Modifier.width(3.dp))
-                                Text(
-                                    text = if (compactHeaderLabels) "PDF" else "导出PDF",
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = VioletAccent,
-                                    maxLines = 1
-                                )
-                            }
-                        }
-
-                        Button(
-                            onClick = onExportMelodyToWorkspace,
-                            enabled = melody.hasPlayableNotes,
-                            shape = RoundedCornerShape(9.dp),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = CyanPrimary,
-                                contentColor = OnAccentLight,
-                                disabledContainerColor = StudioSurfaceElevated,
-                                disabledContentColor = TextMuted
-                            ),
-                            contentPadding = PaddingValues(horizontal = if (compactHeaderLabels) 8.dp else 10.dp, vertical = 0.dp),
-                            modifier = Modifier.height(31.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Rounded.Check,
-                                contentDescription = null,
-                                modifier = Modifier.size(14.dp)
-                            )
-                            Spacer(modifier = Modifier.width(3.dp))
-                            Text(
-                                text = "生成音轨",
-                                fontSize = if (compactHeaderLabels) 11.sp else 11.5.sp,
-                                fontWeight = FontWeight.Bold,
-                                maxLines = 1
-                            )
-                        }
-                    }
-                }
-            }
+            MelodyUnifiedTopBar(
+                melody = melody,
+                activeKeySignature = activeKeyAtCursor,
+                availWidthDp = availWidth.value,
+                isTablet = isTablet,
+                isShortLandscape = isShortLandscape,
+                onEditTitleClick = { showEditTitleDialog = true },
+                onOpenProjectManager = { showProjectManagerDialog = true },
+                onSelectPrimaryInstrument = onSelectPrimaryInstrument,
+                onOpenKeySignatureDialog = { showKeySigDialog = true },
+                onSelectTimeSignature = onTimeSignatureChange,
+                onOpenCustomTimeSignatureDialog = { showCustomTimeSigDialog = true },
+                onBpmChange = onBpmChange,
+                onOpenBpmQuickDialog = { showBpmQuickDialog = true },
+                onToggleMetronome = onToggleMetronome,
+                onToggleFullScreenScore = onToggleMinimizeKeyboardForScore,
+                onOpenSettingsDialog = { showMelodySettingsDialog = true },
+                onExportMelodyToWorkspace = onExportMelodyToWorkspace,
+                onOpenExportPdfDialog = { showExportPdfDialog = true }
+            )
 
             HorizontalDivider(color = StudioBorder)
 
             // ================================================================
-            // 2. Instrument & Global Groove (`拍号` + `调号` + `BPM` + `Swing`) / FX / Sustain Bar
-            //    Automatically collapses in Full-Screen Score mode (`全屏看谱`) for maximum sheet space!
-            // ================================================================
-            if (!melody.keyboardMinimizedForScore) {
-            Surface(
-                color = StudioSurface.copy(alpha = 0.92f),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                if (isCompactDualPhone || isShortLandscape) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(38.dp)
-                            .padding(horizontal = 10.dp)
-                            .horizontalScroll(rememberScrollState()),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        TimeSignatureSelectorPill(
-                            timeSignature = melody.timeSignature,
-                            onSelectTimeSignature = onTimeSignatureChange,
-                            onOpenCustomDialog = { showCustomTimeSigDialog = true }
-                        )
-                        KeySignatureSelectorPill(
-                            activeKeySignature = activeKeyAtCursor,
-                            modulationCount = melody.keySignatureEvents.size,
-                            onClick = { showKeySigDialog = true }
-                        )
-                        BpmCompactControl(
-                            bpm = melody.bpm,
-                            referenceTrackBpm = referenceTrackBpm,
-                            onBpmChange = onBpmChange,
-                            onOpenQuickDialog = { showBpmQuickDialog = true }
-                        )
-                        MelodyTinyToggle(
-                            label = if (melody.tempoEvents.isNotEmpty()) {
-                                "变速(${melody.tempoEvents.size})"
-                            } else {
-                                "速度记号"
-                            },
-                            active = melody.tempoEvents.isNotEmpty(),
-                            activeColor = WarmUmber,
-                            onClick = { expressionDialogTab = 2 }
-                        )
-                        SwingSelectorPill(
-                            swingPreset = melody.swingPreset,
-                            onSelectSwing = onSwingPresetChange
-                        )
-                        MelodyTinyToggle(
-                            label = "节拍器",
-                            active = melody.metronomeEnabled,
-                            activeColor = WarmUmber,
-                            onClick = onToggleMetronome
-                        )
-                        MelodyTinyToggle(
-                            label = "混响:${melody.reverbPreset.label}",
-                            active = true,
-                            activeColor = VioletAccent,
-                            onClick = onCycleReverb
-                        )
-                        TouchGuardSelectorPill(
-                            config = melody.touchGuardConfig,
-                            onClick = { showTouchGuardDialog = true }
-                        )
-                        MelodyTinyToggle(
-                            label = if (melody.dualKeyboardEnabled) "双排键盘:开" else "双排键盘",
-                            active = melody.dualKeyboardEnabled,
-                            activeColor = CyanPrimary,
-                            onClick = onToggleDualKeyboard
-                        )
-                        if (melody.dualKeyboardEnabled) {
-                            val expandShape = RoundedCornerShape(7.dp)
-                            Surface(
-                                shape = expandShape,
-                                color = if (scoreCollapsed) EmeraldLossless.copy(alpha = 0.16f) else StudioSurfaceElevated,
-                                border = BorderStroke(
-                                    1.dp,
-                                    if (scoreCollapsed) EmeraldLossless else StudioBorder
-                                ),
-                                modifier = Modifier
-                                    .height(27.dp)
-                                    .clip(expandShape)
-                                    .clickable {
-                                        val nextCollapsed = !melody.collapseScoreInDualMode
-                                        onToggleCollapseScoreInDual()
-                                        persistLayoutUpdate { it.copy(collapseScore = nextCollapsed) }
-                                    }
-                            ) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    modifier = Modifier.padding(horizontal = 7.dp)
-                                ) {
-                                    Icon(
-                                        imageVector = if (scoreCollapsed) Icons.Rounded.ExpandMore else Icons.Rounded.ExpandLess,
-                                        contentDescription = null,
-                                        tint = if (scoreCollapsed) EmeraldLossless else TextPrimary,
-                                        modifier = Modifier.size(14.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(2.dp))
-                                    Text(
-                                        text = if (scoreCollapsed) "展开五线谱" else "放大琴键",
-                                        fontSize = 11.sp,
-                                        fontWeight = FontWeight.SemiBold,
-                                        color = if (scoreCollapsed) EmeraldLossless else TextPrimary,
-                                        maxLines = 1
-                                    )
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 5.dp),
-                        verticalArrangement = Arrangement.spacedBy(5.dp)
-                    ) {
-                        // Row 2A: Curated 9 Melodic Instruments Horizontal Strip
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(30.dp)
-                                .horizontalScroll(rememberScrollState())
-                                .padding(horizontal = if (isTablet) 18.dp else 10.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            if (melody.dualKeyboardEnabled) {
-                                Text(
-                                    text = "上排音色:",
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = CyanPrimary,
-                                    maxLines = 1
-                                )
-                            }
-                            StudioInstrument.entries.forEach { inst ->
-                                val selected = inst == melody.instrument
-                                val pillShape = RoundedCornerShape(9.dp)
-                                Surface(
-                                    shape = pillShape,
-                                    color = if (selected) CyanPrimary else StudioSurfaceElevated,
-                                    border = BorderStroke(
-                                        1.dp,
-                                        if (selected) CyanPrimary else StudioBorder
-                                    ),
-                                    modifier = Modifier
-                                        .height(28.dp)
-                                        .clip(pillShape)
-                                        .clickable { onSelectPrimaryInstrument(inst) }
-                                ) {
-                                    Row(
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        modifier = Modifier.padding(horizontal = 10.dp)
-                                    ) {
-                                        Text(
-                                            text = inst.displayName,
-                                            fontSize = 12.sp,
-                                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-                                            color = if (selected) OnAccentLight else TextPrimary,
-                                            maxLines = 1
-                                        )
-                                    }
-                                }
-                            }
-                        }
-
-                        // Row 2B: Time Signature + Key Signature + BPM + Global Swing + Metronome + Reverb + Sustain + Dual Keyboard
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(30.dp)
-                                .padding(horizontal = if (isTablet) 18.dp else 10.dp)
-                                .horizontalScroll(rememberScrollState()),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            TimeSignatureSelectorPill(
-                                timeSignature = melody.timeSignature,
-                                onSelectTimeSignature = onTimeSignatureChange,
-                                onOpenCustomDialog = { showCustomTimeSigDialog = true }
-                            )
-                            KeySignatureSelectorPill(
-                                activeKeySignature = activeKeyAtCursor,
-                                modulationCount = melody.keySignatureEvents.size,
-                                onClick = { showKeySigDialog = true }
-                            )
-                            BpmCompactControl(
-                                bpm = melody.bpm,
-                                referenceTrackBpm = referenceTrackBpm,
-                                onBpmChange = onBpmChange,
-                                onOpenQuickDialog = { showBpmQuickDialog = true }
-                            )
-                            MelodyTinyToggle(
-                                label = if (melody.tempoEvents.isNotEmpty()) {
-                                    "变速(${melody.tempoEvents.size})"
-                                } else {
-                                    "速度记号"
-                                },
-                                active = melody.tempoEvents.isNotEmpty(),
-                                activeColor = WarmUmber,
-                                onClick = { expressionDialogTab = 2 }
-                            )
-                            SwingSelectorPill(
-                                swingPreset = melody.swingPreset,
-                                onSelectSwing = onSwingPresetChange
-                            )
-                            MelodyTinyToggle(
-                                label = "节拍器",
-                                active = melody.metronomeEnabled,
-                                activeColor = WarmUmber,
-                                onClick = onToggleMetronome
-                            )
-                            MelodyTinyToggle(
-                                label = "混响:${melody.reverbPreset.label}",
-                                active = true,
-                                activeColor = VioletAccent,
-                                onClick = onCycleReverb
-                            )
-                            if (!melody.dualKeyboardEnabled) {
-                                SustainControlPair(
-                                    sustainOn = melody.sustainPedal,
-                                    sustainSec = melody.sustainDurationSec,
-                                    accentColor = EmeraldLossless,
-                                    compact = false,
-                                    onToggleSustain = onTogglePrimarySustain,
-                                    onEditDuration = { editingSustainSlot = 0 }
-                                )
-                            }
-                            TouchGuardSelectorPill(
-                                config = melody.touchGuardConfig,
-                                onClick = { showTouchGuardDialog = true }
-                            )
-                            MelodyTinyToggle(
-                                label = if (melody.dualKeyboardEnabled) "双排键盘:开" else "+ 双排键盘",
-                                active = melody.dualKeyboardEnabled,
-                                activeColor = CyanPrimary,
-                                onClick = onToggleDualKeyboard
-                            )
-                        }
-                    }
-                }
-            }
-
-            HorizontalDivider(color = StudioBorder)
-            }
-
-            // ================================================================
-            // 3. Eye-Level Real 5-Line Staff (`五线谱` · 支持整页上下滚动与单行切换) + Score Title Bar
-            //    Placed ABOVE the Composing/Undo Dock so fingers never block the score!
+            // 2. Eye-Level Real 5-Line Staff (`五线谱` · 支持整页上下滚动与单行切换)
+            //    Placed directly below the unified top bar with zero duplicate banners!
             // ================================================================
             if (scoreCollapsed && !melody.keyboardMinimizedForScore) {
                 Surface(
@@ -848,11 +464,16 @@ fun MelodyStudioScreen(
                     ) {
                         val barIdx = melody.barNumberAtTick()
                         val beatIdx = melody.beatNumberAtTick()
+                        val staffTag = if (melody.grandStaffEnabled) {
+                            " · ${if (melody.activeStaff == StaffPart.TREBLE) "上行𝄞" else "下行𝄢"}"
+                        } else {
+                            ""
+                        }
                         Text(
                             text = if (melody.isRecording) {
-                                "《${melody.scoreTitle}》(${activeKeyAtCursor.shortPillLabel} · ${melody.timeSignature.label})双排弹录中 · 已录 ${melody.notes.size} 个符号"
+                                "《${melody.scoreTitle}》(${activeKeyAtCursor.shortPillLabel} · ${melody.timeSignature.label}$staffTag)双排弹录中 · 已录 ${melody.notes.size} 个符号"
                             } else {
-                                "《${melody.scoreTitle}》 · ${activeKeyAtCursor.shortPillLabel} · ${melody.timeSignature.label}拍 · 第${barIdx}小节第${beatIdx}拍 · 已写 ${melody.notes.size} 项"
+                                "《${melody.scoreTitle}》 · ${activeKeyAtCursor.shortPillLabel} · ${melody.timeSignature.label}拍$staffTag · 第${barIdx}小节第${beatIdx}拍 · 已写 ${melody.notes.size} 项"
                             },
                             fontSize = 11.sp,
                             fontWeight = FontWeight.Medium,
@@ -871,51 +492,28 @@ fun MelodyStudioScreen(
                     }
                 }
             } else {
-                Column(
+                InteractiveStaffScoreCanvas(
+                    melody = melody,
+                    isTablet = isTablet,
+                    onTapKeySignatureHeader = { showKeySigDialog = true },
+                    onTapTimeSignatureHeader = { showCustomTimeSigDialog = true },
+                    onTapCursorTick = onTapCursorTick,
+                    onTapCursorTickAndStaff = onTapCursorTickAndStaff,
+                    onSelectNote = onSelectNote,
+                    onSelectAnnotation = onSelectAnnotation,
+                    onOpenChordSymbolDialog = { showChordSymbolDialog = true },
                     modifier = Modifier
                         .fillMaxWidth()
                         .weight(1f)
-                ) {
-                    StaffTitleBanner(
-                        scoreTitle = melody.scoreTitle,
-                        scoreViewMode = melody.scoreViewMode,
-                        keyboardMinimizedForScore = melody.keyboardMinimizedForScore,
-                        autoSavedActive = melody.currentProjectId != null,
-                        activeKeySignature = activeKeyAtCursor,
-                        timeSignature = melody.timeSignature,
-                        bpm = melody.bpm,
-                        swingPreset = melody.swingPreset,
-                        barNum = melody.barNumberAtTick(),
-                        beatNum = melody.beatNumberAtTick(),
-                        isGrandStaff = StaffScoreEngraver.needsGrandStaff(melody.notes),
-                        compact = availWidth < 520.dp,
-                        onScoreViewModeChange = onScoreViewModeChange,
-                        onToggleFullScreenScore = onToggleMinimizeKeyboardForScore,
-                        onEditTitleClick = { showEditTitleDialog = true },
-                        onExportPdfClick = { showExportPdfDialog = true }
-                    )
-                    HorizontalDivider(color = StudioBorder.copy(alpha = 0.55f), thickness = 0.7.dp)
-                    InteractiveStaffScoreCanvas(
-                        melody = melody,
-                        isTablet = isTablet,
-                        onTapKeySignatureHeader = { showKeySigDialog = true },
-                        onTapTimeSignatureHeader = { showCustomTimeSigDialog = true },
-                        onTapCursorTick = onTapCursorTick,
-                        onSelectNote = onSelectNote,
-                        onSelectAnnotation = onSelectAnnotation,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .weight(1f)
-                    )
-                }
+                )
             }
 
             HorizontalDivider(color = StudioBorder)
 
             // ================================================================
-            // 4. Ergonomic Thumb-Zone Dock (Directly Above the Piano Keyboard!)
-            //    Pins Undo (`撤销`), Redo (`重做`), Backspace (`退格`), Transport,
-            //    Note Glyphs, Slurs (`乐句连线`), Expressions (`力度·奏法·速度`), & Rests!
+            // 3. Ergonomic Thumb-Zone Dock (Directly Above the Piano Keyboard!)
+            //    Pins Transport, Active Staff (`上行𝄞 | 下行𝄢`), Undo/Redo/Backspace,
+            //    Note Glyphs, Slurs (`乐句连线`), Expressions (`力度·奏法·速度`), & Chords!
             // ================================================================
             Surface(
                 color = StudioSurface,
@@ -931,6 +529,9 @@ fun MelodyStudioScreen(
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
                         Row(
+                            modifier = Modifier
+                                .widthIn(max = availWidth * 0.52f)
+                                .horizontalScroll(rememberScrollState()),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
@@ -940,7 +541,8 @@ fun MelodyStudioScreen(
                                 onTogglePlayStop = onTogglePlayStop,
                                 onPlayFromStart = onPlayFromStart,
                                 onSelectInputMode = onSelectInputMode,
-                                onToggleRecordStop = onToggleRecordStop
+                                onToggleRecordStop = onToggleRecordStop,
+                                onSetActiveStaff = onSetActiveStaff
                             )
                             ThumbUndoRedoBackspaceCluster(
                                 canUndo = melody.canUndo,
@@ -975,23 +577,24 @@ fun MelodyStudioScreen(
                                 onSlurSelectedOrExtendNext = onSlurSelectedOrExtendNext,
                                 onClearSelectedSlur = onClearSelectedSlur,
                                 onOpenExpressionStudio = openSmartExpressionDialog,
-                                onOpenTouchGuard = { showTouchGuardDialog = true },
+                                onOpenChordStudio = { showChordSymbolDialog = true },
                                 onToggleChordMode = onToggleChordMode,
                                 onQuantizeNotes = onQuantizeNotes,
-                                onToggleLoop = onToggleLoop,
                                 onAddBars = onAddBars
                             )
                         }
                     }
                 } else {
-                    val showUndoLabels = availWidth >= 430.dp && melody.inputMode == MelodyInputMode.STEP_INPUT
+                    val showUndoLabels = availWidth >= 460.dp &&
+                        melody.inputMode == MelodyInputMode.STEP_INPUT &&
+                        !melody.grandStaffEnabled
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(horizontal = 10.dp, vertical = if (isShortLandscape) 3.dp else 4.dp),
                         verticalArrangement = Arrangement.spacedBy(if (isShortLandscape) 3.dp else 4.dp)
                     ) {
-                        // Row 4A: Always-Pinned Transport + Thumb Undo / Redo / Backspace (Zero Scroll!)
+                        // Row 3A: Transport + Active Staff (`上行𝄞|下行𝄢`) + Pinned Undo / Redo / Backspace
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -999,14 +602,26 @@ fun MelodyStudioScreen(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            TransportAndModeLeftCluster(
-                                melody = melody,
-                                compactModeLabels = availWidth < 410.dp,
-                                onTogglePlayStop = onTogglePlayStop,
-                                onPlayFromStart = onPlayFromStart,
-                                onSelectInputMode = onSelectInputMode,
-                                onToggleRecordStop = onToggleRecordStop
-                            )
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .padding(end = 6.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    TransportAndModeLeftCluster(
+                                        melody = melody,
+                                        compactModeLabels = availWidth < 430.dp,
+                                        onTogglePlayStop = onTogglePlayStop,
+                                        onPlayFromStart = onPlayFromStart,
+                                        onSelectInputMode = onSelectInputMode,
+                                        onToggleRecordStop = onToggleRecordStop,
+                                        onSetActiveStaff = onSetActiveStaff
+                                    )
+                                }
+                            }
                             ThumbUndoRedoBackspaceCluster(
                                 canUndo = melody.canUndo,
                                 canRedo = melody.canRedo,
@@ -1023,7 +638,7 @@ fun MelodyStudioScreen(
                         }
 
                         if (!scoreCollapsed) {
-                            // Row 4B: Icon-Only Note Glyphs + Tuplets + Rests + Tie + Slur + Expressions
+                            // Row 3B: Icon-Only Note Glyphs + Tuplets + Rests + Tie + Slur + Expressions + Chords
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
@@ -1042,10 +657,9 @@ fun MelodyStudioScreen(
                                     onSlurSelectedOrExtendNext = onSlurSelectedOrExtendNext,
                                     onClearSelectedSlur = onClearSelectedSlur,
                                     onOpenExpressionStudio = openSmartExpressionDialog,
-                                    onOpenTouchGuard = { showTouchGuardDialog = true },
+                                    onOpenChordStudio = { showChordSymbolDialog = true },
                                     onToggleChordMode = onToggleChordMode,
                                     onQuantizeNotes = onQuantizeNotes,
-                                    onToggleLoop = onToggleLoop,
                                     onAddBars = onAddBars
                                 )
                             }
@@ -1057,7 +671,7 @@ fun MelodyStudioScreen(
             HorizontalDivider(color = StudioBorder)
 
             // ================================================================
-            // 5. Resizable & Layout-Persisted Primary & Secondary Keyboards
+            // 4. Resizable & Layout-Persisted Primary & Secondary Keyboards
             //    (Or slim Expand-Keyboard bar when Full-Screen Score mode is active!)
             // ================================================================
             if (melody.keyboardMinimizedForScore) {
@@ -1120,21 +734,16 @@ fun MelodyStudioScreen(
                     deckTitle = null,
                     accentColor = CyanPrimary,
                     instrument = melody.instrument,
-                    sustainOn = melody.sustainPedal,
-                    sustainDurationSec = melody.sustainDurationSec,
                     preferFlats = preferFlatsOnKeyboard,
                     isRecording = melody.isRecording,
                     touchGuardConfig = melody.touchGuardConfig,
-                    showInlineInstrumentAndSustain = isShortLandscape,
+                    showInlineInstrument = false,
                     availContainerWidthDp = availWidth.value,
                     geometry = layoutProfile.primary.copy(
                         deckHeightDp = effectivePrimaryHeightDp,
                         scrollWhiteKey = melody.primaryScrollWhiteKey
                     ),
                     onSelectInstrument = onSelectPrimaryInstrument,
-                    onToggleSustain = onTogglePrimarySustain,
-                    onEditSustainDuration = { editingSustainSlot = 0 },
-                    onOpenSizeConfig = { activeResizeDialogSlot = 0 },
                     onHeightDeltaDp = { deltaDp ->
                         persistLayoutUpdate { prof ->
                             val nextH = (effectivePrimaryHeightDp + deltaDp).coerceIn(96f, maxTotalKeyboardDp)
@@ -1163,24 +772,23 @@ fun MelodyStudioScreen(
             } else {
                 // Upper Keyboard (Slot 0)
                 IndependentKeyboardDeck(
-                    deckTitle = "上排",
+                    deckTitle = when {
+                        !melody.grandStaffEnabled -> "上排"
+                        melody.dualKeyboardStaffRouting == DualKeyboardStaffRouting.SPLIT_BY_DECK -> "上排→上行𝄞"
+                        else -> "上排(跟选中)"
+                    },
                     accentColor = CyanPrimary,
                     instrument = melody.instrument,
-                    sustainOn = melody.sustainPedal,
-                    sustainDurationSec = melody.sustainDurationSec,
                     preferFlats = preferFlatsOnKeyboard,
                     isRecording = melody.isRecording,
                     touchGuardConfig = melody.touchGuardConfig,
-                    showInlineInstrumentAndSustain = true,
+                    showInlineInstrument = true,
                     availContainerWidthDp = availWidth.value,
                     geometry = layoutProfile.primary.copy(
                         deckHeightDp = effectivePrimaryHeightDp,
                         scrollWhiteKey = melody.primaryScrollWhiteKey
                     ),
                     onSelectInstrument = onSelectPrimaryInstrument,
-                    onToggleSustain = onTogglePrimarySustain,
-                    onEditSustainDuration = { editingSustainSlot = 0 },
-                    onOpenSizeConfig = { activeResizeDialogSlot = 0 },
                     onHeightDeltaDp = { deltaDp ->
                         persistLayoutUpdate { prof ->
                             val nextH = (prof.primary.deckHeightDp + deltaDp).coerceIn(88f, maxTotalKeyboardDp - 88f)
@@ -1217,24 +825,23 @@ fun MelodyStudioScreen(
 
                 // Lower Keyboard (Slot 1)
                 IndependentKeyboardDeck(
-                    deckTitle = "下排",
+                    deckTitle = when {
+                        !melody.grandStaffEnabled -> "下排"
+                        melody.dualKeyboardStaffRouting == DualKeyboardStaffRouting.SPLIT_BY_DECK -> "下排→下行𝄢"
+                        else -> "下排(跟选中)"
+                    },
                     accentColor = EmeraldLossless,
                     instrument = melody.secondaryInstrument,
-                    sustainOn = melody.secondarySustainPedal,
-                    sustainDurationSec = melody.secondarySustainDurationSec,
                     preferFlats = preferFlatsOnKeyboard,
                     isRecording = melody.isRecording,
                     touchGuardConfig = melody.touchGuardConfig,
-                    showInlineInstrumentAndSustain = true,
+                    showInlineInstrument = true,
                     availContainerWidthDp = availWidth.value,
                     geometry = layoutProfile.secondary.copy(
                         deckHeightDp = effectiveSecondaryHeightDp,
                         scrollWhiteKey = melody.secondaryScrollWhiteKey
                     ),
                     onSelectInstrument = onSelectSecondaryInstrument,
-                    onToggleSustain = onToggleSecondarySustain,
-                    onEditSustainDuration = { editingSustainSlot = 1 },
-                    onOpenSizeConfig = { activeResizeDialogSlot = 1 },
                     onHeightDeltaDp = { deltaDp ->
                         persistLayoutUpdate { prof ->
                             val nextH = (prof.secondary.deckHeightDp + deltaDp).coerceIn(88f, maxTotalKeyboardDp - 88f)
@@ -1270,8 +877,71 @@ fun MelodyStudioScreen(
         }
 
         // ====================================================================
-        // Dialogs (Sustain 0.xxx秒 Input, Keyboard Resize, Score Title, PDF Export)
+        // Dialogs (Settings ⚙️, Sustain 0.xxx秒, Keyboard Resize, Score Title, PDF Export)
         // ====================================================================
+
+        if (showMelodySettingsDialog) {
+            MelodyStudioSettingsDialog(
+                melody = melody,
+                activeKeySignature = activeKeyAtCursor,
+                isTablet = isTablet,
+                scoreCollapsed = scoreCollapsed,
+                onToggleGrandStaff = onToggleGrandStaff,
+                onScoreViewModeChange = onScoreViewModeChange,
+                onToggleShowChordSymbols = onToggleShowChordSymbols,
+                onToggleChordPlayback = onToggleChordPlayback,
+                onOpenKeySignatureDialog = {
+                    showMelodySettingsDialog = false
+                    showKeySigDialog = true
+                },
+                onOpenCustomTimeSignatureDialog = {
+                    showMelodySettingsDialog = false
+                    showCustomTimeSigDialog = true
+                },
+                onOpenTempoStudioDialog = {
+                    showMelodySettingsDialog = false
+                    expressionDialogTab = 2
+                },
+                onTogglePrimarySustain = onTogglePrimarySustain,
+                onToggleSecondarySustain = onToggleSecondarySustain,
+                onEditPrimarySustainDuration = {
+                    showMelodySettingsDialog = false
+                    editingSustainSlot = 0
+                },
+                onEditSecondarySustainDuration = {
+                    showMelodySettingsDialog = false
+                    editingSustainSlot = 1
+                },
+                onSelectReverb = onSelectReverb,
+                onSwingPresetChange = onSwingPresetChange,
+                onToggleLoop = onToggleLoop,
+                onToggleDualKeyboard = onToggleDualKeyboard,
+                onToggleDualKeyboardStaffRouting = onToggleDualKeyboardStaffRouting,
+                onToggleCollapseScoreInDual = {
+                    val nextCollapsed = !melody.collapseScoreInDualMode
+                    onToggleCollapseScoreInDual()
+                    persistLayoutUpdate { it.copy(collapseScore = nextCollapsed) }
+                },
+                onOpenKeyboardSizeConfig = {
+                    showMelodySettingsDialog = false
+                    activeResizeDialogSlot = 0
+                },
+                onTouchGuardConfigChange = onTouchGuardConfigChange,
+                onOpenTouchGuardDetailDialog = {
+                    showMelodySettingsDialog = false
+                    showTouchGuardDialog = true
+                },
+                onLoadDemoMelody = {
+                    showMelodySettingsDialog = false
+                    onLoadDemoMelody()
+                },
+                onRequestClearScore = {
+                    showMelodySettingsDialog = false
+                    showClearConfirm = true
+                },
+                onDismiss = { showMelodySettingsDialog = false }
+            )
+        }
 
         editingSustainSlot?.let { slot ->
             val currentSec = if (slot == 1) melody.secondarySustainDurationSec else melody.sustainDurationSec
@@ -1383,6 +1053,20 @@ fun MelodyStudioScreen(
         )
     }
 
+    if (showChordSymbolDialog) {
+        ChordSymbolStudioDialog(
+            melody = melody,
+            onTapCursorTick = onTapCursorTick,
+            onAddBars = onAddBars,
+            onUpsertChordSymbol = onUpsertChordSymbol,
+            onDeleteChordSymbol = onDeleteChordSymbol,
+            onToggleShowChordSymbols = onToggleShowChordSymbols,
+            onToggleChordPlayback = onToggleChordPlayback,
+            onPreviewChordSymbol = onPreviewChordSymbol,
+            onDismiss = { showChordSymbolDialog = false }
+        )
+    }
+
     if (showTouchGuardDialog) {
         TouchGuardSettingsDialog(
             config = melody.touchGuardConfig,
@@ -1489,7 +1173,7 @@ fun MelodyStudioScreen(
             },
             text = {
                 Text(
-                    "将清空当前五线谱上的全部音符、休止符、中途变调及力度/奏法/速度记号（支持点击撤销恢复）。",
+                    "将清空当前五线谱上的全部音符、休止符、和弦标记、中途变调及力度/奏法/速度记号（支持点击撤销恢复）。",
                     fontSize = 13.sp,
                     color = TextSecondary
                 )
@@ -1992,8 +1676,8 @@ private fun ExportStaffPdfDialog(
 ) {
     var titleInput by remember(melody.scoreTitle) { mutableStateOf(melody.scoreTitle) }
     val resolvedTitle = titleInput.trim().ifBlank { "未命名乐谱" }
-    val staffTypeLabel = if (StaffScoreEngraver.needsGrandStaff(melody.notes)) {
-        "高低音大谱表 (Grand Staff)"
+    val staffTypeLabel = if (melody.grandStaffEnabled) {
+        "双行钢琴大谱表 (Grand Staff)"
     } else {
         "高音五线谱 (Treble Staff)"
     }
@@ -2055,8 +1739,13 @@ private fun ExportStaffPdfDialog(
                         } else {
                             melody.initialKeySignature.shortPillLabel
                         }
+                        val chordSummary = if (melody.showChordSymbols && melody.chordSymbols.isNotEmpty()) {
+                            " · 和弦标记 ${melody.chordSymbols.size} 处"
+                        } else {
+                            ""
+                        }
                         Text(
-                            text = "谱表类型：$staffTypeLabel · $keySummary · ${melody.timeSignature.label} 拍 · ♩ = ${melody.bpm} BPM$swingSummary · 共 ${melody.totalBars} 小节",
+                            text = "谱表类型：$staffTypeLabel · $keySummary · ${melody.timeSignature.label} 拍 · ♩ = ${melody.bpm} BPM$swingSummary$chordSummary · 共 ${melody.totalBars} 小节",
                             fontSize = 11.sp,
                             color = TextSecondary
                         )
@@ -2158,139 +1847,8 @@ private fun ExportStaffPdfDialog(
 }
 
 // ============================================================================
-// Time Signature (`拍号`), Global Swing, Tuplets & Thumb Undo/Redo Toolbar
+// Time Signature (`拍号`), Tuplets & Thumb Undo/Redo Toolbar
 // ============================================================================
-
-@Composable
-private fun TimeSignatureSelectorPill(
-    timeSignature: TimeSignature,
-    onSelectTimeSignature: (TimeSignature) -> Unit,
-    onOpenCustomDialog: () -> Unit
-) {
-    var expanded by remember { mutableStateOf(false) }
-    val nonDefault = timeSignature != TimeSignature.FOUR_FOUR
-    val shape = RoundedCornerShape(7.dp)
-
-    Box {
-        Surface(
-            shape = shape,
-            color = if (nonDefault) CyanPrimary.copy(alpha = 0.15f) else StudioSurfaceElevated,
-            border = BorderStroke(1.dp, if (nonDefault) CyanPrimary else StudioBorder),
-            modifier = Modifier
-                .height(27.dp)
-                .clip(shape)
-                .clickable { expanded = true }
-        ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.padding(start = 8.dp, end = 4.dp)
-            ) {
-                Text(
-                    text = "${timeSignature.label} 拍",
-                    fontSize = 11.sp,
-                    fontFamily = FontFamily.Serif,
-                    fontWeight = FontWeight.Bold,
-                    color = if (nonDefault) CyanPrimary else TextPrimary,
-                    maxLines = 1
-                )
-                Icon(
-                    imageVector = Icons.Rounded.ArrowDropDown,
-                    contentDescription = "选择或自定义拍号",
-                    tint = if (nonDefault) CyanPrimary else TextSecondary,
-                    modifier = Modifier.size(15.dp)
-                )
-            }
-        }
-
-        DropdownMenu(
-            expanded = expanded,
-            onDismissRequest = { expanded = false },
-            containerColor = StudioSurface
-        ) {
-            TimeSignature.PRESETS.forEach { option ->
-                val selected = option.timeSignature == timeSignature
-                DropdownMenuItem(
-                    leadingIcon = {
-                        Column(
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            modifier = Modifier.width(22.dp)
-                        ) {
-                            Text(
-                                text = "${option.timeSignature.safeNumerator}",
-                                fontFamily = FontFamily.Serif,
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 11.sp,
-                                lineHeight = 11.sp,
-                                color = if (selected) CyanPrimary else TextPrimary
-                            )
-                            Text(
-                                text = "${option.timeSignature.safeDenominator}",
-                                fontFamily = FontFamily.Serif,
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 11.sp,
-                                lineHeight = 11.sp,
-                                color = if (selected) CyanPrimary else TextPrimary
-                            )
-                        }
-                    },
-                    text = {
-                        Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
-                            Text(
-                                text = option.title,
-                                fontSize = 12.5.sp,
-                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-                                color = if (selected) CyanPrimary else TextPrimary
-                            )
-                            Text(
-                                text = option.subtitle,
-                                fontSize = 10.5.sp,
-                                color = TextMuted
-                            )
-                        }
-                    },
-                    trailingIcon = if (selected) {
-                        {
-                            Icon(
-                                imageVector = Icons.Rounded.Check,
-                                contentDescription = null,
-                                tint = CyanPrimary,
-                                modifier = Modifier.size(15.dp)
-                            )
-                        }
-                    } else null,
-                    onClick = {
-                        expanded = false
-                        onSelectTimeSignature(option.timeSignature)
-                    }
-                )
-            }
-
-            HorizontalDivider(color = StudioBorder)
-            DropdownMenuItem(
-                leadingIcon = {
-                    Icon(
-                        imageVector = Icons.Rounded.Tune,
-                        contentDescription = null,
-                        tint = VioletAccent,
-                        modifier = Modifier.size(16.dp)
-                    )
-                },
-                text = {
-                    Text(
-                        text = "自定义拍号（任意分子 / 分母）...",
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = VioletAccent
-                    )
-                },
-                onClick = {
-                    expanded = false
-                    onOpenCustomDialog()
-                }
-            )
-        }
-    }
-}
 
 @Composable
 private fun CustomTimeSignatureDialog(
@@ -2559,97 +2117,6 @@ private fun CustomTimeSignatureDialog(
             }
         }
     )
-}
-
-@Composable
-private fun SwingSelectorPill(
-    swingPreset: SwingPreset,
-    onSelectSwing: (SwingPreset) -> Unit
-) {
-    var expanded by remember { mutableStateOf(false) }
-    val active = swingPreset.isEnabled
-    val shape = RoundedCornerShape(7.dp)
-
-    Box {
-        Surface(
-            shape = shape,
-            color = if (active) AmberMastering.copy(alpha = 0.16f) else StudioSurfaceElevated,
-            border = BorderStroke(1.dp, if (active) AmberMastering else StudioBorder),
-            modifier = Modifier
-                .height(27.dp)
-                .clip(shape)
-                .clickable { expanded = true }
-        ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.padding(start = 8.dp, end = 4.dp)
-            ) {
-                Text(
-                    text = swingPreset.shortBadge,
-                    fontSize = 11.sp,
-                    fontWeight = if (active) FontWeight.Bold else FontWeight.Medium,
-                    color = if (active) AmberMastering else TextSecondary,
-                    maxLines = 1
-                )
-                Icon(
-                    imageVector = Icons.Rounded.ArrowDropDown,
-                    contentDescription = "选择全局 Swing 摇摆律动",
-                    tint = if (active) AmberMastering else TextSecondary,
-                    modifier = Modifier.size(15.dp)
-                )
-            }
-        }
-
-        DropdownMenu(
-            expanded = expanded,
-            onDismissRequest = { expanded = false },
-            containerColor = StudioSurface
-        ) {
-            SwingPreset.entries.forEach { preset ->
-                val selected = preset == swingPreset
-                DropdownMenuItem(
-                    text = {
-                        Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
-                            Text(
-                                text = preset.label,
-                                fontSize = 12.5.sp,
-                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-                                color = if (selected) AmberMastering else TextPrimary
-                            )
-                            Text(
-                                text = preset.menuSubtitle,
-                                fontSize = 10.5.sp,
-                                color = TextMuted
-                            )
-                        }
-                    },
-                    trailingIcon = if (selected) {
-                        {
-                            Icon(
-                                imageVector = Icons.Rounded.Check,
-                                contentDescription = null,
-                                tint = AmberMastering,
-                                modifier = Modifier.size(15.dp)
-                            )
-                        }
-                    } else null,
-                    onClick = {
-                        expanded = false
-                        onSelectSwing(preset)
-                    }
-                )
-            }
-            HorizontalDivider(color = StudioBorder)
-            Text(
-                text = "按标准记谱惯例：谱面保持平直八分/十六分记谱并在谱头标注 Swing，试听与生成音轨全局生效",
-                fontSize = 10.sp,
-                color = TextMuted,
-                modifier = Modifier
-                    .widthIn(max = 268.dp)
-                    .padding(horizontal = 12.dp, vertical = 6.dp)
-            )
-        }
-    }
 }
 
 @Composable
@@ -3027,10 +2494,9 @@ private fun StepOrRecordControlsCluster(
     onSlurSelectedOrExtendNext: () -> Unit,
     onClearSelectedSlur: () -> Unit,
     onOpenExpressionStudio: () -> Unit,
-    onOpenTouchGuard: () -> Unit,
+    onOpenChordStudio: () -> Unit,
     onToggleChordMode: () -> Unit,
     onQuantizeNotes: () -> Unit,
-    onToggleLoop: () -> Unit,
     onAddBars: () -> Unit
 ) {
     var showAllRestsMenu by remember { mutableStateOf(false) }
@@ -3047,13 +2513,21 @@ private fun StepOrRecordControlsCluster(
             if (melody.pendingFermata) append("延")
         }
     }
-    val hasArmedOrSelectedExpr = activeBadgeSummary.isNotEmpty() || melody.selectedAnnotation != null
+    val hasArmedOrSelectedExpr = activeBadgeSummary.isNotEmpty() ||
+        (melody.selectedAnnotation != null && melody.selectedAnnotation !is SelectedScoreAnnotation.ChordSymbol)
     val exprButtonLabel = when {
-        melody.selectedAnnotation != null -> "改记号"
+        melody.selectedAnnotation != null && melody.selectedAnnotation !is SelectedScoreAnnotation.ChordSymbol -> "改记号"
         selNote != null && activeBadgeSummary.isNotEmpty() -> "记号:$activeBadgeSummary"
         activeBadgeSummary.isNotEmpty() -> "下音:$activeBadgeSummary"
         else -> "记号·表情"
     }
+    val chordAtCursor = melody.chordSymbolAtTick(melody.cursorTick)
+    val chordBtnLabel = when {
+        chordAtCursor != null -> "和弦:${chordAtCursor.symbol}"
+        melody.chordSymbols.isNotEmpty() -> "和弦标记(${melody.chordSymbols.size})"
+        else -> "+和弦标记"
+    }
+    val chordBtnActive = chordAtCursor != null || melody.selectedAnnotation is SelectedScoreAnnotation.ChordSymbol
 
     Row(
         verticalAlignment = Alignment.CenterVertically,
@@ -3232,25 +2706,25 @@ private fun StepOrRecordControlsCluster(
                 onClearSelectedSlur = onClearSelectedSlur
             )
 
-            // 5. Musical Expressions (`力度 · 奏法 · 速度`)
+            // 5. Musical Expressions (`力度 · 奏法 · 速度`) + Above-Staff Chord Symbols (`和弦标记`)
             MelodyTinyToggle(
                 label = exprButtonLabel,
                 active = hasArmedOrSelectedExpr,
                 activeColor = VioletAccent,
                 onClick = onOpenExpressionStudio
             )
+            MelodyTinyToggle(
+                label = chordBtnLabel,
+                active = chordBtnActive,
+                activeColor = VioletAccent,
+                onClick = onOpenChordStudio
+            )
 
             MelodyTinyToggle(
-                label = if (melody.chordStepMode) "和弦:开" else "和弦",
+                label = if (melody.chordStepMode) "同拍叠音:开" else "同拍叠音",
                 active = melody.chordStepMode,
                 activeColor = AmberMastering,
                 onClick = onToggleChordMode
-            )
-            MelodyTinyToggle(
-                label = "循环",
-                active = melody.loopPlayback,
-                activeColor = CyanPrimary,
-                onClick = onToggleLoop
             )
             MelodyTinyToggle(
                 label = "+小节",
@@ -3302,20 +2776,16 @@ private fun StepOrRecordControlsCluster(
                 onClick = onOpenExpressionStudio
             )
             MelodyTinyToggle(
-                label = "循环",
-                active = melody.loopPlayback,
-                activeColor = CyanPrimary,
-                onClick = onToggleLoop
+                label = chordBtnLabel,
+                active = chordBtnActive,
+                activeColor = VioletAccent,
+                onClick = onOpenChordStudio
             )
             MelodyTinyToggle(
                 label = "+小节",
                 active = false,
                 activeColor = TextSecondary,
                 onClick = onAddBars
-            )
-            TouchGuardSelectorPill(
-                config = melody.touchGuardConfig,
-                onClick = onOpenTouchGuard
             )
             Text(
                 text = if (melody.isRecording) "跟着节拍弹奏，五线谱将实时生成音符" else "点「开始弹录」跟节拍弹奏",
@@ -3538,197 +3008,1371 @@ private fun MusicalRestGlyphIcon(
 }
 
 // ============================================================================
-// Sheet Title Header + Interactive Real 5-Line Staff Canvas (Point 4)
+// Unified Single-Row Top Bar + Secondary Settings Panel (`⚙️ 设置`)
 // ============================================================================
 
 @Composable
-private fun StaffTitleBanner(
-    scoreTitle: String,
-    scoreViewMode: ScoreViewMode,
-    keyboardMinimizedForScore: Boolean,
-    autoSavedActive: Boolean,
+private fun MelodyUnifiedTopBar(
+    melody: MelodyStudioUiState,
     activeKeySignature: KeySignature,
-    timeSignature: TimeSignature,
-    bpm: Int,
-    swingPreset: SwingPreset,
-    barNum: Int,
-    beatNum: Int,
-    isGrandStaff: Boolean,
-    compact: Boolean,
-    onScoreViewModeChange: (ScoreViewMode) -> Unit,
-    onToggleFullScreenScore: () -> Unit,
+    availWidthDp: Float,
+    isTablet: Boolean,
+    isShortLandscape: Boolean,
     onEditTitleClick: () -> Unit,
-    onExportPdfClick: () -> Unit
+    onOpenProjectManager: () -> Unit,
+    onSelectPrimaryInstrument: (StudioInstrument) -> Unit,
+    onOpenKeySignatureDialog: () -> Unit,
+    onSelectTimeSignature: (TimeSignature) -> Unit,
+    onOpenCustomTimeSignatureDialog: () -> Unit,
+    onBpmChange: (Int) -> Unit,
+    onOpenBpmQuickDialog: () -> Unit,
+    onToggleMetronome: () -> Unit,
+    onToggleFullScreenScore: () -> Unit,
+    onOpenSettingsDialog: () -> Unit,
+    onExportMelodyToWorkspace: () -> Unit,
+    onOpenExportPdfDialog: () -> Unit
 ) {
-    val swingTag = swingPreset.scoreMarking?.let { " · $it" } ?: ""
+    val density = LocalDensity.current
+    val haptic = LocalHapticFeedback.current
+    val compact = availWidthDp < 560f
+    val pillHeight = if (isShortLandscape) 27.dp else 29.dp
+    // Strictly cap right horizontalScroll row width BEFORE horizontalScroll so weight(1f) title never collapses
+    val maxRightToolbarDp = (availWidthDp * if (compact) 0.63f else 0.72f).coerceAtLeast(190f).dp
+
+    var showInstMenu by remember { mutableStateOf(false) }
+    var showTimeSigMenu by remember { mutableStateOf(false) }
+    var showExportMenu by remember { mutableStateOf(false) }
+
+    val bpmScrubStepPx = with(density) { 5.2.dp.toPx().coerceAtLeast(4f) }
+    var isScrubbingBpm by remember { mutableStateOf(false) }
+    var bpmDragAccumPx by remember { mutableFloatStateOf(0f) }
+    val latestBpm by rememberUpdatedState(melody.bpm)
+    val latestOnBpmChange by rememberUpdatedState(onBpmChange)
+
+    val hasActiveSecondarySettings = melody.grandStaffEnabled ||
+        melody.dualKeyboardEnabled ||
+        melody.swingPreset.isEnabled ||
+        melody.sustainPedal ||
+        (melody.dualKeyboardEnabled && melody.secondarySustainPedal) ||
+        melody.loopPlayback ||
+        melody.scoreViewMode == ScoreViewMode.SINGLE_STRIP
+
     Surface(
-        color = Color(0xFFFAF7F0),
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(31.dp)
+        color = StudioSurface,
+        modifier = Modifier.fillMaxWidth()
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = if (compact) 6.dp else 10.dp),
+                .height(if (isShortLandscape) 40.dp else 44.dp)
+                .padding(horizontal = if (isTablet) 14.dp else 8.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
+            // Left Adaptive Cluster: Score Title (`《曲名》✎`) + Auto-Save Drafts (`草稿/工程`)
             Row(
-                verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier
                     .weight(1f)
-                    .clip(RoundedCornerShape(6.dp))
-                    .clickable(onClick = onEditTitleClick)
-                    .padding(vertical = 2.dp, horizontal = 3.dp)
+                    .padding(end = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(5.dp)
             ) {
-                Text(
-                    text = "《${scoreTitle.ifBlank { "未命名乐谱" }}》",
-                    fontFamily = FontFamily.Serif,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = if (compact) 12.sp else 13.sp,
-                    color = TextPrimary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-                Spacer(modifier = Modifier.width(3.dp))
-                Icon(
-                    imageVector = Icons.Rounded.DriveFileRenameOutline,
-                    contentDescription = "编辑标题",
-                    tint = CyanPrimary,
-                    modifier = Modifier.size(13.dp)
-                )
-                if (autoSavedActive && !compact) {
-                    Spacer(modifier = Modifier.width(5.dp))
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .weight(1f, fill = false)
+                        .clip(RoundedCornerShape(7.dp))
+                        .clickable(onClick = onEditTitleClick)
+                        .padding(horizontal = 3.dp, vertical = 3.dp)
+                ) {
                     Text(
-                        text = "✓自动保存",
-                        fontSize = 9.5.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = EmeraldLossless,
-                        maxLines = 1
+                        text = "《${melody.scoreTitle.ifBlank { "未命名乐谱" }}》",
+                        fontFamily = FontFamily.Serif,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = if (isTablet) 14.5.sp else 12.5.sp,
+                        color = TextPrimary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                    Spacer(modifier = Modifier.width(2.dp))
+                    Icon(
+                        imageVector = Icons.Rounded.DriveFileRenameOutline,
+                        contentDescription = "修改曲谱标题",
+                        tint = CyanPrimary,
+                        modifier = Modifier.size(13.dp)
                     )
                 }
-                Spacer(modifier = Modifier.width(6.dp))
-                Text(
-                    text = if (compact) {
-                        "${activeKeySignature.shortPillLabel} · 第${barNum}小节"
-                    } else {
-                        "${if (isGrandStaff) "大谱表" else "高音谱表"} · ${activeKeySignature.shortPillLabel} · ${timeSignature.label}拍 · ♩=$bpm$swingTag · 第${barNum}小节第${beatNum}拍"
-                    },
-                    fontSize = 10.5.sp,
-                    color = if (swingPreset.isEnabled) WarmUmber else TextMuted,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
+
+                val isSavedProject = melody.currentProjectId != null
+                val projShape = RoundedCornerShape(8.dp)
+                Surface(
+                    shape = projShape,
+                    color = if (isSavedProject) EmeraldLossless.copy(alpha = 0.13f) else StudioSurfaceElevated,
+                    border = BorderStroke(
+                        1.dp,
+                        if (isSavedProject) EmeraldLossless.copy(alpha = 0.48f) else StudioBorder
+                    ),
+                    modifier = Modifier
+                        .height(pillHeight)
+                        .clip(projShape)
+                        .clickable(onClick = onOpenProjectManager)
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(horizontal = if (compact) 6.dp else 8.dp)
+                    ) {
+                        Icon(
+                            imageVector = if (isSavedProject) Icons.Rounded.Check else Icons.Rounded.FolderOpen,
+                            contentDescription = "草稿与本地工程",
+                            tint = if (isSavedProject) EmeraldLossless else CyanPrimary,
+                            modifier = Modifier.size(12.dp)
+                        )
+                        Spacer(modifier = Modifier.width(3.dp))
+                        Text(
+                            text = when {
+                                compact && isSavedProject -> "已存"
+                                compact -> "草稿"
+                                isSavedProject -> "已存·工程"
+                                else -> "草稿/工程"
+                            },
+                            fontSize = 10.5.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = if (isSavedProject) EmeraldLossless else TextPrimary,
+                            maxLines = 1
+                        )
+                    }
+                }
             }
 
+            // Right Compact Pill Strip (widthIn BEFORE horizontalScroll per AGENTS.md)
             Row(
+                modifier = Modifier
+                    .widthIn(max = maxRightToolbarDp)
+                    .horizontalScroll(rememberScrollState()),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(if (compact) 4.dp else 6.dp)
+                horizontalArrangement = Arrangement.spacedBy(if (compact) 4.dp else 5.dp)
             ) {
-                // Segmented Toggle: `整页谱` (Multi-row scrollable sheet) vs `单行谱` (Horizontal strip)
-                Surface(
-                    shape = RoundedCornerShape(7.dp),
-                    color = Color(0xFFEDE7DC),
-                    border = BorderStroke(0.8.dp, StudioBorder.copy(alpha = 0.7f)),
-                    modifier = Modifier.height(23.dp)
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        ScoreViewMode.entries.forEach { mode ->
-                            val selected = mode == scoreViewMode
-                            val segShape = RoundedCornerShape(6.dp)
-                            Box(
-                                contentAlignment = Alignment.Center,
-                                modifier = Modifier
-                                    .fillMaxHeight()
-                                    .clip(segShape)
-                                    .background(if (selected) CyanPrimary else Color.Transparent)
-                                    .clickable { onScoreViewModeChange(mode) }
-                                    .padding(horizontal = if (compact) 6.dp else 8.dp)
+                // 1. Instrument Dropdown Pill (shown in single-keyboard or full-screen score mode)
+                if (!melody.dualKeyboardEnabled || melody.keyboardMinimizedForScore) {
+                    Box {
+                        val instShape = RoundedCornerShape(8.dp)
+                        Surface(
+                            shape = instShape,
+                            color = CyanPrimary.copy(alpha = 0.13f),
+                            border = BorderStroke(1.dp, CyanPrimary.copy(alpha = 0.45f)),
+                            modifier = Modifier
+                                .height(pillHeight)
+                                .clip(instShape)
+                                .clickable { showInstMenu = true }
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.padding(start = if (compact) 6.dp else 8.dp, end = 3.dp)
                             ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Piano,
+                                    contentDescription = null,
+                                    tint = CyanPrimary,
+                                    modifier = Modifier.size(12.dp)
+                                )
+                                Spacer(modifier = Modifier.width(3.dp))
                                 Text(
-                                    text = if (compact) {
-                                        when (mode) {
-                                            ScoreViewMode.PAGE_SCROLL -> "整页"
-                                            ScoreViewMode.SINGLE_STRIP -> "单行"
-                                        }
-                                    } else {
-                                        mode.label
-                                    },
-                                    fontSize = 10.sp,
-                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-                                    color = if (selected) OnAccentLight else TextSecondary,
+                                    text = if (compact) melody.instrument.shortName else melody.instrument.displayName,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = CyanPrimary,
                                     maxLines = 1
+                                )
+                                Icon(
+                                    imageVector = Icons.Rounded.ArrowDropDown,
+                                    contentDescription = "选择乐器音色",
+                                    tint = CyanPrimary,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                            }
+                        }
+
+                        DropdownMenu(
+                            expanded = showInstMenu,
+                            onDismissRequest = { showInstMenu = false },
+                            containerColor = StudioSurface
+                        ) {
+                            StudioInstrument.entries.forEach { inst ->
+                                val selected = inst == melody.instrument
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            text = inst.displayName,
+                                            fontSize = 12.5.sp,
+                                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                                            color = if (selected) CyanPrimary else TextPrimary
+                                        )
+                                    },
+                                    trailingIcon = if (selected) {
+                                        {
+                                            Icon(
+                                                imageVector = Icons.Rounded.Check,
+                                                contentDescription = null,
+                                                tint = CyanPrimary,
+                                                modifier = Modifier.size(15.dp)
+                                            )
+                                        }
+                                    } else null,
+                                    onClick = {
+                                        showInstMenu = false
+                                        onSelectPrimaryInstrument(inst)
+                                    }
                                 )
                             }
                         }
                     }
                 }
 
-                // Quick Full-Screen Score Toggle (`全屏看谱` / `展开琴键`)
-                val fsShape = RoundedCornerShape(7.dp)
+                // 2. Unified Key & Time Signature Split Pill (`C大调 | 4/4▾`)
+                Box {
+                    val keyNonDefault = activeKeySignature != KeySignature.C_MAJOR || melody.keySignatureEvents.isNotEmpty()
+                    val timeNonDefault = melody.timeSignature != TimeSignature.FOUR_FOUR
+                    val keyLabel = if (melody.keySignatureEvents.isNotEmpty()) {
+                        "${activeKeySignature.shortPillLabel}·转${melody.keySignatureEvents.size}"
+                    } else {
+                        activeKeySignature.shortPillLabel
+                    }
+
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        val leftShape = RoundedCornerShape(topStart = 8.dp, bottomStart = 8.dp)
+                        Surface(
+                            shape = leftShape,
+                            color = if (keyNonDefault) VioletAccent.copy(alpha = 0.13f) else StudioSurfaceElevated,
+                            border = BorderStroke(1.dp, if (keyNonDefault) VioletAccent.copy(alpha = 0.55f) else StudioBorder),
+                            modifier = Modifier
+                                .height(pillHeight)
+                                .clip(leftShape)
+                                .clickable(onClick = onOpenKeySignatureDialog)
+                        ) {
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier.padding(horizontal = if (compact) 6.dp else 8.dp)
+                            ) {
+                                Text(
+                                    text = keyLabel,
+                                    fontSize = 11.sp,
+                                    fontFamily = FontFamily.Serif,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (keyNonDefault) VioletAccent else TextPrimary,
+                                    maxLines = 1
+                                )
+                            }
+                        }
+
+                        val rightShape = RoundedCornerShape(topEnd = 8.dp, bottomEnd = 8.dp)
+                        Surface(
+                            shape = rightShape,
+                            color = if (timeNonDefault) CyanPrimary.copy(alpha = 0.14f) else StudioSurfaceElevated,
+                            border = BorderStroke(1.dp, if (timeNonDefault) CyanPrimary else StudioBorder),
+                            modifier = Modifier
+                                .height(pillHeight)
+                                .clip(rightShape)
+                                .clickable { showTimeSigMenu = true }
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.padding(start = if (compact) 5.dp else 7.dp, end = 2.dp)
+                            ) {
+                                Text(
+                                    text = melody.timeSignature.label,
+                                    fontSize = 11.sp,
+                                    fontFamily = FontFamily.Serif,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (timeNonDefault) CyanPrimary else TextPrimary,
+                                    maxLines = 1
+                                )
+                                Icon(
+                                    imageVector = Icons.Rounded.ArrowDropDown,
+                                    contentDescription = "选择拍号",
+                                    tint = if (timeNonDefault) CyanPrimary else TextSecondary,
+                                    modifier = Modifier.size(13.dp)
+                                )
+                            }
+                        }
+                    }
+
+                    DropdownMenu(
+                        expanded = showTimeSigMenu,
+                        onDismissRequest = { showTimeSigMenu = false },
+                        containerColor = StudioSurface
+                    ) {
+                        TimeSignature.PRESETS.forEach { option ->
+                            val selected = option.timeSignature == melody.timeSignature
+                            DropdownMenuItem(
+                                leadingIcon = {
+                                    Column(
+                                        horizontalAlignment = Alignment.CenterHorizontally,
+                                        modifier = Modifier.width(22.dp)
+                                    ) {
+                                        Text(
+                                            text = "${option.timeSignature.safeNumerator}",
+                                            fontFamily = FontFamily.Serif,
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = 11.sp,
+                                            lineHeight = 11.sp,
+                                            color = if (selected) CyanPrimary else TextPrimary
+                                        )
+                                        Text(
+                                            text = "${option.timeSignature.safeDenominator}",
+                                            fontFamily = FontFamily.Serif,
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = 11.sp,
+                                            lineHeight = 11.sp,
+                                            color = if (selected) CyanPrimary else TextPrimary
+                                        )
+                                    }
+                                },
+                                text = {
+                                    Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                                        Text(
+                                            text = option.title,
+                                            fontSize = 12.5.sp,
+                                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                                            color = if (selected) CyanPrimary else TextPrimary
+                                        )
+                                        Text(
+                                            text = option.subtitle,
+                                            fontSize = 10.5.sp,
+                                            color = TextMuted
+                                        )
+                                    }
+                                },
+                                trailingIcon = if (selected) {
+                                    {
+                                        Icon(
+                                            imageVector = Icons.Rounded.Check,
+                                            contentDescription = null,
+                                            tint = CyanPrimary,
+                                            modifier = Modifier.size(15.dp)
+                                        )
+                                    }
+                                } else null,
+                                onClick = {
+                                    showTimeSigMenu = false
+                                    onSelectTimeSignature(option.timeSignature)
+                                }
+                            )
+                        }
+                        HorizontalDivider(color = StudioBorder)
+                        DropdownMenuItem(
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = Icons.Rounded.Tune,
+                                    contentDescription = null,
+                                    tint = VioletAccent,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            },
+                            text = {
+                                Text(
+                                    text = "自定义拍号（任意分子 / 分母）...",
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = VioletAccent
+                                )
+                            },
+                            onClick = {
+                                showTimeSigMenu = false
+                                onOpenCustomTimeSignatureDialog()
+                            }
+                        )
+                    }
+                }
+
+                // 3. Unified BPM (Tap + Horizontal Drag Scrub) & Metronome Split Pill (`♩=120 | 节拍`)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    val bpmShape = RoundedCornerShape(topStart = 8.dp, bottomStart = 8.dp)
+                    Surface(
+                        shape = bpmShape,
+                        color = if (isScrubbingBpm) CyanPrimary.copy(alpha = 0.16f) else StudioSurfaceElevated,
+                        border = BorderStroke(1.dp, if (isScrubbingBpm) CyanPrimary else StudioBorder),
+                        modifier = Modifier
+                            .height(pillHeight)
+                            .clip(bpmShape)
+                            .clickable(onClick = onOpenBpmQuickDialog)
+                            .pointerInput(bpmScrubStepPx) {
+                                detectHorizontalDragGestures(
+                                    onDragStart = {
+                                        isScrubbingBpm = true
+                                        bpmDragAccumPx = 0f
+                                    },
+                                    onDragEnd = {
+                                        isScrubbingBpm = false
+                                        bpmDragAccumPx = 0f
+                                    },
+                                    onDragCancel = {
+                                        isScrubbingBpm = false
+                                        bpmDragAccumPx = 0f
+                                    },
+                                    onHorizontalDrag = { change, dragAmount ->
+                                        change.consume()
+                                        bpmDragAccumPx += dragAmount
+                                        val deltaBpm = (bpmDragAccumPx / bpmScrubStepPx).toInt()
+                                        if (deltaBpm != 0) {
+                                            bpmDragAccumPx -= deltaBpm * bpmScrubStepPx
+                                            val next = (latestBpm + deltaBpm).coerceIn(40, 220)
+                                            if (next != latestBpm) {
+                                                if (next % 5 == 0) {
+                                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                                }
+                                                latestOnBpmChange(next)
+                                            }
+                                        }
+                                    }
+                                )
+                            }
+                    ) {
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier.padding(horizontal = if (compact) 6.dp else 8.dp)
+                        ) {
+                            Text(
+                                text = "♩=${melody.bpm}",
+                                fontSize = 11.sp,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold,
+                                color = if (isScrubbingBpm) CyanPrimary else TextPrimary,
+                                maxLines = 1
+                            )
+                        }
+                    }
+
+                    val metroShape = RoundedCornerShape(topEnd = 8.dp, bottomEnd = 8.dp)
+                    Surface(
+                        shape = metroShape,
+                        color = if (melody.metronomeEnabled) WarmUmber.copy(alpha = 0.16f) else StudioSurfaceElevated,
+                        border = BorderStroke(1.dp, if (melody.metronomeEnabled) WarmUmber else StudioBorder),
+                        modifier = Modifier
+                            .height(pillHeight)
+                            .clip(metroShape)
+                            .clickable(onClick = onToggleMetronome)
+                    ) {
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier.padding(horizontal = if (compact) 6.dp else 7.dp)
+                        ) {
+                            Text(
+                                text = "节拍",
+                                fontSize = 10.5.sp,
+                                fontWeight = if (melody.metronomeEnabled) FontWeight.Bold else FontWeight.Medium,
+                                color = if (melody.metronomeEnabled) WarmUmber else TextSecondary,
+                                maxLines = 1
+                            )
+                        }
+                    }
+                }
+
+                // 4. Full-Screen Score Toggle (`全屏看谱` / `展开琴键`)
+                val fsShape = RoundedCornerShape(8.dp)
                 Surface(
                     shape = fsShape,
-                    color = if (keyboardMinimizedForScore) {
-                        CyanPrimary.copy(alpha = 0.16f)
-                    } else {
-                        Color(0xFFEDE7DC)
-                    },
-                    border = BorderStroke(
-                        0.8.dp,
-                        if (keyboardMinimizedForScore) CyanPrimary else StudioBorder.copy(alpha = 0.7f)
-                    ),
+                    color = if (melody.keyboardMinimizedForScore) CyanPrimary.copy(alpha = 0.16f) else StudioSurfaceElevated,
+                    border = BorderStroke(1.dp, if (melody.keyboardMinimizedForScore) CyanPrimary else StudioBorder),
                     modifier = Modifier
-                        .height(23.dp)
+                        .height(pillHeight)
                         .clip(fsShape)
                         .clickable(onClick = onToggleFullScreenScore)
                 ) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.padding(horizontal = if (compact) 5.dp else 7.dp)
+                        modifier = Modifier.padding(horizontal = if (compact) 6.dp else 8.dp)
                     ) {
                         Icon(
-                            imageVector = if (keyboardMinimizedForScore) {
+                            imageVector = if (melody.keyboardMinimizedForScore) {
                                 Icons.Rounded.UnfoldLess
                             } else {
                                 Icons.Rounded.UnfoldMore
                             },
                             contentDescription = null,
-                            tint = if (keyboardMinimizedForScore) CyanPrimary else TextPrimary,
-                            modifier = Modifier.size(12.dp)
+                            tint = if (melody.keyboardMinimizedForScore) CyanPrimary else TextPrimary,
+                            modifier = Modifier.size(13.dp)
                         )
                         Spacer(modifier = Modifier.width(2.dp))
                         Text(
                             text = when {
-                                keyboardMinimizedForScore && compact -> "琴键"
-                                keyboardMinimizedForScore -> "展开琴键"
+                                melody.keyboardMinimizedForScore && compact -> "琴键"
+                                melody.keyboardMinimizedForScore -> "展开琴键"
                                 compact -> "全谱"
                                 else -> "全屏看谱"
                             },
-                            fontSize = 10.sp,
+                            fontSize = 10.5.sp,
                             fontWeight = FontWeight.SemiBold,
-                            color = if (keyboardMinimizedForScore) CyanPrimary else TextPrimary,
+                            color = if (melody.keyboardMinimizedForScore) CyanPrimary else TextPrimary,
                             maxLines = 1
                         )
                     }
                 }
 
-                if (!compact) {
-                    Text(
-                        text = "PDF ▸",
-                        fontSize = 10.5.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = VioletAccent,
-                        maxLines = 1,
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(6.dp))
-                            .clickable(onClick = onExportPdfClick)
-                            .padding(horizontal = 5.dp, vertical = 2.dp)
-                    )
+                // 5. Secondary Settings Pill (`⚙️ 设置`)
+                val setShape = RoundedCornerShape(8.dp)
+                Surface(
+                    shape = setShape,
+                    color = if (hasActiveSecondarySettings) StudioSurfaceElevated else StudioSurfaceElevated,
+                    border = BorderStroke(
+                        1.dp,
+                        if (hasActiveSecondarySettings) CyanPrimary.copy(alpha = 0.55f) else StudioBorder
+                    ),
+                    modifier = Modifier
+                        .height(pillHeight)
+                        .clip(setShape)
+                        .clickable(onClick = onOpenSettingsDialog)
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(horizontal = if (compact) 6.dp else 8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Settings,
+                            contentDescription = "打谱与键盘设置",
+                            tint = if (hasActiveSecondarySettings) CyanPrimary else TextPrimary,
+                            modifier = Modifier.size(13.dp)
+                        )
+                        Spacer(modifier = Modifier.width(3.dp))
+                        Text(
+                            text = "设置",
+                            fontSize = 10.5.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = TextPrimary,
+                            maxLines = 1
+                        )
+                        if (hasActiveSecondarySettings) {
+                            Spacer(modifier = Modifier.width(3.dp))
+                            Box(
+                                modifier = Modifier
+                                    .size(5.dp)
+                                    .clip(RoundedCornerShape(50))
+                                    .background(CyanPrimary)
+                            )
+                        }
+                    }
+                }
+
+                // 6. Primary Split Export Action (`[ ✓ 生成音轨 | ▾ ]`)
+                Box {
+                    val canExportAudio = melody.hasPlayableNotes
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        val expLeftShape = RoundedCornerShape(topStart = 8.dp, bottomStart = 8.dp)
+                        Surface(
+                            shape = expLeftShape,
+                            color = if (canExportAudio) CyanPrimary else StudioSurfaceElevated,
+                            border = if (canExportAudio) null else BorderStroke(1.dp, StudioBorder),
+                            modifier = Modifier
+                                .height(pillHeight)
+                                .clip(expLeftShape)
+                                .clickable(enabled = canExportAudio, onClick = onExportMelodyToWorkspace)
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.padding(horizontal = if (compact) 7.dp else 9.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Check,
+                                    contentDescription = null,
+                                    tint = if (canExportAudio) OnAccentLight else TextMuted,
+                                    modifier = Modifier.size(13.dp)
+                                )
+                                Spacer(modifier = Modifier.width(3.dp))
+                                Text(
+                                    text = if (compact) "生成音轨" else "生成音轨",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (canExportAudio) OnAccentLight else TextMuted,
+                                    maxLines = 1
+                                )
+                            }
+                        }
+
+                        val expRightShape = RoundedCornerShape(topEnd = 8.dp, bottomEnd = 8.dp)
+                        Surface(
+                            shape = expRightShape,
+                            color = if (canExportAudio) CyanPrimary.copy(alpha = 0.86f) else StudioSurfaceElevated,
+                            border = if (canExportAudio) null else BorderStroke(1.dp, StudioBorder),
+                            modifier = Modifier
+                                .height(pillHeight)
+                                .clip(expRightShape)
+                                .clickable { showExportMenu = true }
+                        ) {
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier.padding(horizontal = 4.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.ArrowDropDown,
+                                    contentDescription = "更多导出选项（PDF / 音轨 / 工程）",
+                                    tint = if (canExportAudio) OnAccentLight else TextPrimary,
+                                    modifier = Modifier.size(15.dp)
+                                )
+                            }
+                        }
+                    }
+
+                    DropdownMenu(
+                        expanded = showExportMenu,
+                        onDismissRequest = { showExportMenu = false },
+                        containerColor = StudioSurface
+                    ) {
+                        DropdownMenuItem(
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = Icons.Rounded.Share,
+                                    contentDescription = null,
+                                    tint = VioletAccent,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            },
+                            text = {
+                                Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                                    Text(
+                                        text = "导出高清五线谱 PDF（微信 / 本地）",
+                                        fontSize = 12.5.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = TextPrimary
+                                    )
+                                    Text(
+                                        text = "A4 印刷级纯矢量五线谱，放大不糊",
+                                        fontSize = 10.5.sp,
+                                        color = TextMuted
+                                    )
+                                }
+                            },
+                            onClick = {
+                                showExportMenu = false
+                                onOpenExportPdfDialog()
+                            }
+                        )
+                        DropdownMenuItem(
+                            enabled = canExportAudio,
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = Icons.Rounded.Check,
+                                    contentDescription = null,
+                                    tint = if (canExportAudio) CyanPrimary else TextMuted,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            },
+                            text = {
+                                Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                                    Text(
+                                        text = "生成无损音轨到工作台 (.wav)",
+                                        fontSize = 12.5.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = if (canExportAudio) TextPrimary else TextMuted
+                                    )
+                                    Text(
+                                        text = "支持继续移调变速或送入多轨剪辑台",
+                                        fontSize = 10.5.sp,
+                                        color = TextMuted
+                                    )
+                                }
+                            },
+                            onClick = {
+                                showExportMenu = false
+                                onExportMelodyToWorkspace()
+                            }
+                        )
+                        HorizontalDivider(color = StudioBorder)
+                        DropdownMenuItem(
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = Icons.Rounded.FolderOpen,
+                                    contentDescription = null,
+                                    tint = EmeraldLossless,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            },
+                            text = {
+                                Text(
+                                    text = "草稿管理与工程导入导出 (.stscore)",
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = EmeraldLossless
+                                )
+                            },
+                            onClick = {
+                                showExportMenu = false
+                                onOpenProjectManager()
+                            }
+                        )
+                    }
                 }
             }
         }
     }
+}
+
+@Composable
+private fun MelodyStudioSettingsDialog(
+    melody: MelodyStudioUiState,
+    activeKeySignature: KeySignature,
+    isTablet: Boolean,
+    scoreCollapsed: Boolean,
+    onToggleGrandStaff: () -> Unit,
+    onScoreViewModeChange: (ScoreViewMode) -> Unit,
+    onToggleShowChordSymbols: () -> Unit,
+    onToggleChordPlayback: () -> Unit,
+    onOpenKeySignatureDialog: () -> Unit,
+    onOpenCustomTimeSignatureDialog: () -> Unit,
+    onOpenTempoStudioDialog: () -> Unit,
+    onTogglePrimarySustain: () -> Unit,
+    onToggleSecondarySustain: () -> Unit,
+    onEditPrimarySustainDuration: () -> Unit,
+    onEditSecondarySustainDuration: () -> Unit,
+    onSelectReverb: (ReverbPreset) -> Unit,
+    onSwingPresetChange: (SwingPreset) -> Unit,
+    onToggleLoop: () -> Unit,
+    onToggleDualKeyboard: () -> Unit,
+    onToggleDualKeyboardStaffRouting: () -> Unit,
+    onToggleCollapseScoreInDual: () -> Unit,
+    onOpenKeyboardSizeConfig: () -> Unit,
+    onTouchGuardConfigChange: (PianoTouchGuardConfig) -> Unit,
+    onOpenTouchGuardDetailDialog: () -> Unit,
+    onLoadDemoMelody: () -> Unit,
+    onRequestClearScore: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val canClearScore = melody.notes.isNotEmpty() ||
+        melody.chordSymbols.isNotEmpty() ||
+        melody.dynamicMarks.isNotEmpty() ||
+        melody.hairpins.isNotEmpty() ||
+        melody.tempoEvents.isNotEmpty() ||
+        melody.keySignatureEvents.isNotEmpty()
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = StudioSurface,
+        title = {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.Settings,
+                    contentDescription = null,
+                    tint = CyanPrimary,
+                    modifier = Modifier.size(19.dp)
+                )
+                Column {
+                    Text(
+                        text = "打谱与键盘设置",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 16.sp,
+                        color = TextPrimary
+                    )
+                    Text(
+                        text = "低频选项集中收纳，主界面留给五线谱与琴键",
+                        fontSize = 11.sp,
+                        color = TextMuted
+                    )
+                }
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                // ============================================================
+                // Section 1: Score View & Grand Staff (`谱面与大谱表`)
+                // ============================================================
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = StudioSurfaceElevated,
+                    border = BorderStroke(1.dp, StudioBorder),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            text = "① 谱面显示与大谱表",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = TextPrimary
+                        )
+
+                        // Grand Staff Toggle
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable(onClick = onToggleGrandStaff)
+                                .padding(vertical = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "𝄞𝄢 双行钢琴大谱表 (Grand Staff)",
+                                    fontSize = 12.5.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = TextPrimary
+                                )
+                                Text(
+                                    text = "同时展示高低音谱表，点上下行谱面或底栏即可切换左右手独立录入",
+                                    fontSize = 10.5.sp,
+                                    color = TextSecondary
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Switch(
+                                checked = melody.grandStaffEnabled,
+                                onCheckedChange = { onToggleGrandStaff() },
+                                colors = SwitchDefaults.colors(
+                                    checkedThumbColor = OnAccentLight,
+                                    checkedTrackColor = CyanPrimary
+                                )
+                            )
+                        }
+
+                        // Score View Mode (`整页谱` vs `单行谱`)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text(
+                                text = "看谱布局:",
+                                fontSize = 11.5.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = TextSecondary
+                            )
+                            ScoreViewMode.entries.forEach { mode ->
+                                val selected = melody.scoreViewMode == mode
+                                val modeDesc = when (mode) {
+                                    ScoreViewMode.PAGE_SCROLL -> "整页多行谱(推荐)"
+                                    ScoreViewMode.SINGLE_STRIP -> "单行横向谱"
+                                }
+                                val chipShape = RoundedCornerShape(8.dp)
+                                Surface(
+                                    shape = chipShape,
+                                    color = if (selected) CyanPrimary else StudioSurface,
+                                    border = BorderStroke(1.dp, if (selected) CyanPrimary else StudioBorder),
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(30.dp)
+                                        .clip(chipShape)
+                                        .clickable { onScoreViewModeChange(mode) }
+                                ) {
+                                    Box(contentAlignment = Alignment.Center) {
+                                        Text(
+                                            text = modeDesc,
+                                            fontSize = 11.sp,
+                                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                                            color = if (selected) OnAccentLight else TextPrimary,
+                                            maxLines = 1
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        // Above-Staff Chord Symbol Visibility & Audio Switches
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text(
+                                text = "上方和弦:",
+                                fontSize = 11.5.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = TextSecondary
+                            )
+                            MelodyTinyToggle(
+                                label = if (melody.showChordSymbols) "谱面/PDF:显示" else "谱面/PDF:隐藏",
+                                active = melody.showChordSymbols,
+                                activeColor = VioletAccent,
+                                onClick = onToggleShowChordSymbols
+                            )
+                            MelodyTinyToggle(
+                                label = if (melody.chordPlaybackEnabled) "和弦发声:开启" else "和弦发声:静音",
+                                active = melody.chordPlaybackEnabled,
+                                activeColor = EmeraldLossless,
+                                onClick = onToggleChordPlayback
+                            )
+                        }
+
+                        // Quick links to Key Signature / Time Signature / Tempo Map
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            MelodyTinyToggle(
+                                label = "调号·转调 (${activeKeySignature.shortPillLabel})",
+                                active = activeKeySignature != KeySignature.C_MAJOR || melody.keySignatureEvents.isNotEmpty(),
+                                activeColor = VioletAccent,
+                                onClick = onOpenKeySignatureDialog
+                            )
+                            MelodyTinyToggle(
+                                label = "拍号 (${melody.timeSignature.label})",
+                                active = melody.timeSignature != TimeSignature.FOUR_FOUR,
+                                activeColor = CyanPrimary,
+                                onClick = onOpenCustomTimeSignatureDialog
+                            )
+                            MelodyTinyToggle(
+                                label = if (melody.tempoEvents.isNotEmpty()) {
+                                    "中途变速 (${melody.tempoEvents.size})"
+                                } else {
+                                    "中途变速记号"
+                                },
+                                active = melody.tempoEvents.isNotEmpty(),
+                                activeColor = WarmUmber,
+                                onClick = onOpenTempoStudioDialog
+                            )
+                        }
+                    }
+                }
+
+                // ============================================================
+                // Section 2: Sound, Sustain & Groove (`声音、延音与律动`)
+                // ============================================================
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = StudioSurfaceElevated,
+                    border = BorderStroke(1.dp, StudioBorder),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            text = "② 声音、延音与律动",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = TextPrimary
+                        )
+
+                        // Sustain Pedal(s) + 0.xxx秒 Duration Input
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text = if (melody.dualKeyboardEnabled) {
+                                    "上排延音 (${melody.instrument.shortName})"
+                                } else {
+                                    "琴键延音 (${melody.instrument.shortName})"
+                                },
+                                fontSize = 11.5.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = TextSecondary
+                            )
+                            SustainControlPair(
+                                sustainOn = melody.sustainPedal,
+                                sustainSec = melody.sustainDurationSec,
+                                accentColor = EmeraldLossless,
+                                compact = false,
+                                onToggleSustain = onTogglePrimarySustain,
+                                onEditDuration = onEditPrimarySustainDuration
+                            )
+                        }
+
+                        if (melody.dualKeyboardEnabled) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(
+                                    text = "下排延音 (${melody.secondaryInstrument.shortName})",
+                                    fontSize = 11.5.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    color = TextSecondary
+                                )
+                                SustainControlPair(
+                                    sustainOn = melody.secondarySustainPedal,
+                                    sustainSec = melody.secondarySustainDurationSec,
+                                    accentColor = CyanPrimary,
+                                    compact = false,
+                                    onToggleSustain = onToggleSecondarySustain,
+                                    onEditDuration = onEditSecondarySustainDuration
+                                )
+                            }
+                        }
+
+                        // Reverb 3-Way Selector
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text(
+                                text = "空间混响:",
+                                fontSize = 11.5.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = TextSecondary
+                            )
+                            Row(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(5.dp)
+                            ) {
+                                ReverbPreset.entries.forEach { preset ->
+                                    MelodyTinyToggle(
+                                        label = preset.label,
+                                        active = melody.reverbPreset == preset,
+                                        activeColor = VioletAccent,
+                                        onClick = { onSelectReverb(preset) }
+                                    )
+                                }
+                            }
+                        }
+
+                        // Global Swing Selector
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text(
+                                text = "摇摆律动:",
+                                fontSize = 11.5.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = TextSecondary
+                            )
+                            Row(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(5.dp)
+                            ) {
+                                SwingPreset.entries.forEach { preset ->
+                                    MelodyTinyToggle(
+                                        label = preset.shortBadge,
+                                        active = melody.swingPreset == preset,
+                                        activeColor = AmberMastering,
+                                        onClick = { onSwingPresetChange(preset) }
+                                    )
+                                }
+                            }
+                        }
+
+                        // Loop Playback Toggle
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable(onClick = onToggleLoop)
+                                .padding(vertical = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text = "试听自动循环播放",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = TextPrimary
+                            )
+                            Switch(
+                                checked = melody.loopPlayback,
+                                onCheckedChange = { onToggleLoop() },
+                                colors = SwitchDefaults.colors(
+                                    checkedThumbColor = OnAccentLight,
+                                    checkedTrackColor = CyanPrimary
+                                )
+                            )
+                        }
+                    }
+                }
+
+                // ============================================================
+                // Section 3: Keyboard Layout & Touch Guard (`键盘布局与防误触`)
+                // ============================================================
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = StudioSurfaceElevated,
+                    border = BorderStroke(1.dp, StudioBorder),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            text = "③ 键盘布局与防误触",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = TextPrimary
+                        )
+
+                        // Dual Keyboard Toggle
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable(onClick = onToggleDualKeyboard)
+                                .padding(vertical = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "开启双排独立键盘",
+                                    fontSize = 12.5.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = TextPrimary
+                                )
+                                Text(
+                                    text = "上下两排独立音色与独立八度，适合双手弹奏或高低音对照",
+                                    fontSize = 10.5.sp,
+                                    color = TextSecondary
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Switch(
+                                checked = melody.dualKeyboardEnabled,
+                                onCheckedChange = { onToggleDualKeyboard() },
+                                colors = SwitchDefaults.colors(
+                                    checkedThumbColor = OnAccentLight,
+                                    checkedTrackColor = CyanPrimary
+                                )
+                            )
+                        }
+
+                        if (melody.dualKeyboardEnabled && melody.grandStaffEnabled) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(
+                                    text = "双排谱表分配:",
+                                    fontSize = 11.5.sp,
+                                    color = TextSecondary
+                                )
+                                MelodyTinyToggle(
+                                    label = if (melody.dualKeyboardStaffRouting == DualKeyboardStaffRouting.SPLIT_BY_DECK) {
+                                        "上下分行（上→𝄞 / 下→𝄢）"
+                                    } else {
+                                        "跟随当前选中行"
+                                    },
+                                    active = melody.dualKeyboardStaffRouting == DualKeyboardStaffRouting.SPLIT_BY_DECK,
+                                    activeColor = EmeraldLossless,
+                                    onClick = onToggleDualKeyboardStaffRouting
+                                )
+                            }
+                        }
+
+                        if (melody.dualKeyboardEnabled && !isTablet) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(
+                                    text = "双排时临时收起五线谱放大琴键:",
+                                    fontSize = 11.5.sp,
+                                    color = TextSecondary
+                                )
+                                MelodyTinyToggle(
+                                    label = if (scoreCollapsed) "已收起谱面" else "保持显示谱面",
+                                    active = scoreCollapsed,
+                                    activeColor = EmeraldLossless,
+                                    onClick = onToggleCollapseScoreInDual
+                                )
+                            }
+                        }
+
+                        // Fine-tune Keyboard Width / Height / Key Width Dialog Entry
+                        val sizeCardShape = RoundedCornerShape(8.dp)
+                        Surface(
+                            shape = sizeCardShape,
+                            color = StudioSurface,
+                            border = BorderStroke(1.dp, StudioBorder),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(sizeCardShape)
+                                .clickable(onClick = onOpenKeyboardSizeConfig)
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.Tune,
+                                        contentDescription = null,
+                                        tint = CyanPrimary,
+                                        modifier = Modifier.size(15.dp)
+                                    )
+                                    Column {
+                                        Text(
+                                            text = "精调键盘高度 · 宽度占比 · 单键宽度",
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = TextPrimary
+                                        )
+                                        Text(
+                                            text = "主界面也可直接拖键盘顶条调高度、拖左右侧边调宽度",
+                                            fontSize = 10.sp,
+                                            color = TextMuted
+                                        )
+                                    }
+                                }
+                                Text(
+                                    text = "调节 ▸",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = CyanPrimary
+                                )
+                            }
+                        }
+
+                        // Touch Guard Quick Mode + Detailed Sub-Settings
+                        Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.Shield,
+                                        contentDescription = null,
+                                        tint = EmeraldLossless,
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                    Text(
+                                        text = "琴键防误触（保留刮奏）",
+                                        fontSize = 11.5.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = TextPrimary
+                                    )
+                                }
+                                Text(
+                                    text = "详细子项 ▸",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = EmeraldLossless,
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(5.dp))
+                                        .clickable(onClick = onOpenTouchGuardDetailDialog)
+                                        .padding(horizontal = 4.dp, vertical = 2.dp)
+                                )
+                            }
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                TouchGuardMode.entries.forEach { mode ->
+                                    val activeColor = when (mode) {
+                                        TouchGuardMode.OFF -> TextSecondary
+                                        TouchGuardMode.STANDARD -> EmeraldLossless
+                                        TouchGuardMode.STRICT -> AmberMastering
+                                    }
+                                    MelodyTinyToggle(
+                                        label = mode.shortLabel,
+                                        active = melody.touchGuardConfig.mode == mode,
+                                        activeColor = activeColor,
+                                        onClick = {
+                                            onTouchGuardConfigChange(melody.touchGuardConfig.copy(mode = mode))
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ============================================================
+                // Section 4: Demo Score & Clear Score (`示例曲与重置`)
+                // ============================================================
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = onLoadDemoMelody,
+                        shape = RoundedCornerShape(9.dp),
+                        border = BorderStroke(1.dp, AmberMastering.copy(alpha = 0.55f)),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.AutoAwesome,
+                            contentDescription = null,
+                            tint = AmberMastering,
+                            modifier = Modifier.size(15.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "加载示例曲",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = AmberMastering,
+                            maxLines = 1
+                        )
+                    }
+
+                    OutlinedButton(
+                        onClick = onRequestClearScore,
+                        enabled = canClearScore,
+                        shape = RoundedCornerShape(9.dp),
+                        border = BorderStroke(
+                            1.dp,
+                            if (canClearScore) DangerRed.copy(alpha = 0.55f) else StudioBorder
+                        ),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.DeleteOutline,
+                            contentDescription = null,
+                            tint = if (canClearScore) DangerRed else TextMuted,
+                            modifier = Modifier.size(15.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "清空五线谱",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = if (canClearScore) DangerRed else TextMuted,
+                            maxLines = 1
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = onDismiss,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = CyanPrimary,
+                    contentColor = OnAccentLight
+                )
+            ) {
+                Text("完成", fontWeight = FontWeight.Bold)
+            }
+        }
+    )
 }
 
 @Composable
@@ -3738,8 +4382,10 @@ private fun InteractiveStaffScoreCanvas(
     onTapKeySignatureHeader: () -> Unit,
     onTapTimeSignatureHeader: () -> Unit,
     onTapCursorTick: (Int) -> Unit,
+    onTapCursorTickAndStaff: (Int, StaffPart?) -> Unit,
     onSelectNote: (String?) -> Unit,
     onSelectAnnotation: (SelectedScoreAnnotation?) -> Unit,
+    onOpenChordSymbolDialog: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val density = LocalDensity.current
@@ -3755,13 +4401,17 @@ private fun InteractiveStaffScoreCanvas(
     var lastHitTargets by remember { mutableStateOf<List<StaffHitTarget>>(emptyList()) }
 
     val maxKeyBar = (melody.keySignatureEvents.maxOfOrNull { it.safeBarIndex + 1 } ?: 1)
+    val maxChordBar = melody.chordSymbols.maxOfOrNull {
+        (it.safeTick / melody.ticksPerBar.coerceAtLeast(1)) + 1
+    } ?: 1
     val totalBars = maxOf(
         melody.totalBars,
         ceil((melody.notes.maxOfOrNull { it.endBeat } ?: quarterBeatsPerBar) / quarterBeatsPerBar).toInt(),
-        maxKeyBar
+        maxKeyBar,
+        maxChordBar
     ).coerceAtLeast(1)
 
-    val isGrandStaff = StaffScoreEngraver.needsGrandStaff(melody.notes)
+    val isGrandStaff = melody.grandStaffEnabled
     val estLineSpacing = if (canvasSize.height > 0) {
         if (isGrandStaff) {
             (canvasSize.height / 15.6f).coerceIn(5.6f, 11.8f)
@@ -3782,9 +4432,12 @@ private fun InteractiveStaffScoreCanvas(
     val pageLayout = remember(
         canvasSize.width,
         density.density,
+        melody.grandStaffEnabled,
         melody.timeSignature,
         melody.totalBars,
         melody.notes,
+        melody.chordSymbols,
+        melody.showChordSymbols,
         melody.dynamicMarks,
         melody.hairpins,
         melody.tempoEvents,
@@ -3852,7 +4505,13 @@ private fun InteractiveStaffScoreCanvas(
     } else {
         melody.cursorTick
     }
-    LaunchedEffect(melody.scoreViewMode, pageFollowTrigger, melody.isPlaying, canvasSize.height) {
+    LaunchedEffect(
+        melody.scoreViewMode,
+        pageFollowTrigger,
+        melody.isPlaying,
+        melody.grandStaffEnabled,
+        canvasSize.height
+    ) {
         if (melody.scoreViewMode != ScoreViewMode.PAGE_SCROLL || canvasSize.height <= 0) return@LaunchedEffect
         val sysTop = pageLayout.systemTrebleTopWorldY(activeSystemIdx) - pageLayout.lineSpacing * 2.6f
         val sysBottom = pageLayout.systemTrebleTopWorldY(activeSystemIdx) +
@@ -3885,6 +4544,8 @@ private fun InteractiveStaffScoreCanvas(
     val latestOnSelectNote by rememberUpdatedState(onSelectNote)
     val latestOnSelectAnnotation by rememberUpdatedState(onSelectAnnotation)
     val latestOnTapCursorTick by rememberUpdatedState(onTapCursorTick)
+    val latestOnTapCursorTickAndStaff by rememberUpdatedState(onTapCursorTickAndStaff)
+    val latestOnOpenChordDialog by rememberUpdatedState(onOpenChordSymbolDialog)
 
     val palette = remember {
         StaffScoreEngraver.OnScreenPalette(
@@ -3943,18 +4604,29 @@ private fun InteractiveStaffScoreCanvas(
                     if (hit != null) {
                         if (hit.annotation != null) {
                             val alreadySelected = latestMelody.selectedAnnotation == hit.annotation
-                            if (hit.annotation is SelectedScoreAnnotation.KeyChange) {
-                                if (alreadySelected) {
-                                    latestOnTapKeySig()
-                                } else {
-                                    latestOnSelectAnnotation(hit.annotation)
-                                    latestOnTapCursorTick(hit.startTick)
+                            when (hit.annotation) {
+                                is SelectedScoreAnnotation.ChordSymbol -> {
+                                    if (latestMelody.isPlaying && !latestMelody.isRecording) {
+                                        latestOnTapCursorTick(hit.startTick)
+                                    } else {
+                                        latestOnSelectAnnotation(hit.annotation)
+                                        latestOnOpenChordDialog()
+                                    }
                                 }
-                            } else {
-                                if (alreadySelected && latestMelody.isPlaying && !latestMelody.isRecording) {
-                                    latestOnTapCursorTick(hit.startTick)
-                                } else {
-                                    latestOnSelectAnnotation(if (alreadySelected) null else hit.annotation)
+                                is SelectedScoreAnnotation.KeyChange -> {
+                                    if (alreadySelected) {
+                                        latestOnTapKeySig()
+                                    } else {
+                                        latestOnSelectAnnotation(hit.annotation)
+                                        latestOnTapCursorTick(hit.startTick)
+                                    }
+                                }
+                                else -> {
+                                    if (alreadySelected && latestMelody.isPlaying && !latestMelody.isRecording) {
+                                        latestOnTapCursorTick(hit.startTick)
+                                    } else {
+                                        latestOnSelectAnnotation(if (alreadySelected) null else hit.annotation)
+                                    }
                                 }
                             }
                         } else if (hit.noteId != null) {
@@ -3987,19 +4659,21 @@ private fun InteractiveStaffScoreCanvas(
 
                         latestOnSelectNote(null)
                         latestOnSelectAnnotation(null)
-                        val tick = StaffScoreEngraver.mapPageTouchToTick(
+                        val (tick, tappedStaff) = StaffScoreEngraver.mapPageTouchToTickAndStaff(
                             touchX = pos.x,
                             touchY = pos.y,
                             scrollY = latestScrollY,
                             layout = latestPageLayout,
                             melody = latestMelody
                         )
-                        latestOnTapCursorTick(tick)
+                        latestOnTapCursorTickAndStaff(tick, tappedStaff)
                     } else {
                         latestOnSelectNote(null)
                         latestOnSelectAnnotation(null)
-                        val tick = StaffScoreEngraver.mapTouchXToTick(
+                        val (tick, tappedStaff) = StaffScoreEngraver.mapTouchToTickAndStaff(
                             touchX = pos.x,
+                            touchY = pos.y,
+                            viewportHeight = size.height.toFloat(),
                             scrollX = latestScrollX,
                             clefHeaderWidth = latestHeaderWidthPx,
                             barWidth = latestBarWidthPx,
@@ -4007,7 +4681,7 @@ private fun InteractiveStaffScoreCanvas(
                             totalBars = latestTotalBars,
                             melody = latestMelody
                         )
-                        latestOnTapCursorTick(tick)
+                        latestOnTapCursorTickAndStaff(tick, tappedStaff)
                     }
                 }
             }
@@ -4049,18 +4723,13 @@ private fun IndependentKeyboardDeck(
     deckTitle: String?,
     accentColor: Color,
     instrument: StudioInstrument,
-    sustainOn: Boolean,
-    sustainDurationSec: Float,
     preferFlats: Boolean,
     isRecording: Boolean,
     touchGuardConfig: PianoTouchGuardConfig,
-    showInlineInstrumentAndSustain: Boolean,
+    showInlineInstrument: Boolean,
     availContainerWidthDp: Float,
     geometry: KeyboardDeckGeometry,
     onSelectInstrument: (StudioInstrument) -> Unit,
-    onToggleSustain: () -> Unit,
-    onEditSustainDuration: () -> Unit,
-    onOpenSizeConfig: () -> Unit,
     onHeightDeltaDp: (Float) -> Unit,
     onWidthFractionDelta: (Float) -> Unit,
     onScrollWhiteKeyChange: (newWhiteKey: Float, snapFinished: Boolean) -> Unit,
@@ -4149,7 +4818,7 @@ private fun IndependentKeyboardDeck(
                     )
                 }
 
-                // 2. Top Control + Draggable C1..C8 Range Strip + Size Config Button (29.dp)
+                // 2. Clean Draggable C1..C8 Range Strip (+ Inline Timbre in Dual-Keyboard Mode)
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -4169,7 +4838,7 @@ private fun IndependentKeyboardDeck(
                         )
                     }
 
-                    if (showInlineInstrumentAndSustain) {
+                    if (showInlineInstrument) {
                         Box {
                             val instShape = RoundedCornerShape(6.dp)
                             Surface(
@@ -4231,15 +4900,6 @@ private fun IndependentKeyboardDeck(
                                 }
                             }
                         }
-
-                        SustainControlPair(
-                            sustainOn = sustainOn,
-                            sustainSec = sustainDurationSec,
-                            accentColor = accentColor,
-                            compact = true,
-                            onToggleSustain = onToggleSustain,
-                            onEditDuration = onEditSustainDuration
-                        )
                     }
 
                     // Live Range Readout Pill
@@ -4285,38 +4945,6 @@ private fun IndependentKeyboardDeck(
                             .weight(1f)
                             .height(22.dp)
                     )
-
-                    // Width / Height / Key-Width Adjuster Button (`尺寸`)
-                    val sizeBtnShape = RoundedCornerShape(6.dp)
-                    Surface(
-                        shape = sizeBtnShape,
-                        color = StudioSurface,
-                        border = BorderStroke(1.dp, StudioBorder),
-                        modifier = Modifier
-                            .height(23.dp)
-                            .clip(sizeBtnShape)
-                            .clickable(enabled = !deckChromeLocked, onClick = onOpenSizeConfig)
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier.padding(horizontal = 6.dp)
-                        ) {
-                            Icon(
-                                imageVector = if (showRecordingLockBadge) Icons.Rounded.Lock else Icons.Rounded.Tune,
-                                contentDescription = "调节键盘宽高与键宽",
-                                tint = if (deckChromeLocked) TextMuted else accentColor,
-                                modifier = Modifier.size(12.dp)
-                            )
-                            Spacer(modifier = Modifier.width(2.dp))
-                            Text(
-                                text = "尺寸",
-                                fontSize = 10.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = if (deckChromeLocked) TextMuted else TextPrimary,
-                                maxLines = 1
-                            )
-                        }
-                    }
                 }
 
                 HorizontalDivider(color = StudioBorder.copy(alpha = 0.7f), thickness = 0.75.dp)
@@ -5130,168 +5758,8 @@ private fun GarageBandPianoKeyboard(
 }
 
 // ============================================================================
-// Shared Compact Controls (Key Signature Pill & Fast-Scrub / Tap BPM Control)
+// Transport + Input Mode + Active Grand-Staff Voice Cluster
 // ============================================================================
-
-@Composable
-private fun KeySignatureSelectorPill(
-    activeKeySignature: KeySignature,
-    modulationCount: Int,
-    onClick: () -> Unit
-) {
-    val nonDefault = activeKeySignature != KeySignature.C_MAJOR || modulationCount > 0
-    val shape = RoundedCornerShape(7.dp)
-    val labelText = if (modulationCount > 0) {
-        "${activeKeySignature.shortPillLabel}·转$modulationCount"
-    } else {
-        activeKeySignature.shortPillLabel
-    }
-
-    Surface(
-        shape = shape,
-        color = if (nonDefault) VioletAccent.copy(alpha = 0.14f) else StudioSurfaceElevated,
-        border = BorderStroke(1.dp, if (nonDefault) VioletAccent else StudioBorder),
-        modifier = Modifier
-            .height(27.dp)
-            .clip(shape)
-            .clickable(onClick = onClick)
-    ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.padding(start = 8.dp, end = 4.dp)
-        ) {
-            Text(
-                text = labelText,
-                fontSize = 11.sp,
-                fontFamily = FontFamily.Serif,
-                fontWeight = FontWeight.Bold,
-                color = if (nonDefault) VioletAccent else TextPrimary,
-                maxLines = 1
-            )
-            Icon(
-                imageVector = Icons.Rounded.ArrowDropDown,
-                contentDescription = "设置调号或中途变调",
-                tint = if (nonDefault) VioletAccent else TextSecondary,
-                modifier = Modifier.size(15.dp)
-            )
-        }
-    }
-}
-
-@Composable
-private fun BpmCompactControl(
-    bpm: Int,
-    referenceTrackBpm: Int?,
-    onBpmChange: (Int) -> Unit,
-    onOpenQuickDialog: () -> Unit
-) {
-    val density = LocalDensity.current
-    val haptic = LocalHapticFeedback.current
-    val stepPx = with(density) { 5.2.dp.toPx().coerceAtLeast(4f) }
-
-    var isScrubbing by remember { mutableStateOf(false) }
-    var dragAccumPx by remember { mutableFloatStateOf(0f) }
-    val latestBpm by rememberUpdatedState(bpm)
-    val latestOnBpmChange by rememberUpdatedState(onBpmChange)
-
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(3.dp)
-    ) {
-        MelodySmallStepBtn("−") { onBpmChange(bpm - 1) }
-
-        val pillShape = RoundedCornerShape(7.dp)
-        Surface(
-            shape = pillShape,
-            color = if (isScrubbing) CyanPrimary.copy(alpha = 0.16f) else StudioSurfaceElevated,
-            border = BorderStroke(1.dp, if (isScrubbing) CyanPrimary else StudioBorder),
-            modifier = Modifier
-                .height(27.dp)
-                .clip(pillShape)
-                .clickable(onClick = onOpenQuickDialog)
-                .pointerInput(stepPx) {
-                    detectHorizontalDragGestures(
-                        onDragStart = {
-                            isScrubbing = true
-                            dragAccumPx = 0f
-                        },
-                        onDragEnd = {
-                            isScrubbing = false
-                            dragAccumPx = 0f
-                        },
-                        onDragCancel = {
-                            isScrubbing = false
-                            dragAccumPx = 0f
-                        },
-                        onHorizontalDrag = { change, dragAmount ->
-                            change.consume()
-                            dragAccumPx += dragAmount
-                            val deltaBpm = (dragAccumPx / stepPx).toInt()
-                            if (deltaBpm != 0) {
-                                dragAccumPx -= deltaBpm * stepPx
-                                val next = (latestBpm + deltaBpm).coerceIn(40, 220)
-                                if (next != latestBpm) {
-                                    if (next % 5 == 0) {
-                                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                    }
-                                    latestOnBpmChange(next)
-                                }
-                            }
-                        }
-                    )
-                }
-        ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.padding(horizontal = 7.dp)
-            ) {
-                Text(
-                    text = "${bpm} BPM",
-                    fontSize = 11.sp,
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.Bold,
-                    color = if (isScrubbing) CyanPrimary else TextPrimary,
-                    maxLines = 1
-                )
-                Spacer(modifier = Modifier.width(3.dp))
-                Icon(
-                    imageVector = Icons.Rounded.DriveFileRenameOutline,
-                    contentDescription = "点击快速修改 BPM 或左右滑动调速",
-                    tint = if (isScrubbing) CyanPrimary else TextMuted,
-                    modifier = Modifier.size(11.dp)
-                )
-            }
-        }
-
-        MelodySmallStepBtn("+") { onBpmChange(bpm + 1) }
-
-        if (referenceTrackBpm != null && referenceTrackBpm != bpm) {
-            val syncShape = RoundedCornerShape(7.dp)
-            Surface(
-                shape = syncShape,
-                color = CyanPrimary.copy(alpha = 0.13f),
-                border = BorderStroke(1.dp, CyanPrimary.copy(alpha = 0.4f)),
-                modifier = Modifier
-                    .height(27.dp)
-                    .clip(syncShape)
-                    .clickable { onBpmChange(referenceTrackBpm) }
-            ) {
-                Box(
-                    contentAlignment = Alignment.Center,
-                    modifier = Modifier.padding(horizontal = 6.dp)
-                ) {
-                    Text(
-                        text = "同原曲($referenceTrackBpm)",
-                        fontSize = 10.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = CyanPrimary,
-                        maxLines = 1
-                    )
-                }
-            }
-        }
-    }
-}
 
 @Composable
 private fun TransportAndModeLeftCluster(
@@ -5300,7 +5768,8 @@ private fun TransportAndModeLeftCluster(
     onTogglePlayStop: () -> Unit,
     onPlayFromStart: () -> Unit,
     onSelectInputMode: (MelodyInputMode) -> Unit,
-    onToggleRecordStop: () -> Unit
+    onToggleRecordStop: () -> Unit,
+    onSetActiveStaff: (StaffPart) -> Unit
 ) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
@@ -5308,8 +5777,7 @@ private fun TransportAndModeLeftCluster(
     ) {
         val playShape = RoundedCornerShape(8.dp)
         val playing = melody.isPlaying && !melody.isRecording
-        val maxEndTick = melody.notes.filterNot { it.isRest }.maxOfOrNull { it.resolvedEndTick } ?: 0
-        val effEndTick = if (melody.hasPlayableNotes) maxEndTick else melody.totalTicks
+        val effEndTick = if (melody.hasPlayableNotes) melody.maxPlayableEndTick else melody.totalTicks
         val willStartMidScore = !playing && (melody.cursorTick in 1 until effEndTick)
         val startBar = melody.barNumberAtTick(melody.cursorTick)
         val playLabel = when {
@@ -5455,33 +5923,43 @@ private fun TransportAndModeLeftCluster(
                 }
             }
         }
-    }
-}
 
-@Composable
-private fun MelodyHeaderIconBtn(
-    icon: androidx.compose.ui.graphics.vector.ImageVector,
-    contentDescription: String,
-    enabled: Boolean,
-    onClick: () -> Unit
-) {
-    val shape = RoundedCornerShape(8.dp)
-    Surface(
-        shape = shape,
-        color = StudioSurfaceElevated.copy(alpha = if (enabled) 0.9f else 0.4f),
-        border = BorderStroke(1.dp, StudioBorder),
-        modifier = Modifier
-            .size(29.dp)
-            .clip(shape)
-            .clickable(enabled = enabled, onClick = onClick)
-    ) {
-        Box(contentAlignment = Alignment.Center) {
-            Icon(
-                imageVector = icon,
-                contentDescription = contentDescription,
-                tint = if (enabled) TextPrimary else TextMuted.copy(alpha = 0.4f),
-                modifier = Modifier.size(15.dp)
-            )
+        // Active Staff Switcher (`上行𝄞 | 下行𝄢`) when Grand Staff is enabled
+        if (melody.grandStaffEnabled) {
+            val staffWarmTerracotta = Color(0xFFC96442)
+            Surface(
+                shape = RoundedCornerShape(8.dp),
+                color = StudioSurfaceElevated,
+                border = BorderStroke(1.dp, staffWarmTerracotta.copy(alpha = 0.68f)),
+                modifier = Modifier.height(28.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    StaffPart.entries.forEach { part ->
+                        val selected = part == melody.activeStaff
+                        val segShape = RoundedCornerShape(7.dp)
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier
+                                .fillMaxHeight()
+                                .clip(segShape)
+                                .background(if (selected) staffWarmTerracotta else Color.Transparent)
+                                .clickable { onSetActiveStaff(part) }
+                                .padding(horizontal = if (compactModeLabels) 6.dp else 8.dp)
+                        ) {
+                            Text(
+                                text = when (part) {
+                                    StaffPart.TREBLE -> "上行𝄞"
+                                    StaffPart.BASS -> "下行𝄢"
+                                },
+                                fontSize = 10.5.sp,
+                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                                color = if (selected) OnAccentLight else TextSecondary,
+                                maxLines = 1
+                            )
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -8076,55 +8554,8 @@ private fun formatProjectTimestamp(epochMs: Long): String {
 }
 
 // ============================================================================
-// Glissando-Aware Anti-Mistouch Controls (`防误触 · 保留顺滑刮奏`)
+// Glissando-Aware Anti-Mistouch Settings Dialog (`防误触 · 保留顺滑刮奏`)
 // ============================================================================
-
-@Composable
-private fun TouchGuardSelectorPill(
-    config: PianoTouchGuardConfig,
-    onClick: () -> Unit
-) {
-    val activeColor = when (config.mode) {
-        TouchGuardMode.OFF -> TextMuted
-        TouchGuardMode.STANDARD -> EmeraldLossless
-        TouchGuardMode.STRICT -> AmberMastering
-    }
-    val isActive = config.isEnabled
-    val pillShape = RoundedCornerShape(7.dp)
-
-    Surface(
-        shape = pillShape,
-        color = if (isActive) activeColor.copy(alpha = 0.15f) else StudioSurfaceElevated,
-        border = BorderStroke(
-            1.dp,
-            if (isActive) activeColor.copy(alpha = 0.65f) else StudioBorder
-        ),
-        modifier = Modifier
-            .height(27.dp)
-            .clip(pillShape)
-            .clickable(onClick = onClick)
-    ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.padding(horizontal = 7.dp)
-        ) {
-            Icon(
-                imageVector = Icons.Rounded.Shield,
-                contentDescription = "防误触设置",
-                tint = if (isActive) activeColor else TextMuted,
-                modifier = Modifier.size(12.dp)
-            )
-            Spacer(modifier = Modifier.width(3.dp))
-            Text(
-                text = "防误触:${config.mode.shortLabel}",
-                fontSize = 11.sp,
-                fontWeight = if (isActive) FontWeight.Bold else FontWeight.Medium,
-                color = if (isActive) activeColor else TextSecondary,
-                maxLines = 1
-            )
-        }
-    }
-}
 
 @Composable
 private fun TouchGuardSettingsDialog(
@@ -8341,6 +8772,620 @@ private fun TouchGuardSettingsDialog(
                 )
             ) {
                 Text("完成")
+            }
+        }
+    )
+}
+
+// ============================================================================
+// Above-Staff Letter Chord Symbols Studio Dialog (`谱表上方字母和弦标记面板`)
+//   1. Active-Key Diatonic Recommendations (`调内常用顺阶三和弦 / 顺阶七和弦`)
+//   2. Root (`#` / `b`) + Quality + Slash `/Bass` Combiner (`根音+性质+转位低音组合器`)
+//   3. Freehand Text Input (`自由手打输入框` + Universal Parser + Real-Time Audition)
+// ============================================================================
+
+@Composable
+private fun ChordSymbolStudioDialog(
+    melody: MelodyStudioUiState,
+    onTapCursorTick: (Int) -> Unit,
+    onAddBars: () -> Unit,
+    onUpsertChordSymbol: (tick: Int, rawSymbol: String, editingId: String?) -> Boolean,
+    onDeleteChordSymbol: (String) -> Unit,
+    onToggleShowChordSymbols: () -> Unit,
+    onToggleChordPlayback: () -> Unit,
+    onPreviewChordSymbol: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val anchorTick = melody.cursorTick.coerceAtLeast(0)
+    val ticksPerBar = melody.ticksPerBar.coerceAtLeast(1)
+    val unitBeatTicks = melody.timeSignature.unitTicks.coerceAtLeast(TICKS_PER_STEP)
+    val barIdx = anchorTick / ticksPerBar
+    val barNum = melody.barNumberAtTick(anchorTick)
+    val beatNum = melody.beatNumberAtTick(anchorTick)
+    val activeKey = melody.keySignatureAtTick(anchorTick)
+    val existingAtCursor = melody.chordSymbolAtTick(anchorTick)
+
+    val recommendations = remember(activeKey) {
+        MelodyChordHelper.recommendDiatonicChords(activeKey)
+    }
+
+    var useFlatsInBuilder by remember(activeKey) { mutableStateOf(activeKey.prefersFlats) }
+    val rootOptions = if (useFlatsInBuilder) {
+        MelodyChordHelper.FLAT_ROOT_OPTIONS
+    } else {
+        MelodyChordHelper.SHARP_ROOT_OPTIONS
+    }
+
+    var inputText by remember {
+        mutableStateOf(
+            existingAtCursor?.symbol
+                ?: recommendations.triads.firstOrNull()?.symbol
+                ?: "C"
+        )
+    }
+    var builderRoot by remember { mutableStateOf("C") }
+    var builderQualitySuffix by remember { mutableStateOf("") }
+    var builderBass by remember { mutableStateOf<String?>(null) }
+    var shouldAutoPreviewTyped by remember { mutableStateOf(false) }
+
+    // Sync input field when cursor jumps to a beat that already has a chord symbol
+    LaunchedEffect(anchorTick, existingAtCursor?.id, existingAtCursor?.symbol) {
+        shouldAutoPreviewTyped = false
+        val existingSym = existingAtCursor?.symbol
+        if (existingSym != null) {
+            inputText = existingSym
+            MelodyChordHelper.parseChordSymbol(existingSym)?.let { p ->
+                builderRoot = p.rootName
+                builderBass = p.bassName
+            }
+        }
+    }
+
+    // Gentle debounced preview when user hand-types a valid chord symbol
+    LaunchedEffect(inputText, shouldAutoPreviewTyped) {
+        if (!shouldAutoPreviewTyped) return@LaunchedEffect
+        delay(280L)
+        if (MelodyChordHelper.parseChordSymbol(inputText) != null) {
+            onPreviewChordSymbol(inputText)
+        }
+        shouldAutoPreviewTyped = false
+    }
+
+    val parsedPreview = remember(inputText) {
+        MelodyChordHelper.parseChordSymbol(inputText)
+    }
+    val voicedNotesText = remember(parsedPreview, activeKey.prefersFlats) {
+        parsedPreview?.let { MelodyChordHelper.formatVoicedNoteNames(it, activeKey.prefersFlats) }
+    }
+
+    fun applyBuilderSelection(
+        nextRoot: String = builderRoot,
+        nextQuality: String = builderQualitySuffix,
+        nextBass: String? = builderBass
+    ) {
+        builderRoot = nextRoot
+        builderQualitySuffix = nextQuality
+        builderBass = nextBass
+        val built = buildString {
+            append(nextRoot)
+            append(nextQuality)
+            if (!nextBass.isNullOrBlank()) {
+                append('/')
+                append(nextBass)
+            }
+        }
+        shouldAutoPreviewTyped = false
+        inputText = built
+        onPreviewChordSymbol(built)
+    }
+
+    fun moveCursorToTick(targetTick: Int) {
+        val clampedMin = targetTick.coerceAtLeast(0)
+        if (clampedMin >= melody.totalBars * ticksPerBar && melody.totalBars < MAX_MELODY_BARS) {
+            onAddBars()
+        }
+        onTapCursorTick(clampedMin)
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = StudioSurface,
+        title = {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "谱表上方字母和弦标记",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 15.5.sp,
+                        color = TextPrimary
+                    )
+                    Text(
+                        text = "当前位置：第 $barNum 小节 · 第 $beatNum 拍（${activeKey.modeNameCn}）",
+                        fontSize = 11.sp,
+                        color = CyanPrimary
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                    MelodyTinyToggle(
+                        label = if (melody.showChordSymbols) "谱面:显示" else "谱面:隐藏",
+                        active = melody.showChordSymbols,
+                        activeColor = VioletAccent,
+                        onClick = onToggleShowChordSymbols
+                    )
+                    MelodyTinyToggle(
+                        label = if (melody.chordPlaybackEnabled) "和弦发声:开" else "和弦发声:关",
+                        active = melody.chordPlaybackEnabled,
+                        activeColor = EmeraldLossless,
+                        onClick = onToggleChordPlayback
+                    )
+                }
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                // Quick Beat / Bar Navigation Bar + Delete Existing Button
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(5.dp)
+                ) {
+                    MelodyTinyToggle(
+                        label = "◀ 上小节",
+                        active = false,
+                        activeColor = CyanPrimary,
+                        onClick = { moveCursorToTick(((barIdx - 1).coerceAtLeast(0)) * ticksPerBar) }
+                    )
+                    MelodyTinyToggle(
+                        label = "◀ 上一拍",
+                        active = false,
+                        activeColor = CyanPrimary,
+                        onClick = { moveCursorToTick((anchorTick - unitBeatTicks).coerceAtLeast(0)) }
+                    )
+                    MelodyTinyToggle(
+                        label = "下一拍 ▶",
+                        active = false,
+                        activeColor = CyanPrimary,
+                        onClick = { moveCursorToTick(anchorTick + unitBeatTicks) }
+                    )
+                    MelodyTinyToggle(
+                        label = "下小节 ▶",
+                        active = false,
+                        activeColor = CyanPrimary,
+                        onClick = { moveCursorToTick((barIdx + 1) * ticksPerBar) }
+                    )
+                    if (existingAtCursor != null) {
+                        MelodyTinyToggle(
+                            label = "删除当前 (${existingAtCursor.symbol})",
+                            active = true,
+                            activeColor = DangerRed,
+                            onClick = { onDeleteChordSymbol(existingAtCursor.id) }
+                        )
+                    }
+                }
+
+                // ------------------------------------------------------------
+                // 1. Pinned Active-Key Diatonic Chords (`调内常用和弦一键选`)
+                // ------------------------------------------------------------
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = StudioSurfaceElevated,
+                    border = BorderStroke(1.dp, StudioBorder),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text(
+                            text = "① 调内常用和弦推荐（随当前调号 ${activeKey.shortPillLabel} 自动切换）",
+                            fontSize = 11.5.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = TextPrimary
+                        )
+
+                        // Diatonic Triads (`顺阶三和弦`)
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(5.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState())
+                        ) {
+                            Text(
+                                text = "顺阶三:",
+                                fontSize = 10.5.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = TextMuted,
+                                maxLines = 1
+                            )
+                            recommendations.triads.forEach { opt ->
+                                val selected = inputText.trim() == opt.symbol
+                                val chipShape = RoundedCornerShape(8.dp)
+                                Surface(
+                                    shape = chipShape,
+                                    color = if (selected) VioletAccent else StudioSurface,
+                                    border = BorderStroke(
+                                        1.dp,
+                                        if (selected) VioletAccent else StudioBorder
+                                    ),
+                                    modifier = Modifier
+                                        .clip(chipShape)
+                                        .clickable {
+                                            shouldAutoPreviewTyped = false
+                                            inputText = opt.symbol
+                                            MelodyChordHelper.parseChordSymbol(opt.symbol)?.let { p ->
+                                                builderRoot = p.rootName
+                                                builderQualitySuffix = opt.symbol.removePrefix(p.rootName)
+                                                builderBass = null
+                                            }
+                                            onPreviewChordSymbol(opt.symbol)
+                                        }
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                    ) {
+                                        Text(
+                                            text = opt.degreeBadge,
+                                            fontSize = 9.5.sp,
+                                            color = if (selected) OnAccentLight.copy(alpha = 0.85f) else TextMuted
+                                        )
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text(
+                                            text = opt.symbol,
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = if (selected) OnAccentLight else TextPrimary
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        // Diatonic 7th Chords (`顺阶七和弦`)
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(5.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState())
+                        ) {
+                            Text(
+                                text = "顺阶七:",
+                                fontSize = 10.5.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = TextMuted,
+                                maxLines = 1
+                            )
+                            recommendations.sevenths.forEach { opt ->
+                                val selected = inputText.trim() == opt.symbol
+                                val chipShape = RoundedCornerShape(8.dp)
+                                Surface(
+                                    shape = chipShape,
+                                    color = if (selected) VioletAccent else StudioSurface,
+                                    border = BorderStroke(
+                                        1.dp,
+                                        if (selected) VioletAccent else StudioBorder
+                                    ),
+                                    modifier = Modifier
+                                        .clip(chipShape)
+                                        .clickable {
+                                            shouldAutoPreviewTyped = false
+                                            inputText = opt.symbol
+                                            MelodyChordHelper.parseChordSymbol(opt.symbol)?.let { p ->
+                                                builderRoot = p.rootName
+                                                builderQualitySuffix = opt.symbol.removePrefix(p.rootName)
+                                                builderBass = null
+                                            }
+                                            onPreviewChordSymbol(opt.symbol)
+                                        }
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                    ) {
+                                        Text(
+                                            text = opt.degreeBadge,
+                                            fontSize = 9.5.sp,
+                                            color = if (selected) OnAccentLight.copy(alpha = 0.85f) else TextMuted
+                                        )
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text(
+                                            text = opt.symbol,
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = if (selected) OnAccentLight else TextPrimary
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ------------------------------------------------------------
+                // 2. Freehand Input + Live Parser & Real-Time Voicing Preview
+                // ------------------------------------------------------------
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = StudioSurfaceElevated,
+                    border = BorderStroke(1.dp, StudioBorder),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            OutlinedTextField(
+                                value = inputText,
+                                onValueChange = { raw ->
+                                    val cleaned = raw.replace('\n', ' ').take(18)
+                                    shouldAutoPreviewTyped = true
+                                    inputText = cleaned
+                                },
+                                singleLine = true,
+                                label = { Text("② 自由手打或点选和弦（如 F#m7-5、Bbadd9、Dsus4、G/B）", fontSize = 11.sp) },
+                                modifier = Modifier.weight(1f)
+                            )
+                            Button(
+                                onClick = { onPreviewChordSymbol(inputText) },
+                                enabled = parsedPreview != null,
+                                shape = RoundedCornerShape(9.dp),
+                                contentPadding = PaddingValues(horizontal = 11.dp, vertical = 8.dp),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = EmeraldLossless,
+                                    contentColor = OnAccentLight
+                                )
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.PlayArrow,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(2.dp))
+                                Text("试听", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+
+                        if (parsedPreview != null && voicedNotesText != null) {
+                            Text(
+                                text = "✓ 解析成功：${parsedPreview.canonicalSymbol}（${parsedPreview.qualityLabelCn}） · 伴奏声部：$voicedNotesText",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = EmeraldLossless
+                            )
+                        } else if (inputText.isNotBlank()) {
+                            Text(
+                                text = "暂未识别「${inputText.trim()}」，支持如 C、Dm7、Cmaj7、F#m7-5、Bbadd9、Dsus4、C/E、G/B 等标准字母和弦",
+                                fontSize = 11.sp,
+                                color = DangerRed
+                            )
+                        }
+                    }
+                }
+
+                // ------------------------------------------------------------
+                // 3. Root (`#`/`b`) + Quality + Slash `/Bass` Combiner
+                // ------------------------------------------------------------
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = StudioSurfaceElevated,
+                    border = BorderStroke(1.dp, StudioBorder),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text = "③ 根音 + 性质 + 斜杠转位低音组合器",
+                                fontSize = 11.5.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = TextPrimary
+                            )
+                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                MelodyTinyToggle(
+                                    label = "# 升号",
+                                    active = !useFlatsInBuilder,
+                                    activeColor = CyanPrimary,
+                                    onClick = { useFlatsInBuilder = false }
+                                )
+                                MelodyTinyToggle(
+                                    label = "b 降号",
+                                    active = useFlatsInBuilder,
+                                    activeColor = CyanPrimary,
+                                    onClick = { useFlatsInBuilder = true }
+                                )
+                            }
+                        }
+
+                        // Root row
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState())
+                        ) {
+                            Text(
+                                text = "根音:",
+                                fontSize = 10.5.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = TextMuted,
+                                maxLines = 1
+                            )
+                            rootOptions.forEach { root ->
+                                val selected = builderRoot == root && parsedPreview?.rootName == root
+                                MelodyTinyToggle(
+                                    label = root,
+                                    active = selected,
+                                    activeColor = CyanPrimary,
+                                    onClick = { applyBuilderSelection(nextRoot = root) }
+                                )
+                            }
+                        }
+
+                        // Quality row
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState())
+                        ) {
+                            Text(
+                                text = "性质:",
+                                fontSize = 10.5.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = TextMuted,
+                                maxLines = 1
+                            )
+                            MelodyChordHelper.BUILDER_QUALITIES.forEach { qOpt ->
+                                val selected = builderQualitySuffix == qOpt.suffix
+                                MelodyTinyToggle(
+                                    label = qOpt.buttonLabel,
+                                    active = selected,
+                                    activeColor = VioletAccent,
+                                    onClick = { applyBuilderSelection(nextQuality = qOpt.suffix) }
+                                )
+                            }
+                        }
+
+                        // Slash Bass row (`/Bass`)
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState())
+                        ) {
+                            Text(
+                                text = "转位:",
+                                fontSize = 10.5.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = TextMuted,
+                                maxLines = 1
+                            )
+                            MelodyTinyToggle(
+                                label = "无转位",
+                                active = builderBass == null,
+                                activeColor = WarmUmber,
+                                onClick = { applyBuilderSelection(nextBass = null) }
+                            )
+                            rootOptions.forEach { bassCandidate ->
+                                val selected = builderBass == bassCandidate
+                                MelodyTinyToggle(
+                                    label = "/$bassCandidate",
+                                    active = selected,
+                                    activeColor = WarmUmber,
+                                    onClick = { applyBuilderSelection(nextBass = bassCandidate) }
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // Existing Chords Quick Jump Strip
+                if (melody.chordSymbols.isNotEmpty()) {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(
+                            text = "已标和弦（点击定位修改）：",
+                            fontSize = 10.5.sp,
+                            color = TextMuted
+                        )
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(5.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState())
+                        ) {
+                            melody.chordSymbols.sortedBy { it.safeTick }.forEach { cs ->
+                                val csBar = melody.barNumberAtTick(cs.safeTick)
+                                val csBeat = melody.beatNumberAtTick(cs.safeTick)
+                                val isHere = existingAtCursor?.id == cs.id
+                                MelodyTinyToggle(
+                                    label = "${csBar}小节${csBeat}拍 ${cs.symbol}",
+                                    active = isHere,
+                                    activeColor = VioletAccent,
+                                    onClick = {
+                                        onTapCursorTick(cs.safeTick)
+                                        onPreviewChordSymbol(cs.symbol)
+                                    }
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OutlinedButton(
+                    onClick = {
+                        if (onUpsertChordSymbol(anchorTick, inputText, existingAtCursor?.id)) {
+                            moveCursorToTick(anchorTick + unitBeatTicks)
+                        }
+                    },
+                    enabled = parsedPreview != null,
+                    contentPadding = PaddingValues(horizontal = 9.dp, vertical = 6.dp)
+                ) {
+                    Text("写入+下一拍", fontSize = 11.5.sp)
+                }
+                OutlinedButton(
+                    onClick = {
+                        if (onUpsertChordSymbol(anchorTick, inputText, existingAtCursor?.id)) {
+                            moveCursorToTick((barIdx + 1) * ticksPerBar)
+                        }
+                    },
+                    enabled = parsedPreview != null,
+                    contentPadding = PaddingValues(horizontal = 9.dp, vertical = 6.dp)
+                ) {
+                    Text("写入+下小节", fontSize = 11.5.sp)
+                }
+                Button(
+                    onClick = {
+                        if (onUpsertChordSymbol(anchorTick, inputText, existingAtCursor?.id)) {
+                            onDismiss()
+                        }
+                    },
+                    enabled = parsedPreview != null,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = CyanPrimary,
+                        contentColor = OnAccentLight
+                    ),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                ) {
+                    Text(if (existingAtCursor != null) "更新和弦" else "确定写入", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("关闭", color = TextSecondary)
             }
         }
     )
