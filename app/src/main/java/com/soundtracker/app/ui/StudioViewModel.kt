@@ -3479,13 +3479,17 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             melodyPlayer.startAudioEngine()
         }
         syncMelodyInstrumentToEngine(updated)
+        if (updated.isPlaying) {
+            syncMelodySequenceToEngine(updated)
+        }
 
         if (!updated.isPlaying && !updated.isRecording && updated.soundFontLoaded) {
             previewNoteJob?.cancel()
             val previewMidi = ((instrument.defaultOctave + 1) * 12).coerceIn(PIANO_MIN_MIDI, 96)
+            val previewHoldMs = if (instrument == StudioInstrument.STRINGS_ENSEMBLE) 560L else 320L
             previewNoteJob = viewModelScope.launch {
                 melodyPlayer.noteOn(0, previewMidi, 0.78f)
-                delay(320L)
+                delay(previewHoldMs)
                 melodyPlayer.noteOff(0, previewMidi)
             }
         }
@@ -3506,15 +3510,19 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             melodyPlayer.startAudioEngine()
         }
         syncMelodyInstrumentToEngine(updated)
+        if (updated.isPlaying) {
+            syncMelodySequenceToEngine(updated)
+        }
 
         if (!updated.isPlaying && !updated.isRecording && updated.soundFontLoaded) {
             previewNoteJob?.cancel()
             val previewMidi = MusicalNotationHelper
                 .whiteKeyIndexToMidi(updated.secondaryScrollWhiteKey.roundToInt())
                 .coerceIn(PIANO_MIN_MIDI, 96)
+            val previewHoldMs = if (instrument == StudioInstrument.STRINGS_ENSEMBLE) 560L else 320L
             previewNoteJob = viewModelScope.launch {
                 melodyPlayer.noteOn(1, previewMidi, 0.78f)
-                delay(320L)
+                delay(previewHoldMs)
                 melodyPlayer.noteOff(1, previewMidi)
             }
         }
@@ -4750,9 +4758,11 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         if (selected != null && !selected.isRest && !_uiState.value.melody.isPlaying && !_uiState.value.melody.isRecording) {
             previewNoteJob?.cancel()
             val slot = selected.keyboardSlot.coerceIn(0, 1)
+            val activeInst = if (slot == 1) _uiState.value.melody.secondaryInstrument else _uiState.value.melody.instrument
+            val previewHoldMs = if (activeInst == StudioInstrument.STRINGS_ENSEMBLE) 420L else 240L
             previewNoteJob = viewModelScope.launch {
                 melodyPlayer.noteOn(slot, selected.midiNote, selected.velocity)
-                delay(240L)
+                delay(previewHoldMs)
                 melodyPlayer.noteOff(slot, selected.midiNote)
             }
         }

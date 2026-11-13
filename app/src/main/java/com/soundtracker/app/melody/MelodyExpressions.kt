@@ -19,6 +19,7 @@ object NoteSynthFlags {
     const val PORTATO_RELEASE = 1 shl 1   // Portato / Slur-end gentle singing release
     const val LEGATO_OVERLAP = 1 shl 2    // Interior Slur note smooth legato connection
     const val FORTEPIANO_DUCK = 1 shl 3   // `fp` strong attack followed by immediate soft sustain
+    const val CONTIGUOUS_NEXT = 1 shl 4   // Immediately followed by another note on same slot with no rest gap
 }
 
 /**
@@ -729,18 +730,25 @@ object ScoreExpressionCompiler {
                 }
             }
 
+        fun slotUsesStringsEnsemble(slot: Int): Boolean {
+            val inst = if (slot == 1) melody.secondaryInstrument else melody.instrument
+            return inst.presetNumber == 48
+        }
+
         val nativeNotes = ArrayList<NativeSynthNote>(pitchedNotes.size + melody.chordSymbols.size * 4)
         for (n in pitchedNotes) {
             val rawStartTick = n.resolvedStartTick
             val rawDurTicks = n.resolvedDurationTicks
+            val endTick = rawStartTick + rawDurTicks
+            val slotIdx = n.keyboardSlot.coerceIn(0, 1)
             val rawStartBeat = rawStartTick.toDouble() / TICKS_PER_BEAT.toDouble()
-            val rawEndBeat = (rawStartTick + rawDurTicks).toDouble() / TICKS_PER_BEAT.toDouble()
+            val rawEndBeat = endTick.toDouble() / TICKS_PER_BEAT.toDouble()
 
             val warpedStartTick: Double
             val warpedEndTick: Double
             if (n.tuplet != null || !melody.swingPreset.isEnabled) {
                 warpedStartTick = rawStartTick.toDouble()
-                warpedEndTick = (rawStartTick + rawDurTicks).toDouble()
+                warpedEndTick = endTick.toDouble()
             } else {
                 warpedStartTick = melody.swingPreset.warpBeat(rawStartBeat, barBeatsD) * TICKS_PER_BEAT.toDouble()
                 warpedEndTick = melody.swingPreset.warpBeat(rawEndBeat, barBeatsD) * TICKS_PER_BEAT.toDouble()
@@ -750,12 +758,21 @@ object ScoreExpressionCompiler {
             val nominalEndFrame = tempoMap.tickToFrame(warpedEndTick)
             val nominalDurFrames = (nominalEndFrame - startFrame).coerceAtLeast(512L)
 
+            val hasContiguousNextOnSlot = pitchedNotes.any { other ->
+                other.id != n.id &&
+                    other.keyboardSlot.coerceIn(0, 1) == slotIdx &&
+                    abs(other.resolvedStartTick - endTick) <= 10
+            }
+
             // 1. Dynamic + Accent Velocity Calculation
             val dynRes = dynEval.evaluateAtTick(rawStartTick, n.velocity)
             var finalVel = dynRes.velocity
             var flags = NoteSynthFlags.NONE
             if (dynRes.isFortepiano) {
                 flags = flags or NoteSynthFlags.FORTEPIANO_DUCK
+            }
+            if (hasContiguousNextOnSlot && n.articulation == null && n.accent != NoteAccent.MARCATO && !n.hasFermata) {
+                flags = flags or NoteSynthFlags.CONTIGUOUS_NEXT
             }
 
             // 2. Slur (`圆滑线`) Legato Phrasing vs Articulations (`奏法`)
@@ -807,7 +824,7 @@ object ScoreExpressionCompiler {
                                 other.id != n.id &&
                                     other.keyboardSlot == n.keyboardSlot &&
                                     other.midiNote == n.midiNote &&
-                                    abs(other.resolvedStartTick - (rawStartTick + rawDurTicks)) <= 10
+                                    abs(other.resolvedStartTick - endTick) <= 10
                             }
                             if (samePitchImmediateNext) {
                                 (nominalDurFrames - (0.010 * sr).roundToLong()).coerceAtLeast(512L)
@@ -816,8 +833,16 @@ object ScoreExpressionCompiler {
                             }
                         }
                         isPhraseEndSlurNote -> {
-                            flags = flags or NoteSynthFlags.PORTATO_RELEASE
-                            (nominalDurFrames.toDouble() * 0.88).roundToLong().coerceAtLeast(640L)
+                            if (slotUsesStringsEnsemble(slotIdx)) {
+                                if (hasContiguousNextOnSlot) {
+                                    nominalDurFrames
+                                } else {
+                                    (nominalDurFrames.toDouble() * 0.94).roundToLong().coerceAtLeast(640L)
+                                }
+                            } else {
+                                flags = flags or NoteSynthFlags.PORTATO_RELEASE
+                                (nominalDurFrames.toDouble() * 0.88).roundToLong().coerceAtLeast(640L)
+                            }
                         }
                         else -> nominalDurFrames
                     }
@@ -836,7 +861,7 @@ object ScoreExpressionCompiler {
                 durationFrames = actualDurFrames.coerceAtLeast(512L),
                 midiNote = n.midiNote.coerceIn(12, 108),
                 velocity = finalVel,
-                slot = n.keyboardSlot.coerceIn(0, 1),
+                slot = slotIdx,
                 flags = flags
             )
         }
@@ -872,6 +897,8 @@ object ScoreExpressionCompiler {
                 val barEndTick = ((cStartTick / ticksPerBar) + 1) * ticksPerBar
                 val nextChordTick = sortedChords.getOrNull(idx + 1)?.safeTick ?: Int.MAX_VALUE
                 val baseEndTick = min(nextChordTick, barEndTick).coerceAtLeast(cStartTick + TICKS_PER_STEP)
+                val chordHasContiguousNext = nextChordTick != Int.MAX_VALUE && abs(nextChordTick - baseEndTick) <= 10
+                val chordIsStrings = slotUsesStringsEnsemble(chordSlot)
 
                 val dynScale = if (hasScoreDyn) {
                     (dynEval.evaluateAtTick(cStartTick, 0.85f).velocity / DynamicLevel.MF.targetVelocity)
@@ -916,9 +943,20 @@ object ScoreExpressionCompiler {
 
                     val startFrame = tempoMap.tickToFrame(wStartTick)
                     val endFrame = tempoMap.tickToFrame(wEndTick)
-                    val durFrames = ((endFrame - startFrame).toDouble() * 0.94)
-                        .roundToLong()
-                        .coerceAtLeast(640L)
+                    val isContiguousChordVoice = (voiceEndTick == baseEndTick) && chordHasContiguousNext
+                    val durFrames = if (chordIsStrings) {
+                        (endFrame - startFrame).coerceAtLeast(640L)
+                    } else {
+                        ((endFrame - startFrame).toDouble() * 0.94)
+                            .roundToLong()
+                            .coerceAtLeast(640L)
+                    }
+                    val chordFlags = when {
+                        chordIsStrings && isContiguousChordVoice -> NoteSynthFlags.CONTIGUOUS_NEXT
+                        chordIsStrings -> NoteSynthFlags.NONE
+                        isContiguousChordVoice -> NoteSynthFlags.PORTATO_RELEASE or NoteSynthFlags.CONTIGUOUS_NEXT
+                        else -> NoteSynthFlags.PORTATO_RELEASE
+                    }
                     val vel = (baseWeight * dynScale).coerceIn(0.18f, 0.66f)
 
                     nativeNotes += NativeSynthNote(
@@ -927,7 +965,7 @@ object ScoreExpressionCompiler {
                         midiNote = midi.coerceIn(12, 108),
                         velocity = vel,
                         slot = chordSlot,
-                        flags = NoteSynthFlags.PORTATO_RELEASE
+                        flags = chordFlags
                     )
                 }
             }
