@@ -1020,6 +1020,7 @@ object StaffScoreEngraver {
 
         val vMetrics = computeTimelineVerticalMetrics(viewportHeight, melody)
         val grandStaff = vMetrics.grandStaff
+        val singleStaffBassClef = !grandStaff && melody.singleStaffUsesBassClef
         val lineSpacing = vMetrics.lineSpacing
         val staffHeight = vMetrics.staffHeight
         val trebleTopY = vMetrics.trebleTopY
@@ -1127,13 +1128,13 @@ object StaffScoreEngraver {
                     canvas.drawLine(barLeft, trebleTopY, barLeft, bottomStaffBottomY, modBarPaint)
 
                     val prevKey = melody.keySignatureAtBar(bar - 1)
-                    val cancelTreble = prevKey.cancelledStaffStepsTo(midKeyEvent.keySignature, isBass = false)
+                    val cancelTreble = prevKey.cancelledStaffStepsTo(midKeyEvent.keySignature, isBass = singleStaffBassClef)
                     val groupStartX = barLeft + lineSpacing * 0.42f
                     val groupEndX = drawKeySignatureGroup(
                         canvas = canvas,
                         leftX = groupStartX,
                         staffTopY = trebleTopY,
-                        isBass = false,
+                        isBass = singleStaffBassClef,
                         s = lineSpacing,
                         cancelledSteps = cancelTreble,
                         newKey = midKeyEvent.keySignature,
@@ -1225,6 +1226,7 @@ object StaffScoreEngraver {
                 bassTopY = bassTopY,
                 lineSpacing = lineSpacing,
                 grandStaff = grandStaff,
+                singleStaffBassClef = singleStaffBassClef,
                 selectedNoteId = melody.selectedNoteId,
                 paperBgColor = palette.paperBgColor,
                 slot0Color = palette.slot0Color,
@@ -1489,7 +1491,11 @@ object StaffScoreEngraver {
         } else {
             palette.inkColor
         }
-        drawTrebleClef(canvas, leftMargin + lineSpacing * 1.32f, trebleTopY, lineSpacing, trebleClefColor)
+        if (singleStaffBassClef) {
+            drawBassClef(canvas, leftMargin + lineSpacing * 1.28f, trebleTopY, lineSpacing, trebleClefColor)
+        } else {
+            drawTrebleClef(canvas, leftMargin + lineSpacing * 1.32f, trebleTopY, lineSpacing, trebleClefColor)
+        }
         if (grandStaff) {
             drawBassClef(canvas, leftMargin + lineSpacing * 1.28f, bassTopY, lineSpacing, bassClefColor)
         }
@@ -1501,7 +1507,7 @@ object StaffScoreEngraver {
                 canvas = canvas,
                 leftX = kStart,
                 staffTopY = trebleTopY,
-                isBass = false,
+                isBass = singleStaffBassClef,
                 s = lineSpacing,
                 cancelledSteps = emptyList(),
                 newKey = headerKey,
@@ -1834,8 +1840,9 @@ object StaffScoreEngraver {
             null
         }
         val endBarKey = melody.keySignatureAtBar(endBar)
+        val singleStaffBassClef = !layout.grandStaff && melody.singleStaffUsesBassClef
         val courtesyCancelTreble = if (nextSysKeyEv != null) {
-            endBarKey.cancelledStaffStepsTo(nextSysKeyEv.keySignature, isBass = false)
+            endBarKey.cancelledStaffStepsTo(nextSysKeyEv.keySignature, isBass = singleStaffBassClef)
         } else {
             emptyList()
         }
@@ -1971,6 +1978,7 @@ object StaffScoreEngraver {
         val lineSpacing = layout.lineSpacing
         val staffH = layout.staffHeight
         val grandStaff = layout.grandStaff
+        val singleStaffBassClef = !grandStaff && melody.singleStaffUsesBassClef
         val marginX = layout.marginLeftX
 
         val symbols = buildBarSymbols(
@@ -2120,7 +2128,11 @@ object StaffScoreEngraver {
             } else {
                 palette.inkColor
             }
-            drawTrebleClef(canvas, marginX + lineSpacing * 1.30f, trebleTopY, lineSpacing, trebleClefCol)
+            if (singleStaffBassClef) {
+                drawBassClef(canvas, marginX + lineSpacing * 1.25f, trebleTopY, lineSpacing, trebleClefCol)
+            } else {
+                drawTrebleClef(canvas, marginX + lineSpacing * 1.30f, trebleTopY, lineSpacing, trebleClefCol)
+            }
             if (grandStaff) {
                 drawBassClef(canvas, marginX + lineSpacing * 1.25f, bassTopY, lineSpacing, bassClefCol)
             }
@@ -2131,7 +2143,7 @@ object StaffScoreEngraver {
                     canvas = canvas,
                     leftX = kLeft,
                     staffTopY = trebleTopY,
-                    isBass = false,
+                    isBass = singleStaffBassClef,
                     s = lineSpacing,
                     cancelledSteps = emptyList(),
                     newKey = hGeom.sysStartKey,
@@ -2222,13 +2234,13 @@ object StaffScoreEngraver {
                     canvas.drawLine(bLeft, trebleTopY, bLeft, sysBottomY, modBarPaint)
 
                     val prevKey = melody.keySignatureAtBar(bar - 1)
-                    val cancelT = prevKey.cancelledStaffStepsTo(barKeyEv.keySignature, isBass = false)
+                    val cancelT = prevKey.cancelledStaffStepsTo(barKeyEv.keySignature, isBass = singleStaffBassClef)
                     val kStart = bLeft + lineSpacing * 0.38f
                     val groupEndX = drawKeySignatureGroup(
                         canvas = canvas,
                         leftX = kStart,
                         staffTopY = trebleTopY,
-                        isBass = false,
+                        isBass = singleStaffBassClef,
                         s = lineSpacing,
                         cancelledSteps = cancelT,
                         newKey = barKeyEv.keySignature,
@@ -2312,6 +2324,7 @@ object StaffScoreEngraver {
                     bassTopY = bassTopY,
                     lineSpacing = lineSpacing,
                     grandStaff = grandStaff,
+                    singleStaffBassClef = singleStaffBassClef,
                     selectedNoteId = melody.selectedNoteId,
                     paperBgColor = palette.paperBgColor,
                     slot0Color = palette.slot0Color,
@@ -2342,7 +2355,7 @@ object StaffScoreEngraver {
                         canvas = canvas,
                         leftX = cStartX,
                         staffTopY = trebleTopY,
-                        isBass = false,
+                        isBass = singleStaffBassClef,
                         s = lineSpacing,
                         cancelledSteps = hGeom.courtesyCancelTreble,
                         newKey = hGeom.nextSysKeyEv.keySignature,
@@ -2794,6 +2807,7 @@ object StaffScoreEngraver {
         ).coerceAtLeast(1)
 
         val grandStaff = isEffectiveGrandStaff(melody)
+        val singleStaffBassClef = !grandStaff && melody.singleStaffUsesBassClef
         val hasPdfChords = melody.showChordSymbols && melody.chordSymbols.isNotEmpty()
         val barsPerSystem = if (ticksPerBar > 1200) 3 else 4
         val totalSystems = ceil(totalBars / barsPerSystem.toFloat()).toInt().coerceAtLeast(1)
@@ -2913,7 +2927,7 @@ object StaffScoreEngraver {
                     val nextSysKeyEv = if (endBar + 1 < totalBars) melody.keySignatureEventAtBar(endBar + 1) else null
                     val endBarKey = melody.keySignatureAtBar(endBar)
                     val courtesyCancelTreble = if (nextSysKeyEv != null) {
-                        endBarKey.cancelledStaffStepsTo(nextSysKeyEv.keySignature, isBass = false)
+                        endBarKey.cancelledStaffStepsTo(nextSysKeyEv.keySignature, isBass = singleStaffBassClef)
                     } else {
                         emptyList()
                     }
@@ -2978,7 +2992,11 @@ object StaffScoreEngraver {
                         )
                     }
 
-                    drawTrebleClef(canvas, marginX + lineSpacing * 1.30f, trebleTopY, lineSpacing, ink)
+                    if (singleStaffBassClef) {
+                        drawBassClef(canvas, marginX + lineSpacing * 1.25f, trebleTopY, lineSpacing, ink)
+                    } else {
+                        drawTrebleClef(canvas, marginX + lineSpacing * 1.30f, trebleTopY, lineSpacing, ink)
+                    }
                     if (grandStaff) {
                         drawBassClef(canvas, marginX + lineSpacing * 1.25f, bassTopY, lineSpacing, ink)
                     }
@@ -2990,7 +3008,7 @@ object StaffScoreEngraver {
                             canvas = canvas,
                             leftX = kLeft,
                             staffTopY = trebleTopY,
-                            isBass = false,
+                            isBass = singleStaffBassClef,
                             s = lineSpacing,
                             cancelledSteps = emptyList(),
                             newKey = sysStartKey,
@@ -3074,13 +3092,13 @@ object StaffScoreEngraver {
                             canvas.drawLine(bLeft, trebleTopY, bLeft, sysBottomY, barLinePaint)
 
                             val prevKey = melody.keySignatureAtBar(bar - 1)
-                            val cancelT = prevKey.cancelledStaffStepsTo(midSysKeyEv.keySignature, isBass = false)
+                            val cancelT = prevKey.cancelledStaffStepsTo(midSysKeyEv.keySignature, isBass = singleStaffBassClef)
                             val kStart = bLeft + lineSpacing * 0.38f
                             drawKeySignatureGroup(
                                 canvas = canvas,
                                 leftX = kStart,
                                 staffTopY = trebleTopY,
-                                isBass = false,
+                                isBass = singleStaffBassClef,
                                 s = lineSpacing,
                                 cancelledSteps = cancelT,
                                 newKey = midSysKeyEv.keySignature,
@@ -3120,6 +3138,7 @@ object StaffScoreEngraver {
                             bassTopY = bassTopY,
                             lineSpacing = lineSpacing,
                             grandStaff = grandStaff,
+                            singleStaffBassClef = singleStaffBassClef,
                             selectedNoteId = null,
                             paperBgColor = Color.WHITE,
                             slot0Color = ink,
@@ -3150,7 +3169,7 @@ object StaffScoreEngraver {
                                 canvas = canvas,
                                 leftX = cStartX,
                                 staffTopY = trebleTopY,
-                                isBass = false,
+                                isBass = singleStaffBassClef,
                                 s = lineSpacing,
                                 cancelledSteps = courtesyCancelTreble,
                                 newKey = nextSysKeyEv.keySignature,
@@ -3332,6 +3351,7 @@ object StaffScoreEngraver {
         bassTopY: Float,
         lineSpacing: Float,
         grandStaff: Boolean,
+        singleStaffBassClef: Boolean = false,
         selectedNoteId: String?,
         paperBgColor: Int,
         slot0Color: Int,
@@ -3348,11 +3368,12 @@ object StaffScoreEngraver {
 
         for (staffIdx in 0..(if (grandStaff) 1 else 0)) {
             val isBass = (staffIdx == 1)
+            val useBassClefSteps = isBass || (!grandStaff && singleStaffBassClef)
             val staffTopY = if (isBass) bassTopY else trebleTopY
             val staffBottomY = staffTopY + 4f * lineSpacing
-            val refTopStep = if (isBass) BASS_TOP_STEP else TREBLE_TOP_STEP
-            val refBottomStep = if (isBass) BASS_BOTTOM_STEP else TREBLE_BOTTOM_STEP
-            val refMiddleStep = if (isBass) BASS_MIDDLE_STEP else TREBLE_MIDDLE_STEP
+            val refTopStep = if (useBassClefSteps) BASS_TOP_STEP else TREBLE_TOP_STEP
+            val refBottomStep = if (useBassClefSteps) BASS_BOTTOM_STEP else TREBLE_BOTTOM_STEP
+            val refMiddleStep = if (useBassClefSteps) BASS_MIDDLE_STEP else TREBLE_MIDDLE_STEP
 
             val staffSyms = barSyms.filter { it.useBassStaff == isBass }
             if (staffSyms.isEmpty()) continue

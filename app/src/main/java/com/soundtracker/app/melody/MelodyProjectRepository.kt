@@ -590,7 +590,8 @@ object MelodyProjectRepository {
             val grandStaffEnabled = if (root.has("grandStaffEnabled")) {
                 root.optBoolean("grandStaffEnabled", false)
             } else {
-                notes.any { it.targetStaff == StaffPart.BASS || (!it.isRest && it.midiNote < 56) }
+                instrument != StudioInstrument.FINGERED_BASS &&
+                    notes.any { it.targetStaff == StaffPart.BASS || (!it.isRest && it.midiNote < 56) }
             }
             val activeStaff = safeEnumValueOf(root.optString("activeStaff"), StaffPart.TREBLE)
             val dualKeyboardStaffRouting = safeEnumValueOf(

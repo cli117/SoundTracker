@@ -870,13 +870,7 @@ object ScoreExpressionCompiler {
 
         // 4. Optional Above-Staff Chord Symbol Accompaniment (`和弦真实发声`)
         if (melody.chordPlaybackEnabled && melody.chordSymbols.isNotEmpty()) {
-            val chordSlot = when {
-                melody.dualKeyboardEnabled -> 1
-                melody.instrument == StudioInstrument.SOLO_FLUTE ||
-                    melody.instrument == StudioInstrument.ALTO_SAX ||
-                    melody.instrument == StudioInstrument.MUSIC_BOX -> 1
-                else -> 0
-            }
+            val chordSlot = melody.resolveChordAccompanimentSlot()
             val hasScoreDyn = melody.dynamicMarks.isNotEmpty() || melody.hairpins.isNotEmpty()
             val sortedChords = melody.chordSymbols
                 .sortedBy { it.safeTick }

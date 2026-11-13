@@ -16,6 +16,7 @@ namespace {
 
 constexpr float kTwoPi = 6.28318530717958647692f;
 constexpr float kPi = 3.14159265358979323846f;
+constexpr int kFingeredBassPreset = 33;
 constexpr int kStringsEnsemblePreset = 48;
 
 constexpr int kSynthFlagCrispRelease     = 1 << 0; // Staccato / Staccatissimo / Marcato
@@ -33,6 +34,10 @@ constexpr int kSynthFlagTightOnset       = 1 << 11; // Internal: live keyboard /
 
 inline bool isStringsProfile(const InstrumentFxProfile& prof) {
     return prof.presetNumber == kStringsEnsemblePreset;
+}
+
+inline bool isFingeredBassProfile(const InstrumentFxProfile& prof) {
+    return prof.presetNumber == kFingeredBassPreset;
 }
 
 inline float resolveStringsReleaseSec(bool sustainOn, float sustainDurationSec) {
@@ -59,6 +64,8 @@ tsf* gBaseSoundFont = nullptr;
 
 // Neutralizes SF2 `Fast Strings` (Preset 48) hardcoded bright modEnv filter sweep and LFO vibrato,
 // establishing a clean 1.0 sustain plateau controlled smoothly in dB by StringsVoiceModTracker.
+// Also compensates `Finger Bass` (Preset 33) for TinySoundFont's ignored SF2 `imod` modulators,
+// restoring key-tracked warm body cutoff and velocity-reactive finger-pluck filter articulation.
 void prepareLoadedSoundFontPresets(tsf* sf) {
     if (!sf || !sf->presets) return;
     for (int p = 0; p < sf->presetNum; ++p) {
@@ -75,6 +82,41 @@ void prepareLoadedSoundFontPresets(tsf* sf) {
                 reg.ampenv.hold = 0.0f;
                 reg.ampenv.decay = 0.0f;
                 reg.ampenv.sustain = 1.0f;
+            }
+        } else if (sf->presets[p].preset == kFingeredBassPreset && sf->presets[p].regions) {
+            for (int r = 0; r < sf->presets[p].regionNum; ++r) {
+                struct tsf_region& reg = sf->presets[p].regions[r];
+                // Preserve `0 Ramp` harmonic layer above key 92; apply electric bass string zone filter curve to 0..92.
+                if (reg.hikey <= 92) {
+                    float zoneKey = 50.0f;
+                    int envCents = 6000;
+                    if (reg.hikey <= 30) {
+                        zoneKey = 28.0f;
+                        envCents = 7800;
+                    } else if (reg.hikey <= 35) {
+                        zoneKey = 33.0f;
+                        envCents = 7000;
+                    } else if (reg.hikey <= 40) {
+                        zoneKey = 38.0f;
+                        envCents = 6800;
+                    }
+                    const int baseFc = std::clamp(
+                        static_cast<int>(std::lround(7121.0f + 4000.0f * ((zoneKey - 64.0f) / 64.0f))),
+                        5250,
+                        6600
+                    );
+                    reg.initialFilterFc = baseFc;
+                    reg.modEnvToFilterFc = envCents;
+                    reg.initialFilterQ = 0;
+                    // Fold short 32ms hold into decay so modenv begins in TSF_SEGMENT_DECAY and preserves per-voice velocity scaling.
+                    if (reg.modenv.hold > 0.0f) {
+                        reg.modenv.decay += reg.modenv.hold;
+                        reg.modenv.hold = 0.0f;
+                    }
+                    reg.modenv.delay = 0.0f;
+                    reg.modenv.attack = 0.0f;
+                    reg.modenv.sustain = 0.0f;
+                }
             }
         }
     }
@@ -1312,14 +1354,37 @@ static bool triggerExpressiveChannelNoteOn(
         ? 20.0f * std::log10(std::min(rawVelocity, 1.26f))
         : 0.0f;
 
-    if (f->voices && !isStrings && extraDb > 0.0f) {
+    const bool isBass = !isStrings && isFingeredBassProfile(prof);
+    if (f->voices && !isStrings && (extraDb > 0.0f || isBass)) {
+        const bool crisp = (flags & (kSynthFlagCrispRelease | kSynthFlagFortepianoDuck)) != 0 ||
+                           rawVelocity > 1.01f;
+        const float velFilterScale = std::clamp(
+            (crisp ? 0.38f : 0.26f) + (crisp ? 0.62f : 0.74f) * midiVel,
+            0.26f,
+            1.0f
+        );
         struct tsf_voice *v = f->voices, *vEnd = v + f->voiceNum;
         for (; v != vEnd; ++v) {
             if (v->playingPreset != -1 &&
                 v->playIndex == notePlayIdx &&
                 v->playingChannel == channel &&
                 v->playingKey == key) {
-                v->noteGainDB += extraDb;
+                if (extraDb > 0.0f) {
+                    v->noteGainDB += extraDb;
+                }
+                if (isBass && v->region && v->region->modEnvToFilterFc > 0 &&
+                    v->modenv.segment == TSF_SEGMENT_DECAY && v->modenv.samplesUntilNextSegment > 0) {
+                    v->modenv.level = velFilterScale;
+                    v->modenv.slope = -velFilterScale / static_cast<float>(v->modenv.samplesUntilNextSegment);
+                    const float fres = static_cast<float>(v->region->initialFilterFc) +
+                        velFilterScale * static_cast<float>(v->region->modEnvToFilterFc);
+                    const float fcNorm = std::clamp(
+                        (fres <= 13500.0f ? (8.1757989156f * std::pow(2.0f, fres / 1200.0f) / std::max(8000.0f, f->outSampleRate)) : 1.0f),
+                        0.005f,
+                        0.499f
+                    );
+                    tsf_voice_lowpass_setup(&v->lowpass, fcNorm);
+                }
             }
         }
         return true;

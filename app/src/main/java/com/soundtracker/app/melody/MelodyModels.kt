@@ -164,6 +164,17 @@ enum class StudioInstrument(
         defaultReverb = 0.24f,
         chorusDepth = 0.08f
     ),
+    FINGERED_BASS(
+        displayName = "指弹贝斯",
+        shortName = "贝斯",
+        subtitle = "浑厚指弹电贝斯 · 低频扎实清晰，适合低音声部与律动铺底",
+        bank = 0,
+        presetNumber = 33,
+        defaultOctave = 2,
+        gainDb = 1.8f,
+        defaultReverb = 0.16f,
+        chorusDepth = 0.00f
+    ),
     ORCHESTRAL_HARP(
         displayName = "管弦竖琴",
         shortName = "竖琴",
@@ -830,6 +841,39 @@ data class MelodyStudioUiState(
             val rel = (cursorTick - tupletAnchorTick).mod(tup.spanTicks)
             return ((rel / tup.noteTicks) + 1).coerceIn(1, tup.count)
         }
+
+    /**
+     * When single-staff mode (`!grandStaffEnabled`) is active and the score uses Bass,
+     * engrave on a standard Concert-Pitch Bass Clef (`𝄢`) staff so `C2~G3` sits cleanly on the 5 lines.
+     * When `grandStaffEnabled == true`, upper staff is always Treble (`𝄞`) and lower staff is Bass (`𝄢`).
+     */
+    val singleStaffUsesBassClef: Boolean
+        get() = !grandStaffEnabled &&
+            instrument == StudioInstrument.FINGERED_BASS &&
+            (!dualKeyboardEnabled || secondaryInstrument == StudioInstrument.FINGERED_BASS)
+
+    /**
+     * Selects which synth slot (`0` or `1`) plays above-staff chord symbols (`ScoreChordSymbol`),
+     * avoiding 4-voice chord clusters on Bass or monophonic wind/music-box leads whenever a
+     * polyphonic chordal instrument (Piano / EP / Guitar / Harp / Strings / Marimba) is available.
+     */
+    fun resolveChordAccompanimentSlot(): Int {
+        fun isLeadOrBass(inst: StudioInstrument): Boolean =
+            inst == StudioInstrument.SOLO_FLUTE ||
+                inst == StudioInstrument.ALTO_SAX ||
+                inst == StudioInstrument.MUSIC_BOX ||
+                inst == StudioInstrument.FINGERED_BASS
+
+        return when {
+            dualKeyboardEnabled -> {
+                if (isLeadOrBass(secondaryInstrument) && !isLeadOrBass(instrument)) 0 else 1
+            }
+            isLeadOrBass(instrument) -> {
+                if (!isLeadOrBass(secondaryInstrument)) 1 else 0
+            }
+            else -> 0
+        }
+    }
 
     val effectiveReverbSend: Float
         get() {

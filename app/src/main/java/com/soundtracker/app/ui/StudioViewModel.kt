@@ -3466,13 +3466,27 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     /**
      * Switches primary keyboard instrument WITHOUT altering user's sustain ON/OFF state,
-     * sustain duration, or saved keyboard layout/scroll position.
+     * sustain duration, or manually customized keyboard layout, while auto-focusing Bass octave (`C2`).
      */
     fun selectPrimaryMelodyInstrument(instrument: StudioInstrument) {
         val cur = _uiState.value.melody
         if (cur.instrument == instrument) return
+        pushMelodyUndoSnapshot()
+        val nextScroll = when {
+            instrument == StudioInstrument.FINGERED_BASS && cur.primaryScrollWhiteKey > 11f ->
+                MusicalNotationHelper.octaveToWhiteKeyIndex(instrument.defaultOctave)
+            cur.instrument == StudioInstrument.FINGERED_BASS &&
+                instrument != StudioInstrument.FINGERED_BASS &&
+                kotlin.math.abs(cur.primaryScrollWhiteKey - 7f) < 0.6f -> 21f
+            else -> cur.primaryScrollWhiteKey
+        }
         _uiState.update { st ->
-            st.copy(melody = st.melody.copy(instrument = instrument))
+            st.copy(
+                melody = st.melody.copy(
+                    instrument = instrument,
+                    primaryScrollWhiteKey = nextScroll
+                )
+            )
         }
         val updated = _uiState.value.melody
         if (updated.soundFontLoaded) {
@@ -3486,7 +3500,11 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         if (!updated.isPlaying && !updated.isRecording && updated.soundFontLoaded) {
             previewNoteJob?.cancel()
             val previewMidi = ((instrument.defaultOctave + 1) * 12).coerceIn(PIANO_MIN_MIDI, 96)
-            val previewHoldMs = if (instrument == StudioInstrument.STRINGS_ENSEMBLE) 560L else 320L
+            val previewHoldMs = when (instrument) {
+                StudioInstrument.STRINGS_ENSEMBLE -> 560L
+                StudioInstrument.FINGERED_BASS -> 380L
+                else -> 320L
+            }
             previewNoteJob = viewModelScope.launch {
                 melodyPlayer.noteOn(0, previewMidi, 0.78f)
                 delay(previewHoldMs)
@@ -3497,13 +3515,27 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     /**
      * Switches secondary keyboard instrument WITHOUT altering user's sustain ON/OFF state,
-     * sustain duration, or saved keyboard layout/scroll position.
+     * sustain duration, or manually customized keyboard layout, while auto-focusing Bass octave (`C2`).
      */
     fun selectSecondaryMelodyInstrument(instrument: StudioInstrument) {
         val cur = _uiState.value.melody
         if (cur.secondaryInstrument == instrument) return
+        pushMelodyUndoSnapshot()
+        val nextScroll = when {
+            instrument == StudioInstrument.FINGERED_BASS && cur.secondaryScrollWhiteKey > 11f ->
+                MusicalNotationHelper.octaveToWhiteKeyIndex(instrument.defaultOctave)
+            cur.secondaryInstrument == StudioInstrument.FINGERED_BASS &&
+                instrument != StudioInstrument.FINGERED_BASS &&
+                kotlin.math.abs(cur.secondaryScrollWhiteKey - 7f) < 0.6f -> 14f
+            else -> cur.secondaryScrollWhiteKey
+        }
         _uiState.update { st ->
-            st.copy(melody = st.melody.copy(secondaryInstrument = instrument))
+            st.copy(
+                melody = st.melody.copy(
+                    secondaryInstrument = instrument,
+                    secondaryScrollWhiteKey = nextScroll
+                )
+            )
         }
         val updated = _uiState.value.melody
         if (updated.soundFontLoaded) {
@@ -3516,10 +3548,18 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
         if (!updated.isPlaying && !updated.isRecording && updated.soundFontLoaded) {
             previewNoteJob?.cancel()
-            val previewMidi = MusicalNotationHelper
-                .whiteKeyIndexToMidi(updated.secondaryScrollWhiteKey.roundToInt())
-                .coerceIn(PIANO_MIN_MIDI, 96)
-            val previewHoldMs = if (instrument == StudioInstrument.STRINGS_ENSEMBLE) 560L else 320L
+            val previewMidi = if (instrument == StudioInstrument.FINGERED_BASS) {
+                ((instrument.defaultOctave + 1) * 12).coerceIn(PIANO_MIN_MIDI, 96)
+            } else {
+                MusicalNotationHelper
+                    .whiteKeyIndexToMidi(updated.secondaryScrollWhiteKey.roundToInt())
+                    .coerceIn(PIANO_MIN_MIDI, 96)
+            }
+            val previewHoldMs = when (instrument) {
+                StudioInstrument.STRINGS_ENSEMBLE -> 560L
+                StudioInstrument.FINGERED_BASS -> 380L
+                else -> 320L
+            }
             previewNoteJob = viewModelScope.launch {
                 melodyPlayer.noteOn(1, previewMidi, 0.78f)
                 delay(previewHoldMs)
@@ -5480,13 +5520,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         if (voiced.isEmpty()) return
 
         melodyPlayer.startAudioEngine()
-        val slot = when {
-            cur.dualKeyboardEnabled -> 1
-            cur.instrument == StudioInstrument.SOLO_FLUTE ||
-                cur.instrument == StudioInstrument.ALTO_SAX ||
-                cur.instrument == StudioInstrument.MUSIC_BOX -> 1
-            else -> 0
-        }
+        val slot = cur.resolveChordAccompanimentSlot()
 
         previewNoteJob?.cancel()
         melodyPlayer.allNotesOff()

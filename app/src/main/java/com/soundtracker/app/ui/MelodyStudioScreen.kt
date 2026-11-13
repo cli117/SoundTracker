@@ -1705,10 +1705,10 @@ private fun ExportStaffPdfDialog(
 ) {
     var titleInput by remember(melody.scoreTitle) { mutableStateOf(melody.scoreTitle) }
     val resolvedTitle = titleInput.trim().ifBlank { "未命名乐谱" }
-    val staffTypeLabel = if (melody.grandStaffEnabled) {
-        "双行钢琴大谱表 (Grand Staff)"
-    } else {
-        "高音五线谱 (Treble Staff)"
+    val staffTypeLabel = when {
+        melody.grandStaffEnabled -> "双行钢琴大谱表 (Grand Staff)"
+        melody.singleStaffUsesBassClef -> "低音五线谱 (Bass Staff)"
+        else -> "高音五线谱 (Treble Staff)"
     }
 
     AlertDialog(
@@ -4464,6 +4464,7 @@ private fun InteractiveStaffScoreCanvas(
         canvasSize.width,
         density.density,
         melody.grandStaffEnabled,
+        melody.singleStaffUsesBassClef,
         melody.timeSignature,
         melody.totalBars,
         melody.notes,
